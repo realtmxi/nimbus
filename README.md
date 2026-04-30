@@ -49,19 +49,39 @@ data/                            Local trace files (gitignored)
 
 ## Outsourcing Strategies (Baselines + Ours)
 
-`experiments/run_offload_strategies.py` implements 9 strategies behind a unified
-`OffloadStrategy` interface:
+`experiments/run_offload_strategies.py` implements 11 strategies behind a unified
+`OffloadStrategy` interface, organized in three tiers:
 
-| Strategy | Description | Type |
-|----------|-------------|------|
-| RandomRequestStrategy | Outsource each request with probability `fraction` | Baseline |
-| PressureGatedStrategy | Outsource only when KV pressure exceeds threshold | Baseline |
-| SessionAwareStrategy | Outsource entire sessions (preserve prefix continuity) | Baseline |
-| SizeOutsourceLongStrategy | Outsource largest-prefill requests | Baseline |
-| SizeOutsourceShortStrategy | Outsource smallest-prefill requests (worst case) | Baseline |
-| FlopBasedStrategy | Weight = `prefill_flops + 0.6 * decode_flops` | Nimbus v0 |
-| **CacheDispStrategy** | Weight = `prefill_tokens * decode_tokens` | **Nimbus v1** |
-| GatedSessionAwareStrategy | Pressure gate + session-sticky decisions | Hybrid baseline |
+### Intuitive baselines (oblivious / extremes)
+
+| Strategy | CLI name | Description |
+|----------|----------|-------------|
+| AllLocalStrategy | `all_local` | No outsourcing (cost lower bound, latency upper bound) |
+| AllCloudStrategy | `all_cloud` | Outsource everything (cost upper bound, no local pressure) |
+| FIFOStrategy | `fifo` | Outsource the first N% requests by arrival order |
+| RandomRequestStrategy | `random_request` | Outsource each request i.i.d. with probability `fraction` |
+
+### System-state baselines (use system signals, not request features)
+
+| Strategy | CLI name | Description |
+|----------|----------|-------------|
+| PressureGatedStrategy | `pressure_gated` | Outsource only when KV pressure exceeds threshold |
+| SessionAwareStrategy | `session_aware` | Outsource entire sessions to preserve prefix continuity |
+| GatedSessionAwareStrategy | `gated_session_aware` | Pressure gate + session-sticky decisions |
+
+### Feature-aware baselines (use per-request features)
+
+| Strategy | CLI name | Description |
+|----------|----------|-------------|
+| SizeOutsourceLongStrategy | `size_long` | Outsource largest-prefill requests |
+| SizeOutsourceShortStrategy | `size_short` | Outsource smallest-prefill requests (worst case) |
+| FlopBasedStrategy | `flop_based` | Weight = `prefill_flops + 0.6 * decode_flops` (Nimbus v0) |
+
+### Ours
+
+| Strategy | CLI name | Description |
+|----------|----------|-------------|
+| **CacheDispStrategy** | `cache_disp` | Weight = `prefill_tokens * decode_tokens` (memory-time product) |
 
 ## Quick Start
 
@@ -98,9 +118,14 @@ python experiments/run_offload_strategies.py \
     --sglang-url http://localhost:8200 \
     --mode knee \
     --fractions 0.0 0.15 0.20 0.25 0.30 0.35 0.50 \
-    --strategies flop_based cache_disp session_aware oracle_size \
+    --strategies all_local all_cloud fifo random_request \
+                 flop_based cache_disp session_aware size_long \
     --output-dir logs/cachedisp_knee
 ```
+
+Note: `all_local` and `all_cloud` ignore the `fraction` argument and run
+identically across all fractions; including them once at any fraction is
+sufficient for cost/latency reference points.
 
 ## Data
 

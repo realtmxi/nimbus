@@ -242,8 +242,68 @@ class OffloadStrategy:
         self.fraction = fraction
 
 
+class AllLocalStrategy(OffloadStrategy):
+    """No outsourcing: every request runs locally.
+
+    Cost lower bound but worst latency under burst (will trigger
+    bistability collapse for any non-trivial trace).  The `fraction`
+    argument is ignored.
+    """
+
+    def should_outsource(self, req: dict, kv_pressure: float) -> bool:
+        self.n_total += 1
+        return False
+
+
+class AllCloudStrategy(OffloadStrategy):
+    """Full outsourcing: every request goes to the cloud API.
+
+    Cost upper bound but no local resource pressure.  Useful as a
+    reference for "what if we never used the local GPU".  The
+    `fraction` argument is ignored.
+    """
+
+    def should_outsource(self, req: dict, kv_pressure: float) -> bool:
+        self.n_total += 1
+        self.n_outsourced += 1
+        return True
+
+
+class FIFOStrategy(OffloadStrategy):
+    """Outsource the first `fraction` of requests by arrival order.
+
+    Oblivious baseline: no per-request features, just "send the first
+    N% of arrivals to the cloud, keep the rest local".  Tests whether
+    intelligent selection beats arrival-order shedding.
+    """
+
+    def __init__(self, fraction: float, seed: int, trace: list[dict]):
+        super().__init__(fraction, seed)
+        n = len(trace)
+        cutoff = int(n * fraction)
+        # Sort by arrival time and mark the first `cutoff` indices.
+        sorted_indices = sorted(range(n), key=lambda i: trace[i]["arrived_at"])
+        self.outsource_set: set[int] = set(sorted_indices[:cutoff])
+        # Map from request key (use index in trace order if no id field)
+        # to outsource decision.  Caller must pass the trace in same
+        # order so we can match by sequential index.
+        self._idx = 0
+
+    def should_outsource(self, req: dict, kv_pressure: float) -> bool:
+        self.n_total += 1
+        decide = self._idx in self.outsource_set
+        self._idx += 1
+        if decide:
+            self.n_outsourced += 1
+        return decide
+
+
 class RandomRequestStrategy(OffloadStrategy):
-    """Random per-request outsourcing (baseline)."""
+    """Random per-request outsourcing at a fixed fraction (baseline).
+
+    Each request is outsourced i.i.d. with probability `fraction`,
+    independent of features or system state.
+    """
 
     def should_outsource(self, req: dict, kv_pressure: float) -> bool:
         self.n_total += 1
@@ -1061,13 +1121,21 @@ async def run_compare(args: argparse.Namespace) -> None:
         json.dump(config, f, indent=2)
 
     all_strategies = [
+        # Intuitive baselines (oblivious / extremes).
+        ("all_local", lambda: AllLocalStrategy(frac, args.seed)),
+        ("all_cloud", lambda: AllCloudStrategy(frac, args.seed)),
+        ("fifo", lambda: FIFOStrategy(frac, args.seed, trace)),
         ("random_request", lambda: RandomRequestStrategy(frac, args.seed)),
+        # System-state baselines.
         ("pressure_gated", lambda: PressureGatedStrategy(frac, args.seed)),
         ("session_aware", lambda: SessionAwareStrategy(frac, args.seed, trace)),
         ("gated_session_aware", lambda: GatedSessionAwareStrategy(frac, args.seed)),
+        # Feature-aware baselines.
+        ("size_long", lambda: SizeOutsourceLongStrategy(frac, args.seed, trace)),
+        ("size_short", lambda: SizeOutsourceShortStrategy(frac, args.seed, trace)),
         ("flop_based", lambda: FlopBasedStrategy(frac, args.seed, trace)),
+        # Ours.
         ("cache_disp", lambda: CacheDispStrategy(frac, args.seed, trace)),
-        ("oracle_size", lambda: SizeOutsourceLongStrategy(frac, args.seed, trace)),
     ]
     if args.strategies:
         selected = set(args.strategies)
