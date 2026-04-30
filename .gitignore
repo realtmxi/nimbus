@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.venv/
+venv/
+
+# Data files (too large)
+data/*.jsonl
+data/*.csv
+data/*.tar.gz
+!data/README.md
+
+# Logs and results from runs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated figures (kept curated copies in results/images/)
+*.tmp.png
