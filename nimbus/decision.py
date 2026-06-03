@@ -19,6 +19,12 @@ from .request import OutsourcingRequestInfo
 from .request_tracker import RequestTracker
 from .violation_detection import TTFTViolationDetector
 
+import logging
+
+
+def get_logger(name):
+    return logging.getLogger(name)
+
 
 @dataclass
 class OutsourcingDecision:
@@ -174,7 +180,6 @@ class OutsourcingEngine:
             if not candidates:
                 if self.debug_outsourcing:
                     import logging
-def get_logger(name): return logging.getLogger(name)
 
                     logger = get_logger(__name__)
                     logger.info(
@@ -196,7 +201,6 @@ def get_logger(name): return logging.getLogger(name)
                 # No violations detected, we're done
                 if iteration > 0 and self.debug_outsourcing:
                     import logging
-def get_logger(name): return logging.getLogger(name)
 
                     logger = get_logger(__name__)
                     logger.info(
@@ -206,7 +210,6 @@ def get_logger(name): return logging.getLogger(name)
 
             if iteration == 0 and self.debug_outsourcing:
                 import logging
-def get_logger(name): return logging.getLogger(name)
 
                 logger = get_logger(__name__)
                 logger.info(f"[{self.model_id}] TTFT violation detected at t={current_time:.2f}")
@@ -232,7 +235,6 @@ def get_logger(name): return logging.getLogger(name)
                 outsource_ids = [sorted_items[0]["id"]]
                 if self.debug_outsourcing:
                     import logging
-def get_logger(name): return logging.getLogger(name)
 
                     logger = get_logger(__name__)
                     logger.info(
@@ -246,7 +248,6 @@ def get_logger(name): return logging.getLogger(name)
             if single_outsource:
                 if self.debug_outsourcing:
                     import logging
-def get_logger(name): return logging.getLogger(name)
 
                     logger = get_logger(__name__)
                     logger.info(
@@ -265,7 +266,6 @@ def get_logger(name): return logging.getLogger(name)
                 # No request to outsource, break
                 if self.debug_outsourcing:
                     import logging
-def get_logger(name): return logging.getLogger(name)
 
                     logger = get_logger(__name__)
                     logger.info(
@@ -276,7 +276,6 @@ def get_logger(name): return logging.getLogger(name)
         # Safety limit reached
         if iteration >= self.max_outsourcing_iterations and self.debug_outsourcing:
             import logging
-def get_logger(name): return logging.getLogger(name)
 
             logger = get_logger(__name__)
             logger.warning(
