@@ -18,7 +18,7 @@ compute (FLOPs) when the real bottleneck is cache displacement (memory × time).
 Local LLM deployment is cheap but limited. When burst traffic exceeds local capacity,
 some requests must be outsourced to cloud APIs. The question: **which requests to outsource?**
 
-Existing systems (including our Nimbus v1) use **FLOP cost** as the outsourcing weight:
+Existing systems and our now-legacy Nimbus V0 path use **FLOP cost** as the outsourcing weight:
 outsource the most compute-expensive requests first to free the most GPU cycles.
 
 **This is wrong.** In prefix-caching LLM serving, the dominant cost is not compute but
@@ -27,15 +27,17 @@ requests from cache.
 
 ---
 
-## Key Insight: Cache Miss >> Batch Penalty (152×)
+## Key Insight: Cache Miss >> Batch Penalty
 
-We measured two penalties on Qwen2.5-7B (RTX PRO 6000 Blackwell):
+The working hypothesis is that prefix-cache misses dominate decode batching
+penalties. The exact ratios must be remeasured under the steady-state
+hold/trigger-removal protocol before being cited as final paper numbers.
 
 | Penalty | Magnitude | What it means |
 |---|---|---|
-| **Cache miss** (prefix cache evicted) | **251× TTFT** | Losing cache is catastrophic |
-| **Batch contention** (larger batch) | **1.65× TPOT** | Sharing GPU is mild |
-| **Ratio** | **152×** | Cache preservation is 152× more important than compute saving |
+| **Cache miss** (prefix cache evicted) | pending remeasurement | Losing cache is catastrophic |
+| **Batch contention** (larger batch) | pending remeasurement | Sharing GPU is mild |
+| **Ratio** | pending remeasurement | Cache preservation is more important than compute saving |
 
 So the right outsourcing objective is: **preserve the prefix cache**, not save compute.
 
@@ -51,14 +53,16 @@ hysteretic phase transition:
 - **Saturated**: cache evicted → slow service → queue buildup → memory pressure →
   more eviction → cache gone (self-reinforcing)
 
-**Experimental evidence** (Qwen2.5-7B, ShareGPT+BurstGPT trace, 28K requests):
+**Experimental evidence status**: the existing ramp experiment is exploratory.
+Do not cite the old exploratory ratios until the measurement is replaced with a
+steady-state hold plus trigger-removal protocol.
 
 | Metric | Value |
 |---|---|
-| Phase transition | 251× TTFT degradation |
-| Hysteresis gap | 470× at same outsource fraction |
-| Policy invariance | All routing policies equivalent under saturation |
-| Session coherence | 37× better than oracle request-level admission |
+| Phase transition | pending validated protocol |
+| Hysteresis gap | pending validated protocol |
+| Policy invariance | pending validated protocol |
+| Session coherence | pending validated protocol |
 
 This is not gradual degradation. It is a feedback-driven cliff. Once you fall off,
 you cannot climb back without drastic action.
@@ -111,7 +115,7 @@ The two strategies are nearly **orthogonal** on production workloads.
 | decode only | 201M | #2 |
 | prefill² + decode² | 140M | #3 |
 | prefill + decode | 139M | #4 |
-| FLOPs (Nimbus v1) | 132M | #5 |
+| FLOPs (legacy V0) | 132M | #5 |
 | prefill only | 117M | #6 |
 
 Multiply captures both dimensions (memory footprint × time held). Additive methods
@@ -122,7 +126,7 @@ are dominated by whichever dimension is larger, losing the other.
 ## End-to-End Results
 
 **Setup**: Qwen2.5-7B-Instruct, RTX PRO 6000 Blackwell 96GB, ShareGPT+BurstGPT
-trace (28K requests), live SGLang server, trace replay at 5× speedup.
+trace (28K requests), live vLLM/OpenAI-compatible server, trace replay at 5× speedup.
 
 ### TTFT p50 (ms) by Outsource Fraction
 
@@ -167,18 +171,22 @@ To meet TTFT p99 < 5s SLO:
 
 ## What Changed in the Code
 
-One line in `routing/outsourcing/decision.py`:
+The core path is now in `nimbus/decision.py` and exposes explicit weight modes:
 
 ```python
-# Before (Nimbus v1 — FLOP-based):
-weight = int(prefill_flops + 0.6 * decode_flops)
+# Legacy V0 comparison:
+weight_mode = "v0_flops"
 
-# After (Nimbus v2 — Cache Displacement):
-weight = int(req.prefill_tokens * req.estimated_decode_tokens)
+# Cache displacement:
+weight_mode = "v1_cache_displacement"
+
+# Online Nimbus default:
+weight_mode = "v2_token_seconds"
 ```
 
-The rest of the Nimbus system (TTFT predictor, iterative knapsack, prefix cache
-awareness) remains unchanged.
+The online experiment path is `experiments/run_engine.py --policy nimbus --weight v2`.
+It uses a KV-time budget (`available_kv_tokens * horizon_seconds`) and does not
+call the legacy FLOP TTFT detector on the Nimbus decision path.
 
 ### Output Token Estimation Is Not a Problem
 
@@ -200,10 +208,10 @@ In practice, use `max_tokens` (client-specified) or session historical mean.
 
 | # | Contribution | Type | Key Number |
 |---|---|---|---|
-| C1 | Cache miss >> batch penalty (152×) | Measurement | 152× ratio |
+| C1 | Cache miss >> batch penalty | Measurement | pending validated ratio |
 | C2 | Cache Displacement metric (memory-time product) | Theory + Ablation | #1 in 6-way ablation |
 | C3 | FLOP-based picks wrong requests | Key Finding | 89% different, 11.7× E2E gap |
-| C4 | Bistability in prefix-caching serving | Formalization | 251× TTFT, 470× hysteresis |
+| C4 | Bistability in prefix-caching serving | Formalization | pending validated protocol |
 | C5 | Nimbus v2 system | System | 11.7× at 15%, 17% cost saving |
 | C6 | FreeInference + production traces | Infrastructure | 55K LOC, 3 traces |
 
@@ -223,7 +231,7 @@ In practice, use `max_tokens` (client-specified) or session historical mean.
 
 ## Experiment Status
 
-- [x] Bistability measurement (251×, 470× hysteresis) — Done
+- [ ] Bistability measurement — replace exploratory ramp with steady-state hold + trigger-removal
 - [x] 6-way weight function ablation — Done
 - [x] DI reversal on 3 traces — Done
 - [x] E2E knee sweep (4 strategies × 7 fractions) — Done
@@ -231,7 +239,7 @@ In practice, use `max_tokens` (client-specified) or session historical mean.
 - [x] Output estimation robustness analysis — Done
 - [ ] Near-knee repeat runs for error bars — Running (~9h)
 - [ ] Rednote trace validation (optional, expected gap larger)
-- [ ] Nimbus v2 integration test (knapsack + TTFT predictor)
+- [x] Nimbus v2 integration test (KV-time budget + knapsack decision loop)
 
 ---
 

@@ -15,10 +15,20 @@ use the simpler one.
 
 ## Background: How Nimbus Uses Knapsack
 
-When a TTFT violation is detected, Nimbus runs an iterative loop:
+The online Nimbus path (`nimbus/decision.py::decide_by_kv_time_budget`) uses
+a KV-time budget:
 
 ```
-while TTFT_violation_exists():
+budget = available_kv_tokens * horizon_seconds
+```
+
+and repeatedly solves a keep-local knapsack while the waiting queue exceeds
+that budget.
+
+This standalone analysis intentionally uses a stricter solver-isolation loop:
+
+```
+while forced_overflow_exists():
     items = [knapsack_item(r) for r in waiting_queue]
     budget = total_weight - 1        # force at least 1 outsource
     keep_set, outsource_set = knapsack.solve(items, budget)
@@ -28,15 +38,16 @@ while TTFT_violation_exists():
 ```
 
 Each request becomes a knapsack item:
-- **weight** = `prefill_tokens * decode_tokens` (cache displacement)
+- **weight** = `prefill_tokens * decode_tokens` (V1 cache displacement)
 - **value** = API cost if outsourced (what we save by keeping it local)
 
-The budget is set to `total_weight - 1` to guarantee at least one request
-is outsourced per iteration.
+The online V2 path uses token-seconds, but V1 is enough for this experiment:
+the question here is whether 0/1 DP and greedy ratio sorting make equivalent
+choices under heterogeneous request weights and values.
 
 ## Experiment Design
 
-### Two Solvers (already implemented in `routing/outsourcing/knapsack.py`)
+### Two Solvers (already implemented in `nimbus/knapsack.py`)
 
 | Solver | Strategy | How it works |
 |--------|----------|-------------|

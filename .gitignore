@@ -10,6 +10,9 @@ venv/
 data/*.jsonl
 data/*.csv
 data/*.tar.gz
+data/**/*.jsonl
+data/**/*.csv
+data/.cache/
 !data/README.md
 
 # Logs and results from runs
@@ -27,3 +30,7 @@ Thumbs.db
 
 # Generated figures (kept curated copies in results/images/)
 *.tmp.png
+
+# Secrets — never commit
+.env
+.env.*

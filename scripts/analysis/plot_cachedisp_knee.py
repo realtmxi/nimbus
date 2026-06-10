@@ -13,9 +13,8 @@ Usage:
 import argparse
 import csv
 import json
+import sys
 from pathlib import Path
-
-import matplotlib.pyplot as plt
 
 STRATEGY_COLORS = {
     "flop_based": "#d62728",      # red
@@ -24,18 +23,33 @@ STRATEGY_COLORS = {
     "oracle_size": "#9467bd",     # purple
 }
 STRATEGY_LABELS = {
-    "flop_based": "FLOP-based (Nimbus v1)",
+    "flop_based": "FLOP-based (legacy)",
     "cache_disp": "Cache Displacement (ours)",
     "session_aware": "Session-aware",
     "oracle_size": "Oracle (size)",
 }
 
 
+class MissingPlotDependency(RuntimeError):
+    """Raised when plotting dependencies are not installed."""
+
+
+def _require_pyplot():
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError as exc:
+        raise MissingPlotDependency(
+            "matplotlib is required for plotting. Install project deps with "
+            "`python3 -m pip install -r requirements.txt`."
+        ) from exc
+    return plt
+
+
 def load_sweep(sweep_root: Path):
     """Return {strategy: [(fraction, ttft_p50, ttft_p99, cache_hit, success_pct), ...]}"""
     results = {}
-    for run_dir in sorted(sweep_root.glob("strategies_*")):
-        summary = run_dir / "strategy_summary.csv"
+    for summary in sorted(sweep_root.rglob("strategy_summary.csv")):
+        run_dir = summary.parent
         cfg = run_dir / "config.json"
         if not summary.exists() or not cfg.exists():
             continue
@@ -44,10 +58,17 @@ def load_sweep(sweep_root: Path):
 
         with open(summary) as f:
             for row in csv.DictReader(f):
-                strat = row["strategy"]
+                strat = row.get("strategy") or row.get("label")
+                if not strat:
+                    continue
                 ttft_p50 = float(row.get("ttft_p50_ms") or row.get("ttft_p50") or 0)
                 ttft_p99 = float(row.get("ttft_p99_ms") or row.get("ttft_p99") or 0)
-                success = float(row.get("success_rate_pct") or row.get("success_pct") or 0)
+                success = float(
+                    row.get("success_rate_pct")
+                    or row.get("success_pct")
+                    or row.get("local_success_rate")
+                    or 0
+                )
                 # Cache hit rate: load from metrics.csv if available
                 cache_hit = load_mean_cache_hit(run_dir / strat / "metrics.csv")
                 results.setdefault(strat, []).append(
@@ -75,6 +96,7 @@ def load_mean_cache_hit(metrics_csv: Path) -> float:
 
 
 def plot_knee(results, output: Path):
+    plt = _require_pyplot()
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8), sharex=True)
     for strat in ["flop_based", "cache_disp", "session_aware", "oracle_size"]:
         if strat not in results:
@@ -146,7 +168,11 @@ def main():
         print(f"  {s}: {len(d)} fractions")
 
     output = args.output or (args.sweep_dir / "knee_plot.png")
-    plot_knee(results, output)
+    try:
+        plot_knee(results, output)
+    except MissingPlotDependency as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
     print_dollar_efficiency(results, 5000)
     print_dollar_efficiency(results, 1000)
 

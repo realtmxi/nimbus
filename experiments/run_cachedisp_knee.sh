@@ -15,8 +15,8 @@ SGLANG_URL="http://localhost:8200"
 MODEL="Qwen2.5-7B-Instruct"
 TRACE="data/sharegpt_burstgpt/sharegpt_prompts_burstgpt_timestamps.jsonl"
 OUT="logs/cachedisp_${TAG}"
-PY="/home/murphy/local-deployment/.venv/bin/python"
-SCRIPT="experiments/local_deployment/phase2/run_offload_strategies.py"
+PY="${PYTHON:-python3}"
+SCRIPT="experiments/run_offload_strategies.py"
 
 STRATEGIES="flop_based cache_disp session_aware oracle_size"
 FRACTIONS="0.0 0.15 0.20 0.25 0.30 0.35 0.50"
@@ -33,27 +33,18 @@ echo "Fractions: $FRACTIONS" | tee -a "$OUT/driver.log"
 echo "Strategies: $STRATEGIES" | tee -a "$OUT/driver.log"
 echo "" | tee -a "$OUT/driver.log"
 
-for frac in $FRACTIONS; do
-    echo "========================================" | tee -a "$OUT/driver.log"
-    echo "FRACTION $frac @ $(date)" | tee -a "$OUT/driver.log"
-    echo "========================================" | tee -a "$OUT/driver.log"
-
-    $PY $SCRIPT \
-        --sglang-url "$SGLANG_URL" \
-        --model "$MODEL" \
-        --trace-file "$TRACE" \
-        --start-hours $START_HOURS \
-        --duration-hours $DURATION_HOURS \
-        --time-scale $TIME_SCALE \
-        --mode compare \
-        --fraction $frac \
-        --strategies $STRATEGIES \
-        --output-dir "$OUT" \
-        --seed $SEED 2>&1 | tee -a "$OUT/driver.log"
-
-    # Give the server 30s cooldown between fractions
-    sleep 30
-done
+$PY $SCRIPT \
+    --sglang-url "$SGLANG_URL" \
+    --model "$MODEL" \
+    --trace-file "$TRACE" \
+    --start-hours $START_HOURS \
+    --duration-hours $DURATION_HOURS \
+    --time-scale $TIME_SCALE \
+    --mode knee \
+    --fractions $FRACTIONS \
+    --strategies $STRATEGIES \
+    --output-dir "$OUT" \
+    --seed $SEED 2>&1 | tee -a "$OUT/driver.log"
 
 echo "" | tee -a "$OUT/driver.log"
 echo "Completed: $(date)" | tee -a "$OUT/driver.log"

@@ -17,7 +17,8 @@ class RequestTracker:
 
         Args:
             model_id: ID of the model/replica
-            cost_calculator: Function to calculate API cost (input_tokens, output_tokens) -> cost
+            cost_calculator: Function to calculate API cost
+                (input_tokens, cached_input_tokens, output_tokens) -> cost
         """
         self._model_id = model_id
         self._cost_calculator = cost_calculator
@@ -37,7 +38,15 @@ class RequestTracker:
         """
         input_tokens = request.num_prompt_tokens
         output_tokens = request.num_output_tokens
-        api_cost = self._cost_calculator(input_tokens, output_tokens)
+        cached_input_tokens = min(
+            input_tokens,
+            max(0, int(request.metadata.get("remote_cached_tokens") or 0)),
+        )
+        api_cost = self._cost_calculator(
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+        )
 
         self._outsourced_request_details.append(
             {
@@ -47,6 +56,7 @@ class RequestTracker:
                 "queue_time": request.queue_time,
                 "num_prompt_tokens": input_tokens,
                 "num_output_tokens": output_tokens,
+                "remote_cached_tokens": cached_input_tokens,
                 "num_processed_tokens": request.num_processed_tokens,
                 "num_cached_tokens": request.num_cached_tokens,
                 "api_cost_usd": api_cost,
@@ -66,6 +76,7 @@ class RequestTracker:
                 "total_api_cost_usd": 0.0,
                 "total_input_tokens": 0,
                 "total_output_tokens": 0,
+                "total_remote_cached_tokens": 0,
                 "model_id": str(self._model_id),
             }
 
@@ -79,11 +90,15 @@ class RequestTracker:
         total_output = sum(
             d["num_output_tokens"] for d in self._outsourced_request_details
         )
+        total_remote_cached = sum(
+            d["remote_cached_tokens"] for d in self._outsourced_request_details
+        )
 
         return {
             "total_outsourced": total,
             "total_api_cost_usd": total_cost,
             "total_input_tokens": total_input,
             "total_output_tokens": total_output,
+            "total_remote_cached_tokens": total_remote_cached,
             "model_id": str(self._model_id),
         }

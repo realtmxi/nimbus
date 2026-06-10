@@ -1,30 +1,22 @@
 #!/usr/bin/env python3
-"""Phase 2.6: Offload Strategy Comparison.
+"""Fixed-fraction offload strategy replay.
 
-Compares four outsourcing strategies at matched budgets to test whether
-*when* and *how* you outsource matters more than *how much*:
-
-  A) random-request       — baseline (already shown ineffective)
-  B) pressure-gated       — only outsource when KV > threshold (tests timing)
-  C) session-aware        — outsource entire sessions to preserve prefix chains
-  D) gated-session-aware  — pressure gate + session-level sticky decisions
-
-Also sweeps fractions around the capacity knee (35%, 40%, 50%) to find the
-phase transition point where the system escapes the saturated regime.
-
-Key hypothesis: session-aware offload at 25% >>> random offload at 25%,
-because it preserves intra-session prefix continuity.
+This script is for baseline and oracle-style fixed-fraction comparisons against
+live SGLang. The online Nimbus algorithm lives in ``experiments/run_engine.py``
+and the core package ``nimbus/decision.py``.
 
 Usage:
-    # Compare 3 strategies at 25% budget
-    python experiments/local_deployment/phase2/run_offload_strategies.py \
-        --sglang-url http://localhost:8003
+    # Compare selected strategies at one fraction
+    python experiments/run_offload_strategies.py --sglang-url http://localhost:8200 \
+        --mode compare --fraction 0.25 --strategies cache_disp session_aware
 
-    # Knee-finding sweep (random strategy, fine fractions)
-    python experiments/local_deployment/phase2/run_offload_strategies.py \
-        --sglang-url http://localhost:8003 \
-        --mode knee --fractions 0.0 0.30 0.35 0.40 0.45 0.50
+    # Sweep fractions for several strategies
+    python experiments/run_offload_strategies.py --sglang-url http://localhost:8200 \
+        --mode knee --fractions 0.0 0.15 0.20 0.25 0.30 \
+        --strategies flop_based cache_disp session_aware oracle_size
 """
+
+from __future__ import annotations
 
 import argparse
 import asyncio
@@ -37,15 +29,43 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
-import aiohttp
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from metrics_collector import collect_loop
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_TRACE = (
     _PROJECT_ROOT / "data" / "sharegpt_burstgpt" / "sharegpt_prompts_burstgpt_timestamps.jsonl"
 )
+
+
+class MissingExperimentDependency(RuntimeError):
+    """Raised when a live experiment dependency is not installed."""
+
+
+def _require_aiohttp():
+    """Import aiohttp only for live SGLang paths.
+
+    Strategy construction, trace loading, and ``--help`` should work on a
+    lightweight local Python. Real replay/probing still requires project deps.
+    """
+    try:
+        import aiohttp
+    except ModuleNotFoundError as exc:
+        raise MissingExperimentDependency(
+            "aiohttp is required for live SGLang replay. Install project deps with "
+            "`python3 -m pip install -r requirements.txt`."
+        ) from exc
+    return aiohttp
+
+
+def _require_collect_loop():
+    try:
+        from metrics_collector import collect_loop
+    except ModuleNotFoundError as exc:
+        raise MissingExperimentDependency(
+            "metrics collection dependencies are missing. Install project deps with "
+            "`python3 -m pip install -r requirements.txt`."
+        ) from exc
+    return collect_loop
 
 
 # ---------------------------------------------------------------------------
@@ -76,9 +96,14 @@ def load_trace(
                 continue
             if duration_hours is not None and elapsed_h > start_hours + duration_hours:
                 break
+            session_id = row.get("session_id", 0)
+            if session_id is None or session_id == "":
+                session_id = 0
             requests.append({
+                "request_id": i,
+                "arrived_at": ts,
                 "ts_sec": ts,
-                "session_id": int(row.get("session_id", 0)),
+                "session_id": session_id,
                 "prompt_text": row.get("prompt_text", ""),
                 "num_prefill_tokens": int(row.get("num_prefill_tokens", 0)),
                 "num_decode_tokens": int(row.get("num_decode_tokens", 256)),
@@ -91,6 +116,15 @@ def load_trace(
 # ---------------------------------------------------------------------------
 # Request sender (same as cascade verification)
 # ---------------------------------------------------------------------------
+def stream_chunk_has_content(chunk: dict) -> bool:
+    """Return True when an OpenAI streaming chunk carries non-empty content."""
+    choices = chunk.get("choices") or []
+    if not choices:
+        return False
+    delta = choices[0].get("delta") or {}
+    return isinstance(delta.get("content"), str) and bool(delta["content"])
+
+
 async def send_request(
     session: aiohttp.ClientSession,
     url: str,
@@ -145,6 +179,7 @@ async def send_request(
 
     start = time.time()
     ttft_ms = None
+    first_choice_ms = None
     chunk_count = 0
     try:
         async with session.post(url, json=payload, headers=headers) as resp:
@@ -158,15 +193,20 @@ async def send_request(
                 try:
                     cj = json.loads(data)
                     chunk_count += 1
-                    if ttft_ms is None:
-                        choices = cj.get("choices") or []
-                        if choices:
-                            delta = choices[0].get("delta") or {}
-                            if isinstance(delta.get("content"), str) and delta["content"]:
-                                ttft_ms = (time.time() - start) * 1000
+                    choices = cj.get("choices") or []
+                    if choices and first_choice_ms is None:
+                        first_choice_ms = (time.time() - start) * 1000
+                    if ttft_ms is None and choices:
+                        # Some OpenAI-compatible servers emit an initial role-only
+                        # or empty delta. Prefer first non-empty content, but fall
+                        # back to the first choices chunk before returning.
+                        if stream_chunk_has_content(cj):
+                            ttft_ms = (time.time() - start) * 1000
                 except Exception:
                     pass
             latency_ms = (time.time() - start) * 1000
+            if ttft_ms is None:
+                ttft_ms = first_choice_ms
             return {
                 "success": resp.status == 200,
                 "ttft_ms": ttft_ms,
@@ -198,6 +238,7 @@ async def probe_kv_pressure(sglang_url: str) -> float:
     On timeout/error, returns last known value instead of 0 to avoid
     false negatives under heavy load.
     """
+    aiohttp = _require_aiohttp()
     global _last_kv_pressure
     url = f"{sglang_url.rstrip('/')}/metrics"
     timeout = aiohttp.ClientTimeout(total=5)
@@ -350,7 +391,7 @@ class SessionAwareStrategy(OffloadStrategy):
         session_ids = list({req["session_id"] for req in trace})
         self.rng.shuffle(session_ids)
         n_outsource = int(len(session_ids) * fraction)
-        self.outsourced_sessions: set[int] = set(session_ids[:n_outsource])
+        self.outsourced_sessions: set[object] = set(session_ids[:n_outsource])
 
     def should_outsource(self, req: dict, kv_pressure: float) -> bool:
         self.n_total += 1
@@ -418,15 +459,15 @@ class SizeOutsourceShortStrategy(OffloadStrategy):
 
 
 class FlopBasedStrategy(OffloadStrategy):
-    """Outsource requests with highest FLOP cost (production Nimbus v1 weight).
+    """Outsource requests with highest FLOP cost (legacy V0 baseline).
 
-    Uses the production SimpleFLOPCalculator from routing/outsourcing/flop_calculator.py
-    with Qwen2.5-7B architecture params. Weight =
+    Uses the same SimpleFLOPCalculator formula as the legacy FLOP path with
+    Qwen2.5-7B architecture params. Weight =
         compute_prefill_flops(prefill) + 0.6 * compute_decode_flops(decode)
-    matching Nimbus v1's default decode_weight_ratio.
+    matching the legacy default decode_weight_ratio.
 
     Pre-computes a percentile threshold on the full trace (oracle for threshold,
-    but the scoring function is what Nimbus v1 actually uses in production).
+    but the scoring function is the legacy comparison point).
     """
 
     def __init__(
@@ -550,6 +591,69 @@ class GatedSessionAwareStrategy(OffloadStrategy):
             return False
 
 
+DEFAULT_COMPARE_STRATEGIES = [
+    "all_local",
+    "all_cloud",
+    "fifo",
+    "random_request",
+    "pressure_gated",
+    "session_aware",
+    "gated_session_aware",
+    "size_long",
+    "size_short",
+    "flop_based",
+    "cache_disp",
+]
+
+DEFAULT_KNEE_STRATEGIES = [
+    "flop_based",
+    "cache_disp",
+    "session_aware",
+    "oracle_size",
+]
+
+
+def make_strategy_factories(frac: float, args: argparse.Namespace, trace: list[dict]):
+    """Return strategy factories keyed by CLI strategy name.
+
+    ``oracle_size`` is kept as a compatibility alias for the largest-prefill
+    oracle used by the analysis scripts.
+    """
+    return {
+        # Intuitive baselines (oblivious / extremes).
+        "all_local": lambda: AllLocalStrategy(frac, args.seed),
+        "all_cloud": lambda: AllCloudStrategy(frac, args.seed),
+        "fifo": lambda: FIFOStrategy(frac, args.seed, trace),
+        "random_request": lambda: RandomRequestStrategy(frac, args.seed),
+        # System-state baselines.
+        "pressure_gated": lambda: PressureGatedStrategy(frac, args.seed),
+        "session_aware": lambda: SessionAwareStrategy(frac, args.seed, trace),
+        "gated_session_aware": lambda: GatedSessionAwareStrategy(frac, args.seed),
+        # Feature-aware baselines.
+        "size_long": lambda: SizeOutsourceLongStrategy(frac, args.seed, trace),
+        "oracle_size": lambda: SizeOutsourceLongStrategy(frac, args.seed, trace),
+        "size_short": lambda: SizeOutsourceShortStrategy(frac, args.seed, trace),
+        # Legacy baseline and current fixed-fraction heuristic.
+        "flop_based": lambda: FlopBasedStrategy(frac, args.seed, trace),
+        "cache_disp": lambda: CacheDispStrategy(frac, args.seed, trace),
+    }
+
+
+def build_strategies(
+    names: list[str],
+    frac: float,
+    args: argparse.Namespace,
+    trace: list[dict],
+) -> list[tuple[str, OffloadStrategy]]:
+    factories = make_strategy_factories(frac, args, trace)
+    unknown = [name for name in names if name not in factories]
+    if unknown:
+        raise ValueError(
+            f"Unknown strategies: {unknown}. Choose from: {sorted(factories)}"
+        )
+    return [(name, factories[name]()) for name in names]
+
+
 # ---------------------------------------------------------------------------
 # Replay with strategy
 # ---------------------------------------------------------------------------
@@ -563,6 +667,7 @@ async def replay_with_strategy(
     probe_interval: float = 2.0,
 ) -> list[dict]:
     """Replay trace using the given offload strategy."""
+    aiohttp = _require_aiohttp()
     url = f"{sglang_url.rstrip('/')}/v1/chat/completions"
     connector = aiohttp.TCPConnector(limit=0)
     timeout = aiohttp.ClientTimeout(total=None)
@@ -718,6 +823,7 @@ def compute_stats(results: list[dict], label: str) -> dict:
 # ---------------------------------------------------------------------------
 async def wait_for_cooldown(sglang_url: str, max_wait: float = 120) -> None:
     """Wait until SGLang has 0 running and 0 queued requests."""
+    aiohttp = _require_aiohttp()
     url = f"{sglang_url.rstrip('/')}/metrics"
     timeout = aiohttp.ClientTimeout(total=5)
     start = time.time()
@@ -763,6 +869,7 @@ async def replay_with_ramp(
                   [(0, 0.0), (4000, 0.30), (8000, 0.40)]
                   means 0% for first 4000 reqs, then 30%, then 40%.
     """
+    aiohttp = _require_aiohttp()
     url = f"{sglang_url.rstrip('/')}/v1/chat/completions"
     connector = aiohttp.TCPConnector(limit=0)
     timeout = aiohttp.ClientTimeout(total=None)
@@ -923,11 +1030,133 @@ def compute_phase_stats(results: list[dict]) -> list[dict]:
     return all_stats
 
 
+def _coefficient_of_variation(values: list[float]) -> float:
+    vals = [float(v) for v in values if float(v) > 0]
+    if len(vals) <= 1:
+        return 0.0
+    mean = sum(vals) / len(vals)
+    if mean <= 0:
+        return 0.0
+    var = sum((v - mean) ** 2 for v in vals) / len(vals)
+    return (var ** 0.5) / mean
+
+
+def _steady_state_reached(
+    segment_stats: list[dict],
+    min_windows: int,
+    cv_threshold: float,
+) -> tuple[bool, dict]:
+    """Return whether recent hold segments look steady enough to compare."""
+    if len(segment_stats) < min_windows:
+        return False, {
+            "steady_windows": len(segment_stats),
+            "ttft_p50_cv": "",
+            "success_rate_cv": "",
+        }
+
+    recent = segment_stats[-min_windows:]
+    ttft_cv = _coefficient_of_variation([s.get("ttft_p50", 0.0) for s in recent])
+    success_cv = _coefficient_of_variation(
+        [max(float(s.get("local_success_rate", 0.0)), 1e-9) for s in recent]
+    )
+    steady = ttft_cv <= cv_threshold and success_cv <= cv_threshold
+    return steady, {
+        "steady_windows": min_windows,
+        "ttft_p50_cv": ttft_cv,
+        "success_rate_cv": success_cv,
+    }
+
+
+def _trace_chunk(trace: list[dict], start: int, count: int) -> list[dict]:
+    if not trace or count <= 0:
+        return []
+    if start + count <= len(trace):
+        return trace[start:start + count]
+    # Wrap around for long hold protocols. Each replay chunk re-bases timestamps
+    # to its own first request, so wrapping only reuses request shapes.
+    out = trace[start:]
+    remaining = count - len(out)
+    while remaining > 0:
+        take = min(remaining, len(trace))
+        out.extend(trace[:take])
+        remaining -= take
+    return out
+
+
+async def _flush_cache_best_effort(sglang_url: str) -> None:
+    aiohttp = _require_aiohttp()
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(f"{sglang_url.rstrip('/')}/flush_cache") as resp:
+                print(f"  Flush response: {resp.status}")
+    except Exception as exc:
+        print(f"  Flush failed: {exc}")
+
+
+async def _run_hold_until_steady(
+    *,
+    args: argparse.Namespace,
+    trace: list[dict],
+    trace_start: int,
+    fraction: float,
+    label: str,
+    out_dir: Path,
+) -> tuple[int, list[dict], dict]:
+    """Run repeated fixed-fraction hold segments until steady or max segments."""
+    segment_stats: list[dict] = []
+    trace_pos = trace_start
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for segment_idx in range(args.bistability_max_holds):
+        chunk = _trace_chunk(trace, trace_pos % len(trace), args.bistability_hold_requests)
+        trace_pos += args.bistability_hold_requests
+        strategy = RandomRequestStrategy(fraction, args.seed + segment_idx)
+        requests_csv = out_dir / f"{label}_segment_{segment_idx:02d}.csv"
+        print(
+            f"  Hold {label} segment={segment_idx} fraction={fraction:.0%} "
+            f"requests={len(chunk)}"
+        )
+        results = await replay_with_strategy(
+            args.sglang_url,
+            args.model,
+            chunk,
+            args.time_scale,
+            strategy,
+            requests_csv,
+        )
+        stats = compute_stats(results, f"{label}_segment_{segment_idx:02d}")
+        stats.update(
+            {
+                "stage": label,
+                "segment": segment_idx,
+                "target_fraction": fraction,
+                "actual_outsource_pct": strategy.actual_fraction,
+                "requests_csv": str(requests_csv),
+            }
+        )
+        segment_stats.append(stats)
+
+        steady, steady_metrics = _steady_state_reached(
+            segment_stats,
+            args.bistability_steady_windows,
+            args.bistability_steady_cv,
+        )
+        stats.update(steady_metrics)
+        stats["steady"] = steady
+        if steady:
+            break
+
+    final = segment_stats[-1] if segment_stats else {}
+    return trace_pos, segment_stats, final
+
+
 # ---------------------------------------------------------------------------
 # Main: hysteresis verification mode
 # ---------------------------------------------------------------------------
 async def run_hysteresis(args: argparse.Namespace) -> None:
     """Test for hysteresis by ramping fraction UP then DOWN without cache flush."""
+    aiohttp = _require_aiohttp()
+    collect_loop = _require_collect_loop()
     fractions = args.fractions  # e.g. [0.0, 0.30, 0.35, 0.40, 0.45, 0.50]
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     sweep_dir = Path(args.output_dir) / f"hysteresis_{ts}"
@@ -1071,11 +1300,209 @@ async def run_hysteresis(args: argparse.Namespace) -> None:
     print("hysteresis is confirmed: the system 'remembers' its previous state.")
 
 
+async def run_bistability(args: argparse.Namespace) -> None:
+    """Validate bistability with steady-state hold plus trigger-removal.
+
+    For each target outsource fraction:
+      1. Clean path: flush cache, hold directly at the target fraction until
+         recent segment metrics stabilize.
+      2. Post-trigger path: flush cache, hold at a trigger fraction until stable,
+         then remove the trigger by switching to the same target fraction and
+         hold again until stable.
+
+    If the two final steady states differ at the same target fraction, the
+    experiment supports hysteresis/bistability. The old ramp mode is kept only
+    as a quick exploratory smoke.
+    """
+    collect_loop = _require_collect_loop()
+    fractions = args.fractions
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    sweep_dir = Path(args.output_dir) / f"bistability_{ts}"
+    sweep_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=== Bistability Hold + Trigger-Removal Experiment ===")
+    print(f"SGLang:          {args.sglang_url}")
+    print(f"Target fractions:{[f'{f:.0%}' for f in fractions]}")
+    print(f"Trigger fraction:{args.bistability_trigger_fraction:.0%}")
+    print(f"Hold requests:   {args.bistability_hold_requests}")
+    print(f"Max holds:       {args.bistability_max_holds}")
+    print(f"Steady windows:  {args.bistability_steady_windows}")
+    print(f"Steady CV:       {args.bistability_steady_cv}")
+    print(f"Output:          {sweep_dir}")
+    print()
+
+    trace = load_trace(
+        args.trace_file,
+        args.max_requests,
+        args.duration_hours,
+        args.start_hours,
+    )
+    if not trace:
+        print("No requests loaded!")
+        return
+    print(f"  {len(trace)} requests loaded")
+
+    config = {
+        "sglang_url": args.sglang_url,
+        "model": args.model,
+        "trace_file": args.trace_file,
+        "start_hours": args.start_hours,
+        "duration_hours": args.duration_hours,
+        "time_scale": args.time_scale,
+        "fractions": fractions,
+        "trigger_fraction": args.bistability_trigger_fraction,
+        "hold_requests": args.bistability_hold_requests,
+        "max_holds": args.bistability_max_holds,
+        "steady_windows": args.bistability_steady_windows,
+        "steady_cv": args.bistability_steady_cv,
+        "seed": args.seed,
+        "timestamp": ts,
+    }
+    with open(sweep_dir / "config.json", "w") as f:
+        json.dump(config, f, indent=2)
+
+    metrics_csv = sweep_dir / "metrics.csv"
+    stop_event = asyncio.Event()
+    collector_task = asyncio.create_task(
+        collect_loop(
+            f"{args.sglang_url.rstrip('/')}/metrics",
+            metrics_csv,
+            interval_s=0.1,
+            stop_event=stop_event,
+        )
+    )
+
+    all_segments: list[dict] = []
+    summary_rows: list[dict] = []
+    trace_pos = 0
+
+    try:
+        for target_fraction in fractions:
+            print(f"\n{'#' * 72}")
+            print(f"Target fraction: {target_fraction:.0%}")
+            print(f"{'#' * 72}")
+
+            print("\n[CLEAN PATH] flush -> hold target")
+            await _flush_cache_best_effort(args.sglang_url)
+            await wait_for_cooldown(args.sglang_url)
+            clean_dir = sweep_dir / f"target_{int(target_fraction * 100):03d}" / "clean"
+            trace_pos, clean_segments, clean_final = await _run_hold_until_steady(
+                args=args,
+                trace=trace,
+                trace_start=trace_pos,
+                fraction=target_fraction,
+                label=f"clean_target_{int(target_fraction * 100):03d}",
+                out_dir=clean_dir,
+            )
+            for row in clean_segments:
+                row["path"] = "clean"
+                row["target_fraction"] = target_fraction
+            all_segments.extend(clean_segments)
+
+            print("\n[POST-TRIGGER PATH] flush -> hold trigger -> hold target")
+            await _flush_cache_best_effort(args.sglang_url)
+            await wait_for_cooldown(args.sglang_url)
+            trigger_dir = sweep_dir / f"target_{int(target_fraction * 100):03d}" / "trigger"
+            trace_pos, trigger_segments, trigger_final = await _run_hold_until_steady(
+                args=args,
+                trace=trace,
+                trace_start=trace_pos,
+                fraction=args.bistability_trigger_fraction,
+                label=f"trigger_{int(target_fraction * 100):03d}",
+                out_dir=trigger_dir,
+            )
+            for row in trigger_segments:
+                row["path"] = "trigger"
+                row["target_fraction"] = target_fraction
+            all_segments.extend(trigger_segments)
+
+            post_dir = sweep_dir / f"target_{int(target_fraction * 100):03d}" / "post_trigger"
+            trace_pos, post_segments, post_final = await _run_hold_until_steady(
+                args=args,
+                trace=trace,
+                trace_start=trace_pos,
+                fraction=target_fraction,
+                label=f"post_trigger_target_{int(target_fraction * 100):03d}",
+                out_dir=post_dir,
+            )
+            for row in post_segments:
+                row["path"] = "post_trigger"
+                row["target_fraction"] = target_fraction
+            all_segments.extend(post_segments)
+
+            clean_ttft = float(clean_final.get("ttft_p50", 0.0) or 0.0)
+            post_ttft = float(post_final.get("ttft_p50", 0.0) or 0.0)
+            ratio = post_ttft / clean_ttft if clean_ttft > 0 else 0.0
+            gap_ms = post_ttft - clean_ttft
+            summary_rows.append(
+                {
+                    "target_fraction": target_fraction,
+                    "trigger_fraction": args.bistability_trigger_fraction,
+                    "clean_steady": bool(clean_final.get("steady", False)),
+                    "post_trigger_steady": bool(post_final.get("steady", False)),
+                    "clean_segments": len(clean_segments),
+                    "trigger_segments": len(trigger_segments),
+                    "post_trigger_segments": len(post_segments),
+                    "clean_ttft_p50": clean_ttft,
+                    "post_trigger_ttft_p50": post_ttft,
+                    "gap_ms": gap_ms,
+                    "ratio": ratio,
+                    "clean_success_rate": clean_final.get("local_success_rate", 0.0),
+                    "post_trigger_success_rate": post_final.get("local_success_rate", 0.0),
+                }
+            )
+
+            print(
+                f"\nTarget {target_fraction:.0%}: clean={clean_ttft:.0f}ms "
+                f"post_trigger={post_ttft:.0f}ms gap={gap_ms:+.0f}ms ratio={ratio:.2f}x"
+            )
+    finally:
+        stop_event.set()
+        await asyncio.sleep(0.2)
+        collector_task.cancel()
+        try:
+            await collector_task
+        except asyncio.CancelledError:
+            pass
+
+    segment_cols = [
+        "path", "stage", "segment", "target_fraction", "actual_outsource_pct",
+        "steady", "steady_windows", "ttft_p50_cv", "success_rate_cv",
+        "label", "total_requests", "local_requests", "outsourced_requests",
+        "local_success", "local_success_rate",
+        "ttft_p50", "ttft_p90", "ttft_p95", "ttft_p99", "ttft_max",
+        "latency_p50", "latency_p99", "requests_csv",
+    ]
+    with open(sweep_dir / "bistability_segments.csv", "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=segment_cols, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(all_segments)
+
+    summary_cols = [
+        "target_fraction", "trigger_fraction",
+        "clean_steady", "post_trigger_steady",
+        "clean_segments", "trigger_segments", "post_trigger_segments",
+        "clean_ttft_p50", "post_trigger_ttft_p50",
+        "gap_ms", "ratio",
+        "clean_success_rate", "post_trigger_success_rate",
+    ]
+    summary_path = sweep_dir / "bistability_summary.csv"
+    with open(summary_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=summary_cols)
+        w.writeheader()
+        w.writerows(summary_rows)
+
+    print(f"\nSummary: {summary_path}")
+    print("Use only rows where clean_steady and post_trigger_steady are both true.")
+
+
 # ---------------------------------------------------------------------------
 # Main: strategy comparison mode
 # ---------------------------------------------------------------------------
 async def run_compare(args: argparse.Namespace) -> None:
     """Compare offload strategies at matched budget."""
+    aiohttp = _require_aiohttp()
+    collect_loop = _require_collect_loop()
     frac = args.fraction
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     sweep_dir = Path(args.output_dir) / f"strategies_{ts}_f{int(frac*100):02d}"
@@ -1086,7 +1513,7 @@ async def run_compare(args: argparse.Namespace) -> None:
     print(f"Window:       {args.start_hours}h–{args.start_hours + args.duration_hours}h "
           f"at {args.time_scale}x")
     print(f"Budget:       {frac:.0%} outsource")
-    strat_names = args.strategies or ["random_request", "pressure_gated", "session_aware", "gated_session_aware"]
+    strat_names = args.strategies or DEFAULT_COMPARE_STRATEGIES
     print(f"Strategies:   {', '.join(strat_names)}")
     print(f"Output:       {sweep_dir}")
     print()
@@ -1120,28 +1547,7 @@ async def run_compare(args: argparse.Namespace) -> None:
     with open(sweep_dir / "config.json", "w") as f:
         json.dump(config, f, indent=2)
 
-    all_strategies = [
-        # Intuitive baselines (oblivious / extremes).
-        ("all_local", lambda: AllLocalStrategy(frac, args.seed)),
-        ("all_cloud", lambda: AllCloudStrategy(frac, args.seed)),
-        ("fifo", lambda: FIFOStrategy(frac, args.seed, trace)),
-        ("random_request", lambda: RandomRequestStrategy(frac, args.seed)),
-        # System-state baselines.
-        ("pressure_gated", lambda: PressureGatedStrategy(frac, args.seed)),
-        ("session_aware", lambda: SessionAwareStrategy(frac, args.seed, trace)),
-        ("gated_session_aware", lambda: GatedSessionAwareStrategy(frac, args.seed)),
-        # Feature-aware baselines.
-        ("size_long", lambda: SizeOutsourceLongStrategy(frac, args.seed, trace)),
-        ("size_short", lambda: SizeOutsourceShortStrategy(frac, args.seed, trace)),
-        ("flop_based", lambda: FlopBasedStrategy(frac, args.seed, trace)),
-        # Ours.
-        ("cache_disp", lambda: CacheDispStrategy(frac, args.seed, trace)),
-    ]
-    if args.strategies:
-        selected = set(args.strategies)
-        strategies = [(n, fn()) for n, fn in all_strategies if n in selected]
-    else:
-        strategies = [(n, fn()) for n, fn in all_strategies]
+    strategies = build_strategies(strat_names, frac, args, trace)
 
     all_stats: list[dict] = []
 
@@ -1229,8 +1635,11 @@ async def run_compare(args: argparse.Namespace) -> None:
 # Main: knee-finding sweep mode
 # ---------------------------------------------------------------------------
 async def run_knee(args: argparse.Namespace) -> None:
-    """Sweep fractions to find the capacity knee point."""
+    """Sweep fractions and strategies to find capacity knees."""
+    aiohttp = _require_aiohttp()
+    collect_loop = _require_collect_loop()
     fractions = args.fractions
+    strat_names = args.strategies or DEFAULT_KNEE_STRATEGIES
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     sweep_dir = Path(args.output_dir) / f"knee_{ts}"
     sweep_dir.mkdir(parents=True, exist_ok=True)
@@ -1240,7 +1649,7 @@ async def run_knee(args: argparse.Namespace) -> None:
     print(f"Window:       {args.start_hours}h–{args.start_hours + args.duration_hours}h "
           f"at {args.time_scale}x")
     print(f"Fractions:    {[f'{f:.0%}' for f in fractions]}")
-    print(f"Strategy:     session-aware (preserves prefix chains)")
+    print(f"Strategies:   {', '.join(strat_names)}")
     print(f"Output:       {sweep_dir}")
     print()
 
@@ -1261,7 +1670,7 @@ async def run_knee(args: argparse.Namespace) -> None:
         "duration_hours": args.duration_hours,
         "time_scale": args.time_scale,
         "fractions": fractions,
-        "strategy": "session_aware",
+        "strategies": strat_names,
         "seed": args.seed,
         "timestamp": ts,
     }
@@ -1269,51 +1678,94 @@ async def run_knee(args: argparse.Namespace) -> None:
         json.dump(config, f, indent=2)
 
     all_stats: list[dict] = []
+    run_count = 0
+    total_runs = len(fractions) * len(strat_names)
 
-    for fi, frac in enumerate(fractions):
-        tag = f"f{int(frac * 100):03d}"
-        run_dir = sweep_dir / tag
-        run_dir.mkdir(parents=True, exist_ok=True)
+    for frac in fractions:
+        frac_tag = f"f{int(frac * 100):02d}"
+        frac_dir = sweep_dir / f"strategies_{ts}_{frac_tag}"
+        frac_dir.mkdir(parents=True, exist_ok=True)
+        frac_config = {
+            **config,
+            "fraction": frac,
+            "num_requests": len(trace),
+            "num_sessions": len({r["session_id"] for r in trace}),
+        }
+        with open(frac_dir / "config.json", "w") as f:
+            json.dump(frac_config, f, indent=2)
 
-        print(f"\n{'#' * 60}")
-        print(f"Run {fi + 1}/{len(fractions)}: session-aware {frac:.0%}")
-        print(f"{'#' * 60}")
+        frac_stats: list[dict] = []
+        strategies = build_strategies(strat_names, frac, args, trace)
 
-        if fi > 0:
-            await wait_for_cooldown(args.sglang_url)
-            await asyncio.sleep(args.cooldown)
+        for name, strategy in strategies:
+            run_count += 1
+            run_dir = frac_dir / name
+            run_dir.mkdir(parents=True, exist_ok=True)
 
-        strategy = SessionAwareStrategy(frac, args.seed, trace)
-
-        metrics_csv = run_dir / "metrics.csv"
-        requests_csv = run_dir / "requests.csv"
-
-        metrics_url = f"{args.sglang_url.rstrip('/')}/metrics"
-        stop_event = asyncio.Event()
-        collector_task = asyncio.create_task(
-            collect_loop(metrics_url, metrics_csv, interval_s=0.1, stop_event=stop_event)
-        )
-
-        try:
-            results = await replay_with_strategy(
-                args.sglang_url, args.model, trace, args.time_scale,
-                strategy, requests_csv,
+            print(f"\n{'#' * 60}")
+            print(
+                f"Run {run_count}/{total_runs}: {name} "
+                f"(target {frac:.0%})"
             )
-        finally:
-            stop_event.set()
-            await asyncio.sleep(0.2)
-            collector_task.cancel()
+            print(f"{'#' * 60}")
+
+            print("  Flushing SGLang cache...")
             try:
-                await collector_task
-            except asyncio.CancelledError:
-                pass
+                async with aiohttp.ClientSession() as flush_sess:
+                    async with flush_sess.post(
+                        f"{args.sglang_url.rstrip('/')}/flush_cache"
+                    ) as resp:
+                        print(f"  Flush response: {resp.status}")
+            except Exception as e:
+                print(f"  Flush failed: {e}")
 
-        stats = compute_stats(results, f"session_{frac:.0%}")
-        stats["target_fraction"] = frac
-        stats["actual_outsource_pct"] = strategy.actual_fraction
-        all_stats.append(stats)
+            await wait_for_cooldown(args.sglang_url)
+            if run_count > 1:
+                await asyncio.sleep(args.cooldown)
 
-    # Write summary
+            metrics_csv = run_dir / "metrics.csv"
+            requests_csv = run_dir / "requests.csv"
+
+            metrics_url = f"{args.sglang_url.rstrip('/')}/metrics"
+            stop_event = asyncio.Event()
+            collector_task = asyncio.create_task(
+                collect_loop(metrics_url, metrics_csv, interval_s=0.1, stop_event=stop_event)
+            )
+
+            try:
+                results = await replay_with_strategy(
+                    args.sglang_url, args.model, trace, args.time_scale,
+                    strategy, requests_csv,
+                )
+            finally:
+                stop_event.set()
+                await asyncio.sleep(0.2)
+                collector_task.cancel()
+                try:
+                    await collector_task
+                except asyncio.CancelledError:
+                    pass
+
+            stats = compute_stats(results, name)
+            stats["target_fraction"] = frac
+            stats["actual_outsource_pct"] = strategy.actual_fraction
+            frac_stats.append(stats)
+            all_stats.append(stats)
+            print(f"  Actual outsource rate: {strategy.actual_fraction:.1%}")
+
+        frac_summary = frac_dir / "strategy_summary.csv"
+        cols = [
+            "label", "target_fraction", "actual_outsource_pct",
+            "total_requests", "local_requests", "outsourced_requests",
+            "local_success", "local_success_rate",
+            "ttft_p50", "ttft_p90", "ttft_p95", "ttft_p99", "ttft_max",
+            "latency_p50", "latency_p99",
+        ]
+        with open(frac_summary, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writeheader()
+            w.writerows(frac_stats)
+
     summary_path = sweep_dir / "knee_summary.csv"
     cols = [
         "label", "target_fraction", "actual_outsource_pct",
@@ -1328,14 +1780,15 @@ async def run_knee(args: argparse.Namespace) -> None:
         w.writerows(all_stats)
 
     print(f"\n{'=' * 70}")
-    print("KNEE-FINDING SUMMARY (session-aware offload)")
+    print("KNEE-FINDING SUMMARY")
     print(f"{'=' * 70}")
-    print(f"{'Frac':>6} {'Outsourced%':>11} {'Local':>6} {'Success%':>9} "
+    print(f"{'Strategy':<16} {'Frac':>6} {'Outsrc%':>8} {'Success%':>9} "
           f"{'TTFT_p50':>10} {'TTFT_p99':>10}")
-    print("-" * 60)
+    print("-" * 70)
     for s in all_stats:
-        print(f"{s['target_fraction']:>5.0%} {s['actual_outsource_pct']:>10.1%} "
-              f"{s['local_requests']:>6} {s['local_success_rate']:>8.1%} "
+        print(f"{s['label']:<16} {s['target_fraction']:>5.0%} "
+              f"{s['actual_outsource_pct']:>7.1%} "
+              f"{s['local_success_rate']:>8.1%} "
               f"{s['ttft_p50']:>9.0f}ms {s['ttft_p99']:>9.0f}ms")
 
     print(f"\nSummary: {summary_path}")
@@ -1351,6 +1804,8 @@ async def run_policy_invariance(args: argparse.Namespace) -> None:
     saturation AND under healthy regime, all policies give the same result.
     The only variable that matters is the outsource fraction (admission rate).
     """
+    aiohttp = _require_aiohttp()
+    collect_loop = _require_collect_loop()
     fractions = args.fractions
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     sweep_dir = Path(args.output_dir) / f"policy_invariance_{ts}"
@@ -1518,6 +1973,8 @@ async def run(args: argparse.Namespace) -> None:
         await run_knee(args)
     elif args.mode == "hysteresis":
         await run_hysteresis(args)
+    elif args.mode == "bistability":
+        await run_bistability(args)
     elif args.mode == "policy_invariance":
         await run_policy_invariance(args)
 
@@ -1551,11 +2008,12 @@ def main() -> None:
 
     # Mode selection
     parser.add_argument(
-        "--mode", choices=["compare", "knee", "hysteresis", "policy_invariance"],
+        "--mode", choices=["compare", "knee", "hysteresis", "bistability", "policy_invariance"],
         default="compare",
         help="'compare': 3 strategies at matched budget. "
              "'knee': fraction sweep. "
-             "'hysteresis': ramp up/down to test for path-dependent behavior. "
+             "'hysteresis': legacy ramp up/down smoke. "
+             "'bistability': steady-state hold + trigger-removal validation. "
              "'policy_invariance': validate that scheduling policy doesn't matter.",
     )
     # For compare mode
@@ -1567,7 +2025,9 @@ def main() -> None:
     parser.add_argument(
         "--strategies", type=str, nargs="+", default=None,
         help="Strategies to run (default: all). "
-             "Choose from: random_request, pressure_gated, session_aware, gated_session_aware",
+             "Choose from: all_local, all_cloud, fifo, random_request, "
+             "pressure_gated, session_aware, gated_session_aware, size_long, "
+             "oracle_size, size_short, flop_based, cache_disp",
     )
     # For knee mode
     parser.add_argument(
@@ -1575,10 +2035,43 @@ def main() -> None:
         default=[0.0, 0.30, 0.35, 0.40, 0.45, 0.50],
         help="Fractions for knee sweep",
     )
+    parser.add_argument(
+        "--bistability-trigger-fraction",
+        type=float,
+        default=0.0,
+        help="Trigger fraction used to induce the collapsed state before removal",
+    )
+    parser.add_argument(
+        "--bistability-hold-requests",
+        type=int,
+        default=2000,
+        help="Requests per hold segment in --mode bistability",
+    )
+    parser.add_argument(
+        "--bistability-max-holds",
+        type=int,
+        default=4,
+        help="Maximum hold segments per stage in --mode bistability",
+    )
+    parser.add_argument(
+        "--bistability-steady-windows",
+        type=int,
+        default=3,
+        help="Recent hold segments required for steady-state check",
+    )
+    parser.add_argument(
+        "--bistability-steady-cv",
+        type=float,
+        default=0.10,
+        help="Max coefficient of variation for steady-state TTFT/success checks",
+    )
     args = parser.parse_args()
 
     sys.stdout.reconfigure(line_buffering=True)
-    asyncio.run(run(args))
+    try:
+        asyncio.run(run(args))
+    except MissingExperimentDependency as exc:
+        parser.exit(2, f"error: {exc}\n")
 
 
 if __name__ == "__main__":

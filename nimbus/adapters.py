@@ -1,10 +1,9 @@
 """Adapter implementations for specific serving engines.
 
-This module contains the SGLang adapter used by the outsourcing engine. In
-SGLang, accessing internal scheduler structures for metrics is discouraged.
-Instead, this adapter maintains its own internal waiting queue and reads
-operational metrics from SGLang's Prometheus endpoint (e.g.
-http://localhost:30000/metrics) for observability.
+This module contains the serving-engine adapter used by the outsourcing engine.
+The class name is kept for compatibility with earlier SGLang experiments, but
+the adapter itself maintains an internal waiting queue and can read generic
+OpenAI-serving Prometheus metrics (vLLM or SGLang) for observability.
 """
 
 import re
@@ -25,13 +24,13 @@ from nimbus.request import OutsourcingRequestInfo
 
 
 class SGLangWaitingQueueAdapter(WaitingQueueInterface):
-    """Adapter for SGLang integration with internal queue management.
+    """Adapter for OpenAI-compatible serving with internal queue management.
 
     This adapter maintains its own internal FIFO waiting queue and fetches
-    performance metrics from SGLang's Prometheus endpoint for monitoring.
+    performance metrics from the serving engine's Prometheus endpoint for monitoring.
 
     Example usage:
-        queue_adapter = SGLangWaitingQueueAdapter(metrics_url="http://localhost:30000/metrics")
+        queue_adapter = SGLangWaitingQueueAdapter(metrics_url="http://localhost:8000/metrics")
 
         # Add requests to the queue
         queue_adapter.add_request(request_info)
@@ -53,13 +52,13 @@ class SGLangWaitingQueueAdapter(WaitingQueueInterface):
 
         Args:
             metrics_url: Optional Prometheus metrics URL (defaults to
-                "http://localhost:30000/metrics" if not provided).
+                "http://localhost:8000/metrics" if not provided).
             http_timeout_s: Timeout for HTTP requests to the metrics endpoint.
             metrics_cache_ttl_s: How long to treat cached metrics as fresh.
                 Safe callers receive cached values immediately and trigger a
                 background refresh when the cache is stale.
         """
-        self.metrics_url = metrics_url or "http://localhost:30000/metrics"
+        self.metrics_url = metrics_url or "http://localhost:8000/metrics"
         self.http_timeout_s = http_timeout_s
         self.metrics_cache_ttl_s = max(0.0, metrics_cache_ttl_s)
 
@@ -229,7 +228,7 @@ class SGLangWaitingQueueAdapter(WaitingQueueInterface):
         try:
             self._refresh_metrics_blocking()
         except Exception as exc:
-            logger.debug("Async SGLang metrics refresh failed: %s", exc)
+            logger.debug("Async serving metrics refresh failed: %s", exc)
             self._clear_refresh_flag()
 
     def _schedule_background_refresh(self) -> None:
@@ -240,7 +239,7 @@ class SGLangWaitingQueueAdapter(WaitingQueueInterface):
 
         thread = threading.Thread(
             target=self._refresh_metrics_background,
-            name="sglang-metrics-refresh",
+            name="serving-metrics-refresh",
             daemon=True,
         )
         thread.start()
@@ -301,6 +300,7 @@ class SGLangWaitingQueueAdapter(WaitingQueueInterface):
         # Prefer explicit tokens_per_second gauges if present
         for key in [
             "sglang:gen_throughput",
+            "vllm:avg_generation_throughput_toks_per_s",
             "tokens_per_second",
             "throughput_tokens_per_second",
             "sglang_tokens_per_second",
@@ -312,6 +312,7 @@ class SGLangWaitingQueueAdapter(WaitingQueueInterface):
         # TTFT average (seconds)
         for prefix in [
             "sglang:time_to_first_token_seconds",
+            "vllm:time_to_first_token_seconds",
             "time_to_first_token_seconds",
             "ttft_seconds",
             "sglang_ttft_seconds",
@@ -323,6 +324,7 @@ class SGLangWaitingQueueAdapter(WaitingQueueInterface):
 
         # Inter-token latency average (seconds)
         for prefix in [
+            "vllm:time_per_output_token_seconds",
             "inter_token_latency_seconds",
             "token_latency_seconds",
             "sglang_inter_token_latency_seconds",
@@ -359,6 +361,7 @@ class SGLangWaitingQueueAdapter(WaitingQueueInterface):
         # Request queue length / pending requests
         for key in [
             "sglang:num_queue_reqs",
+            "vllm:num_requests_waiting",
             "pending_requests",
             "request_queue_length",
             "waiting_requests",
