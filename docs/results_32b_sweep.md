@@ -50,3 +50,49 @@ violation-free but 3× the cost, nimbus sits in between but on the efficient fro
    absolute cost/cloud-TTFT need `--cloud real`.
 4. **Budget-units open question** (token·s vs tokens) still unresolved; sweep suggests
    nimbus's self-selected 26 % is efficient (0 viol at low cost), not over-shedding.
+
+---
+
+## Iteration 2 — long-context probe (32k ctx, heavy-tail prompts ≤28k, n=40)
+
+Relaunched 32B at `--max-model-len 32768` to admit the long-input tail, then ran
+cachedisp vs flop at matched fraction (`logs/weight_32b/`). **Two findings, both
+important:**
+
+### (a) Synthetic cannot test the CacheDisp-vs-FLOP weight claim
+`cachedisp_oracle@0.25` and `flop_oracle@0.25` came out **byte-identical** (22.5 % out,
+$0.0458, p99 1112 ms) — the prompt-length cap collapses the heavy tail to a single value
+(28000), so both oracles select the same requests. **The weight claim (paper C2/C3) is
+NOT validated by synthetic data; it requires a real trace** (ShareGPT/BurstGPT/Rednote)
+with continuous, independent (prompt, decode) variation. Recommend
+`scripts/download_data.sh` + re-run, or the offline selection analysis
+(`scripts/analysis/exp_oracle_analysis.py`) on real token counts.
+
+### (b) 🚩 Real bug: nimbus underperforms all_local on near-uniform large-prompt load
+On this workload all_local is fine (0 % viol, service p50 323 ms) — 40 huge requests
+don't saturate when admission backpressure paces them. But **nimbus gets 70 % violations,
+service p50 13.8 s**, while *outsourcing 25 %*. Request-level diagnosis:
+
+| | nimbus local-kept (n=30) | all_local (n=40) |
+|---|---|---|
+| queue_delay (harness) | med 7 ms (max 28 ms) | med 6 ms (**max 2807 ms**) |
+| service TTFT (vLLM)   | **med 13 842 ms** | med 323 ms |
+
+Root cause — **two control gates fight**: (1) nimbus's knapsack sheds the overflow, so
+the waiting queue looks short → (2) the admission backpressure loop then admits all 30
+kept requests almost immediately (no pacing, queue_delay ~7 ms) → vLLM internally queues
+them (only ~3 of these 28k-prompt requests fit in 90 k-token KV) → 13.8 s service. In
+all_local the queue stays long, so backpressure *paces* dispatch (queue_delay up to 2.8 s)
+and vLLM is never overloaded. Nimbus over-triggers because the **token·s budget mis-sizes
+capacity for huge requests** (a single 28k/512 request's weight ≈ 445k token·s > the whole
+~405k budget), so `Σweight > budget` fires even when the system has real slack.
+
+**Implications for Murphy (design decisions, not for me to finalize unilaterally):**
+- This is concrete evidence for the **budget-in-tokens** reformulation (footprint =
+  prompt_tokens vs KV capacity), with token·s used only as shed-priority — it would bound
+  shedding to physical KV and stop the spurious over-trigger.
+- The **knapsack ↔ admission-backpressure relationship must be specified**: today they
+  double-control admission and conflict. Either the engine should own pacing, or shedding
+  should feed the admission rate rather than just removing items.
+- The realistic-workload result (8k mixed, §above) is unaffected and remains strong;
+  the pathology is specific to near-uniform very-large-prompt load.
