@@ -4,6 +4,7 @@ from argparse import Namespace
 from experiments.run_engine import (
     KVMetricsState,
     LocalAdmissionState,
+    RealCloud,
     SimCloud,
     _effective_tpot_seconds,
     _estimate_decode_batch_size,
@@ -27,6 +28,68 @@ def make_request(request_id: str, session_id: int, prompt_tokens: int) -> Outsou
     )
     req.metadata["session_id"] = session_id
     return req
+
+
+class RealCloudAccountingTests(unittest.TestCase):
+    """Lock the cost/cache semantics of the --cloud real sink (no network).
+
+    The streaming TTFT path is exercised as an integration test on a host with
+    aiohttp + a live endpoint; here we pin the billing math and the remote
+    prefix-cache (TTL) model that make sim/real cost comparable.
+    """
+
+    def _cloud(self, ttl: float = 0.0) -> RealCloud:
+        return RealCloud(
+            url="http://unused",
+            model="m",
+            api_key_env=None,
+            in_price=1.0,
+            cached_in_price=0.5,
+            out_price=2.0,
+            remote_cache_ttl_s=ttl,
+        )
+
+    def test_cost_dict_bills_uncached_input_and_output(self):
+        out = self._cloud().cost_dict(
+            prompt_tokens=1_000_000, cached_input_tokens=0,
+            output_tokens=1_000_000, ttft_ms=120.0, success=True,
+        )
+        self.assertTrue(out["success"])
+        self.assertEqual(out["ttft_ms"], 120.0)
+        self.assertAlmostEqual(out["cost_usd"], 3.0, places=6)  # 1M*$1 + 1M*$2
+        self.assertEqual(out["uncached_input_tokens"], 1_000_000)
+        self.assertEqual(out["output_tokens"], 1_000_000)
+
+    def test_cost_dict_discounts_cached_input(self):
+        out = self._cloud().cost_dict(
+            prompt_tokens=1_000_000, cached_input_tokens=1_000_000,
+            output_tokens=0, ttft_ms=50.0, success=True,
+        )
+        self.assertAlmostEqual(out["cost_usd"], 0.5, places=6)  # 1M cached @ $0.5
+        self.assertEqual(out["cached_input_tokens"], 1_000_000)
+        self.assertEqual(out["remote_cached_tokens"], 1_000_000)
+
+    def test_success_requires_first_token(self):
+        out = self._cloud().cost_dict(
+            prompt_tokens=10, cached_input_tokens=0,
+            output_tokens=0, ttft_ms=None, success=True,
+        )
+        self.assertFalse(out["success"])  # no measured TTFT -> SLO miss
+
+    def test_remote_cache_ttl_window(self):
+        cloud = self._cloud(ttl=100.0)
+        first = make_request("r1", session_id=7, prompt_tokens=500)
+        self.assertEqual(cloud.estimate_remote_cached_tokens(first, now=0.0), 0)
+        cloud._remember_remote_prompt(first, now=0.0)
+        repeat = make_request("r2", session_id=7, prompt_tokens=500)
+        self.assertEqual(cloud.estimate_remote_cached_tokens(repeat, now=50.0), 500)
+        self.assertEqual(cloud.estimate_remote_cached_tokens(repeat, now=200.0), 0)
+
+    def test_no_ttl_disables_cache(self):
+        cloud = self._cloud(ttl=0.0)
+        req = make_request("r1", session_id=7, prompt_tokens=500)
+        cloud._remember_remote_prompt(req, now=0.0)
+        self.assertEqual(cloud.estimate_remote_cached_tokens(req, now=1.0), 0)
 
 
 class SimCloudRemoteCacheTests(unittest.TestCase):

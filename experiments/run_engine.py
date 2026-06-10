@@ -30,6 +30,7 @@ import argparse
 import asyncio
 import contextlib
 import csv
+import json
 import random
 import sys
 import time
@@ -132,6 +133,154 @@ class SimCloud:
         if session_id is None:
             return
         self._remote_cache[str(session_id)] = (now, req.num_prompt_tokens)
+
+
+class RealCloud:
+    """Real cloud sink: streams from an OpenAI-compatible endpoint, measures
+    real TTFT, and bills real $ from returned usage (falling back to planned
+    token counts).
+
+    Same ``serve``-shaped result dict as :class:`SimCloud` so outsourced-request
+    accounting is identical across ``--cloud sim`` and ``--cloud real``. The
+    remote-prefix cache (TTL) model is also mirrored so cost stays comparable.
+    Ported from the open-loop baseline client (``vllm/run.py``).
+    """
+
+    def __init__(
+        self,
+        url: str,
+        model: str,
+        api_key_env: str | None,
+        in_price: float,
+        cached_in_price: float | None,
+        out_price: float,
+        remote_cache_ttl_s: float = 0.0,
+        timeout_s: float = 600.0,
+        temperature: float = 0.0,
+    ):
+        self._url = url
+        self._model = model
+        self._api_key_env = api_key_env
+        self._cost = APICostCalculator(in_price, out_price, cached_in_price)
+        self._remote_cache_ttl_s = max(0.0, remote_cache_ttl_s)
+        self._remote_cache: dict[str, tuple[float, int]] = {}
+        self._timeout_s = timeout_s
+        self._temperature = temperature
+
+    def estimate_remote_cached_tokens(self, req: OutsourcingRequestInfo, now: float) -> int:
+        if "remote_cached_tokens" in req.metadata:
+            return min(req.num_prompt_tokens, max(0, int(req.metadata["remote_cached_tokens"])))
+        ttl_cached = 0
+        session_id = req.metadata.get("session_id")
+        if self._remote_cache_ttl_s > 0 and session_id is not None:
+            cached = self._remote_cache.get(str(session_id))
+            if cached is not None:
+                cached_at, cached_prompt_tokens = cached
+                if now - cached_at <= self._remote_cache_ttl_s:
+                    ttl_cached = min(cached_prompt_tokens, req.num_prompt_tokens)
+        return min(req.num_prompt_tokens, max(0, ttl_cached))
+
+    def _remember_remote_prompt(self, req: OutsourcingRequestInfo, now: float) -> None:
+        if self._remote_cache_ttl_s <= 0:
+            return
+        session_id = req.metadata.get("session_id")
+        if session_id is None:
+            return
+        self._remote_cache[str(session_id)] = (now, req.num_prompt_tokens)
+
+    def cost_dict(
+        self,
+        prompt_tokens: int,
+        cached_input_tokens: int,
+        output_tokens: int,
+        ttft_ms: float | None,
+        success: bool,
+    ) -> dict:
+        """Build the SimCloud-shaped result dict from measured token counts."""
+        breakdown = self._cost.calculate_cost_breakdown(
+            input_tokens=prompt_tokens,
+            cached_input_tokens=cached_input_tokens,
+            output_tokens=output_tokens,
+        )
+        return {
+            "ttft_ms": ttft_ms,
+            "cost_usd": breakdown["total_cost_usd"],
+            "success": bool(success and ttft_ms is not None),
+            "remote_cached_tokens": min(prompt_tokens, max(0, cached_input_tokens)),
+            **breakdown,
+        }
+
+    async def serve_async(self, session, req: OutsourcingRequestInfo, now: float) -> dict:
+        import os
+
+        headers = {"Content-Type": "application/json"}
+        if self._api_key_env:
+            key = os.environ.get(self._api_key_env)
+            if key:
+                headers["Authorization"] = f"Bearer {key}"
+
+        payload = {
+            "model": self._model,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "temperature": self._temperature,
+            "max_tokens": max(1, int(req.num_output_tokens)),
+            "messages": [{"role": "user", "content": req.metadata.get("prompt_text", "")}],
+        }
+        remote_cached = self.estimate_remote_cached_tokens(req, now)
+
+        start = time.perf_counter()
+        first_token_time = None
+        usage: dict = {}
+        completion_chunks = 0
+        done = False
+        try:
+            import aiohttp
+
+            timeout = aiohttp.ClientTimeout(total=self._timeout_s)
+            async with session.post(
+                self._url, headers=headers, json=payload, timeout=timeout
+            ) as resp:
+                if resp.status < 400:
+                    buffer = ""
+                    async for raw in resp.content.iter_chunked(8192):
+                        buffer += raw.decode("utf-8", errors="replace")
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            line = line.strip()
+                            if not line or line.startswith(":") or not line.startswith("data:"):
+                                continue
+                            data = line[5:].strip()
+                            if data == "[DONE]":
+                                done = True
+                                break
+                            obj = json.loads(data)
+                            if obj.get("usage"):
+                                usage = obj["usage"]
+                            choices = obj.get("choices") or []
+                            delta = choices[0].get("delta") if choices else {}
+                            token = delta.get("content") if isinstance(delta, dict) else ""
+                            if token:
+                                first_token_time = first_token_time or time.perf_counter()
+                                completion_chunks += 1
+                        if done:
+                            break
+        except Exception:
+            first_token_time = first_token_time  # fall through; success gated on first token
+
+        ttft_ms = None if first_token_time is None else (first_token_time - start) * 1000.0
+        prompt_tokens = int(usage.get("prompt_tokens") or req.num_prompt_tokens)
+        completion_tokens = int(
+            usage.get("completion_tokens") or (completion_chunks if first_token_time else 0)
+        )
+        self._remember_remote_prompt(req, now)
+        return self.cost_dict(
+            prompt_tokens=prompt_tokens,
+            cached_input_tokens=min(prompt_tokens, remote_cached),
+            output_tokens=completion_tokens,
+            ttft_ms=ttft_ms,
+            success=first_token_time is not None,
+        )
 
 
 def _sized_synthetic_prompt(prompt_tokens: int) -> str:
@@ -400,14 +549,26 @@ async def replay(args: argparse.Namespace, trace: list[dict]) -> list[dict]:
     tpot_samples_s: list[float] = []
     serving_engine = getattr(args, "serving_engine", "vllm")
     adapter = SGLangWaitingQueueAdapter(metrics_url=f"{args.sglang_url.rstrip('/')}/metrics")
-    cloud = SimCloud(
-        in_price=args.in_price,
-        cached_in_price=args.cached_in_price,
-        out_price=args.out_price,
-        ttft_mean_ms=args.cloud_ttft_ms,
-        remote_cache_ttl_s=args.remote_cache_ttl_s,
-        seed=args.seed,
-    )
+    if args.cloud == "real":
+        cloud = RealCloud(
+            url=args.cloud_url,
+            model=args.cloud_model,
+            api_key_env=args.cloud_api_key_env,
+            in_price=args.in_price,
+            cached_in_price=args.cached_in_price,
+            out_price=args.out_price,
+            remote_cache_ttl_s=args.remote_cache_ttl_s,
+            timeout_s=args.cloud_timeout_s,
+        )
+    else:
+        cloud = SimCloud(
+            in_price=args.in_price,
+            cached_in_price=args.cached_in_price,
+            out_price=args.out_price,
+            ttft_mean_ms=args.cloud_ttft_ms,
+            remote_cache_ttl_s=args.remote_cache_ttl_s,
+            seed=args.seed,
+        )
     decider = make_decider(args, trace)
     engine = None
     if args.policy == "nimbus":
@@ -442,39 +603,65 @@ async def replay(args: argparse.Namespace, trace: list[dict]) -> list[dict]:
         return time.time()
 
     def record_outsourced(req: OutsourcingRequestInfo) -> None:
+        if req.request_id in results:
+            return
         decision_now = replay_time()
-        out = cloud.serve(req, now=decision_now)
         queue_delay_ms = _queue_delay_ms(
             req,
             decision_now,
             args.time_scale,
             scale_wait=False,
         )
-        service_ttft_ms = out["ttft_ms"] if out["success"] else None
-        ttft_ms = None if service_ttft_ms is None else queue_delay_ms + service_ttft_ms
-        results[req.request_id] = {
-            "id": req.request_id, "outsourced": True, "success": out["success"],
-            "ttft_ms": ttft_ms,
-            "queue_delay_ms": queue_delay_ms,
-            "service_ttft_ms": service_ttft_ms,
-            "cost_usd": out["cost_usd"],
-            "remote_cached_tokens": out["remote_cached_tokens"],
-            "uncached_input_tokens": out["uncached_input_tokens"],
-            "cached_input_tokens": out["cached_input_tokens"],
-            "output_tokens": out["output_tokens"],
-            "prefill": req.num_prompt_tokens, "decode": req.num_output_tokens,
-        }
 
-    # aiohttp is only needed for real local serving; --local mock runs without it.
+        def _write(out: dict) -> None:
+            service_ttft_ms = out["ttft_ms"] if out["success"] else None
+            ttft_ms = None if service_ttft_ms is None else queue_delay_ms + service_ttft_ms
+            results[req.request_id] = {
+                "id": req.request_id, "outsourced": True, "success": out["success"],
+                "ttft_ms": ttft_ms,
+                "queue_delay_ms": queue_delay_ms,
+                "service_ttft_ms": service_ttft_ms,
+                "cost_usd": out["cost_usd"],
+                "remote_cached_tokens": out["remote_cached_tokens"],
+                "uncached_input_tokens": out["uncached_input_tokens"],
+                "cached_input_tokens": out["cached_input_tokens"],
+                "output_tokens": out["output_tokens"],
+                "prefill": req.num_prompt_tokens, "decode": req.num_output_tokens,
+            }
+
+        if args.cloud == "real":
+            # A real cloud call is async and takes wall-clock time. Claim the
+            # request synchronously (so dedup + the per-tick nimbus guard treat
+            # it as handled now), then patch in measured TTFT/cost when the
+            # streaming call returns -- mirrors the admit_local task pattern.
+            _write({
+                "ttft_ms": None, "success": False, "cost_usd": 0.0,
+                "remote_cached_tokens": 0, "uncached_input_tokens": 0,
+                "cached_input_tokens": 0, "output_tokens": 0,
+            })
+
+            async def _outsource_task() -> None:
+                try:
+                    _write(await cloud.serve_async(session, req, decision_now))
+                except Exception:
+                    pass  # leave the failed-claim row (success=False -> SLO violation)
+
+            pending.append(asyncio.create_task(_outsource_task()))
+        else:
+            _write(cloud.serve(req, now=decision_now))
+
+    # aiohttp is needed for real local serving and/or a real cloud sink;
+    # --local mock --cloud sim runs without it.
     send_request = None
     session_cm = null_session()
-    if args.local == "real":
+    if args.local == "real" or args.cloud == "real":
         import aiohttp
-        from run_offload_strategies import send_request
         session_cm = aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(limit=0),
             timeout=aiohttp.ClientTimeout(total=None),
         )
+    if args.local == "real":
+        from run_offload_strategies import send_request
     async with session_cm as session:
 
         async def read_kv() -> tuple[float, float]:
@@ -811,7 +998,9 @@ def main() -> None:
     )
     p.add_argument("--output-dir", default="logs/engine")
     p.add_argument("--local", choices=["real", "mock"], default="mock")
-    p.add_argument("--cloud", choices=["sim"], default="sim")
+    p.add_argument("--cloud", choices=["sim", "real"], default="sim",
+                   help="cloud sink: sim=modeled TTFT + real $ from token counts; "
+                        "real=stream from an OpenAI-compatible endpoint, measure real TTFT")
     p.add_argument("--weight", choices=["v0", "v1", "v2"], default="v2",
                    help="cache-displacement weight; v2 (token-seconds) is unit-matched to the KV budget")
     p.add_argument("--start-hours", type=float, default=0.0)
@@ -865,6 +1054,23 @@ def main() -> None:
         default=1.5,
         help="Nimbus deadline guard multiplier for simulated cloud TTFT",
     )
+    # --cloud real sink (OpenAI-compatible streaming endpoint)
+    p.add_argument(
+        "--cloud-url",
+        default="https://openrouter.ai/api/v1/chat/completions",
+        help="real cloud OpenAI-compatible endpoint (used when --cloud real)",
+    )
+    p.add_argument(
+        "--cloud-model",
+        default="qwen3-32b",
+        help="cloud model id; use the SAME model as local for a clean comparison",
+    )
+    p.add_argument(
+        "--cloud-api-key-env",
+        default="OPENROUTER_API_KEY1",
+        help="env var holding the cloud API key (never hardcode keys)",
+    )
+    p.add_argument("--cloud-timeout-s", type=float, default=600.0)
     args = p.parse_args()
     asyncio.run(run_engine(args))
 

@@ -242,6 +242,29 @@ serving engine's `/metrics` text endpoint and maps it onto the configured
 SGLang remains available as a compatibility path by passing
 `--serving-engine sglang --serving-url http://localhost:8200`.
 
+### Real cloud sink (`--cloud real`)
+
+By default outsourced requests use `--cloud sim` (modeled TTFT + real `$` from
+token counts). To measure **real** cloud TTFT and bill real usage, stream from
+an OpenAI-compatible endpoint. The API key is read from an environment variable
+— never hardcode it.
+```bash
+export OPENROUTER_API_KEY1=...        # or: source .env
+python experiments/run_engine.py \
+    --policy nimbus --weight v2 \
+    --local real --serving-url http://127.0.0.1:18200 --model qwen3-32b \
+    --cloud real \
+    --cloud-url https://openrouter.ai/api/v1/chat/completions \
+    --cloud-model qwen3-32b \
+    --cloud-api-key-env OPENROUTER_API_KEY1 \
+    --trace-file data/sharegpt_burstgpt/sharegpt_prompts_burstgpt_timestamps.jsonl \
+    --output-dir logs/engine_realcloud
+```
+For an apples-to-apples hybrid comparison, serve the **same model** in the cloud
+as locally (`--cloud-model` == `--model`); a different cloud model confounds the
+cost/latency comparison. The streaming client (TTFT capture, usage-based cost,
+error handling) is ported from the `vllm/` open-loop baseline.
+
 For providers with explicit prompt-cache TTL and cached-input pricing, add:
 ```bash
     --remote-cache-ttl-s 300 \
