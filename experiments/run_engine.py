@@ -65,6 +65,12 @@ async def null_session():
     yield None
 
 
+@contextlib.asynccontextmanager
+async def _null_async_ctx():
+    """No-op async context manager (used when cloud concurrency is unbounded)."""
+    yield
+
+
 class SimCloud:
     """Simulated cloud sink: real $ from token counts, modeled TTFT.
 
@@ -157,6 +163,7 @@ class RealCloud:
         remote_cache_ttl_s: float = 0.0,
         timeout_s: float = 600.0,
         temperature: float = 0.0,
+        max_concurrency: int = 0,
     ):
         self._url = url
         self._model = model
@@ -166,6 +173,9 @@ class RealCloud:
         self._remote_cache: dict[str, tuple[float, int]] = {}
         self._timeout_s = timeout_s
         self._temperature = temperature
+        # Bound in-flight cloud calls; 0 = unlimited. asyncio.Semaphore binds to
+        # the running loop lazily on first use (we construct inside run_engine).
+        self._limiter = asyncio.Semaphore(max_concurrency) if max_concurrency > 0 else None
 
     def estimate_remote_cached_tokens(self, req: OutsourcingRequestInfo, now: float) -> int:
         if "remote_cached_tokens" in req.metadata:
@@ -195,18 +205,26 @@ class RealCloud:
         output_tokens: int,
         ttft_ms: float | None,
         success: bool,
+        http_status: int | None = None,
+        error: str | None = None,
     ) -> dict:
         """Build the SimCloud-shaped result dict from measured token counts."""
+        ok = bool(success and ttft_ms is not None)
+        # No charge for a failed outsource (provider 429/timeout/auth/etc.): bill
+        # zero tokens so a rejected request is a pure SLO miss, not phantom cost.
+        billed = (prompt_tokens, cached_input_tokens, output_tokens) if ok else (0, 0, 0)
         breakdown = self._cost.calculate_cost_breakdown(
-            input_tokens=prompt_tokens,
-            cached_input_tokens=cached_input_tokens,
-            output_tokens=output_tokens,
+            input_tokens=billed[0],
+            cached_input_tokens=billed[1],
+            output_tokens=billed[2],
         )
         return {
             "ttft_ms": ttft_ms,
             "cost_usd": breakdown["total_cost_usd"],
-            "success": bool(success and ttft_ms is not None),
-            "remote_cached_tokens": min(prompt_tokens, max(0, cached_input_tokens)),
+            "success": ok,
+            "remote_cached_tokens": min(prompt_tokens, max(0, cached_input_tokens)) if ok else 0,
+            "http_status": http_status,
+            "error": error,
             **breakdown,
         }
 
@@ -234,39 +252,54 @@ class RealCloud:
         usage: dict = {}
         completion_chunks = 0
         done = False
+        http_status: int | None = None
+        error: str | None = None
+        # Cap concurrent cloud calls so a burst of outsourced requests does not
+        # self-inflict provider rate limits (429), which would otherwise read as
+        # SLO violations and corrupt the cost/SLO frontier.
+        limiter = self._limiter if self._limiter is not None else _null_async_ctx()
         try:
-            import aiohttp
+            # Prefer aiohttp's ClientTimeout when available; fall back to a plain
+            # float so this path is unit-testable with a stub session (no aiohttp).
+            try:
+                import aiohttp
 
-            timeout = aiohttp.ClientTimeout(total=self._timeout_s)
-            async with session.post(
-                self._url, headers=headers, json=payload, timeout=timeout
-            ) as resp:
-                if resp.status < 400:
-                    buffer = ""
-                    async for raw in resp.content.iter_chunked(8192):
-                        buffer += raw.decode("utf-8", errors="replace")
-                        while "\n" in buffer:
-                            line, buffer = buffer.split("\n", 1)
-                            line = line.strip()
-                            if not line or line.startswith(":") or not line.startswith("data:"):
-                                continue
-                            data = line[5:].strip()
-                            if data == "[DONE]":
-                                done = True
+                timeout = aiohttp.ClientTimeout(total=self._timeout_s)
+            except Exception:
+                timeout = self._timeout_s
+            async with limiter:
+                async with session.post(
+                    self._url, headers=headers, json=payload, timeout=timeout
+                ) as resp:
+                    http_status = resp.status
+                    if resp.status >= 400:
+                        error = f"HTTP {resp.status}: {(await resp.text())[:200]}"
+                    else:
+                        buffer = ""
+                        async for raw in resp.content.iter_chunked(8192):
+                            buffer += raw.decode("utf-8", errors="replace")
+                            while "\n" in buffer:
+                                line, buffer = buffer.split("\n", 1)
+                                line = line.strip()
+                                if not line or line.startswith(":") or not line.startswith("data:"):
+                                    continue
+                                data = line[5:].strip()
+                                if data == "[DONE]":
+                                    done = True
+                                    break
+                                obj = json.loads(data)
+                                if obj.get("usage"):
+                                    usage = obj["usage"]
+                                choices = obj.get("choices") or []
+                                delta = choices[0].get("delta") if choices else {}
+                                token = delta.get("content") if isinstance(delta, dict) else ""
+                                if token:
+                                    first_token_time = first_token_time or time.perf_counter()
+                                    completion_chunks += 1
+                            if done:
                                 break
-                            obj = json.loads(data)
-                            if obj.get("usage"):
-                                usage = obj["usage"]
-                            choices = obj.get("choices") or []
-                            delta = choices[0].get("delta") if choices else {}
-                            token = delta.get("content") if isinstance(delta, dict) else ""
-                            if token:
-                                first_token_time = first_token_time or time.perf_counter()
-                                completion_chunks += 1
-                        if done:
-                            break
-        except Exception:
-            first_token_time = first_token_time  # fall through; success gated on first token
+        except Exception as exc:  # network/timeout/parse: record cause, gate success on first token
+            error = error or f"{type(exc).__name__}: {exc}"
 
         ttft_ms = None if first_token_time is None else (first_token_time - start) * 1000.0
         prompt_tokens = int(usage.get("prompt_tokens") or req.num_prompt_tokens)
@@ -280,6 +313,8 @@ class RealCloud:
             output_tokens=completion_tokens,
             ttft_ms=ttft_ms,
             success=first_token_time is not None,
+            http_status=http_status,
+            error=error,
         )
 
 
@@ -552,13 +587,16 @@ async def replay(args: argparse.Namespace, trace: list[dict]) -> list[dict]:
     if args.cloud == "real":
         cloud = RealCloud(
             url=args.cloud_url,
-            model=args.cloud_model,
+            # same model on local and cloud is the Nimbus assumption; default the
+            # cloud model to the local one unless explicitly overridden.
+            model=args.cloud_model or args.model,
             api_key_env=args.cloud_api_key_env,
             in_price=args.in_price,
             cached_in_price=args.cached_in_price,
             out_price=args.out_price,
             remote_cache_ttl_s=args.remote_cache_ttl_s,
             timeout_s=args.cloud_timeout_s,
+            max_concurrency=args.cloud_max_concurrency,
         )
     else:
         cloud = SimCloud(
@@ -627,6 +665,8 @@ async def replay(args: argparse.Namespace, trace: list[dict]) -> list[dict]:
                 "cached_input_tokens": out["cached_input_tokens"],
                 "output_tokens": out["output_tokens"],
                 "prefill": req.num_prompt_tokens, "decode": req.num_output_tokens,
+                "http_status": out.get("http_status"),
+                "error": out.get("error"),
             }
 
         if args.cloud == "real":
@@ -858,6 +898,10 @@ def summarize(results: list[dict], args: argparse.Namespace) -> dict:
     ttfts = [r["ttft_ms"] for r in results if r["ttft_ms"] is not None and r["success"]]
     violations = sum(1 for r in results
                      if (not r["success"]) or r["ttft_ms"] is None or r["ttft_ms"] > slo_ms)
+    # Outsourced requests that failed at the provider (429/timeout/auth/etc.), not
+    # for latency. These inflate slo_violation_pct; track them so a real-cloud run
+    # can tell "cloud rejected us" apart from "cloud too slow".
+    cloud_errors = sum(1 for r in outs if r.get("error"))
     remote_cached = sum(int(r.get("remote_cached_tokens") or 0) for r in outs)
     remote_input = sum(int(r.get("prefill") or 0) for r in outs)
 
@@ -882,6 +926,8 @@ def summarize(results: list[dict], args: argparse.Namespace) -> dict:
         "tpot_ms_mean": round(float(getattr(args, "tpot_ms_mean", args.tpot_s * 1000.0)), 3),
         "tpot_ms_max": round(float(getattr(args, "tpot_ms_max", args.tpot_s * 1000.0)), 3),
         "slo_violation_pct": round(violations / max(n, 1), 4),
+        "cloud_errors": cloud_errors,
+        "cloud_error_pct": round(cloud_errors / max(len(outs), 1), 4),
         "ttft_p50_ms": round(pct(ttfts, 0.50), 1), "ttft_p99_ms": round(pct(ttfts, 0.99), 1),
     }
 
@@ -945,6 +991,8 @@ async def run_engine(args: argparse.Namespace) -> None:
                 "uncached_input_tokens",
                 "cached_input_tokens",
                 "output_tokens",
+                "http_status",
+                "error",
             ],
         )
         w.writeheader()
@@ -1062,8 +1110,8 @@ def main() -> None:
     )
     p.add_argument(
         "--cloud-model",
-        default="qwen3-32b",
-        help="cloud model id; use the SAME model as local for a clean comparison",
+        default=None,
+        help="cloud model id; defaults to --model (same model on local+cloud is the Nimbus assumption)",
     )
     p.add_argument(
         "--cloud-api-key-env",
@@ -1071,6 +1119,12 @@ def main() -> None:
         help="env var holding the cloud API key (never hardcode keys)",
     )
     p.add_argument("--cloud-timeout-s", type=float, default=600.0)
+    p.add_argument(
+        "--cloud-max-concurrency",
+        type=int,
+        default=32,
+        help="cap concurrent cloud calls (0=unlimited) so burst outsourcing doesn't self-inflict provider 429s",
+    )
     args = p.parse_args()
     asyncio.run(run_engine(args))
 

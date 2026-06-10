@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from argparse import Namespace
 
@@ -28,6 +29,41 @@ def make_request(request_id: str, session_id: int, prompt_tokens: int) -> Outsou
     )
     req.metadata["session_id"] = session_id
     return req
+
+
+class _FakeContent:
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    async def iter_chunked(self, _n):
+        for chunk in self._chunks:
+            yield chunk
+
+
+class _FakeResp:
+    """Minimal stand-in for an aiohttp streaming response."""
+
+    def __init__(self, status, chunks=(), text=""):
+        self.status = status
+        self.content = _FakeContent(chunks)
+        self._text = text
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def text(self):
+        return self._text
+
+
+class _FakeSession:
+    def __init__(self, resp):
+        self._resp = resp
+
+    def post(self, *args, **kwargs):
+        return self._resp
 
 
 class RealCloudAccountingTests(unittest.TestCase):
@@ -90,6 +126,32 @@ class RealCloudAccountingTests(unittest.TestCase):
         req = make_request("r1", session_id=7, prompt_tokens=500)
         cloud._remember_remote_prompt(req, now=0.0)
         self.assertEqual(cloud.estimate_remote_cached_tokens(req, now=1.0), 0)
+
+    def test_serve_async_streams_ttft_and_bills_real_usage(self):
+        chunks = [
+            b'data: {"choices":[{"delta":{"content":"Hi"}}]}\n',
+            b'data: {"choices":[{"delta":{"content":" there"}}]}\n',
+            b'data: {"usage":{"prompt_tokens":1000000,"completion_tokens":1000000}}\n',
+            b"data: [DONE]\n",
+        ]
+        req = make_request("r1", session_id=1, prompt_tokens=10)
+        out = asyncio.run(self._cloud().serve_async(_FakeSession(_FakeResp(200, chunks)), req, now=0.0))
+        self.assertTrue(out["success"])
+        self.assertIsNotNone(out["ttft_ms"])
+        self.assertIsNone(out["error"])
+        self.assertEqual(out["http_status"], 200)
+        self.assertAlmostEqual(out["cost_usd"], 3.0, places=6)  # 1M in @$1 + 1M out @$2
+        self.assertEqual(out["output_tokens"], 1_000_000)
+
+    def test_serve_async_records_http_error_not_silent(self):
+        req = make_request("r1", session_id=1, prompt_tokens=10)
+        out = asyncio.run(
+            self._cloud().serve_async(_FakeSession(_FakeResp(429, [], text="rate limited")), req, now=0.0)
+        )
+        self.assertFalse(out["success"])  # provider rejection != latency violation
+        self.assertEqual(out["http_status"], 429)
+        self.assertIn("429", out["error"])
+        self.assertEqual(out["cost_usd"], 0.0)
 
 
 class SimCloudRemoteCacheTests(unittest.TestCase):
