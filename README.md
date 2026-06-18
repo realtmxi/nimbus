@@ -29,8 +29,7 @@ experiments/                     End-to-end trace replay against live serving en
   run_engine_sweep.py            Online iso-SLO cost/violation sweep driver
   run_offload_strategies.py      Fixed-fraction baseline/oracle replay infra
   metrics_collector.py           Time-series KV/queue/throughput metrics
-  run_cachedisp_knee.sh          Knee sweep across outsource fractions
-  run_cachedisp_repeats.sh       Multi-seed repeats for error bars
+  run_cachedisp_repeats.sh       Multi-seed repeats for error bars (--mode compare)
 
 scripts/analysis/                Offline analysis (no GPU required)
   exp_knapsack_vs_sorting.py     Knapsack vs greedy comparison
@@ -63,7 +62,7 @@ fixed-fraction baselines/oracles behind a unified `OffloadStrategy` interface:
 
 `nimbus` (`--policy nimbus`) is the adaptive online controller and the main path;
 the baselines above are fixed-fraction. The offline `run_offload_strategies.py`
-compare/knee/bistability modes expose the same classes via
+compare/bistability modes expose the same classes via
 `--strategies {all_local, all_cloud, random_request, cache_disp}`.
 
 ## Quick Start
@@ -305,17 +304,6 @@ python experiments/run_offload_strategies.py \
     --output-dir logs/bistability
 ```
 Only cite rows where `clean_steady` and `post_trigger_steady` are both true.
-
-### Run Fixed-Fraction Baseline Knee Sweep (legacy SGLang path)
-```bash
-# Start SGLang on a GPU box, then:
-python experiments/run_offload_strategies.py \
-    --sglang-url http://localhost:8200 \
-    --mode knee \
-    --fractions 0.0 0.15 0.20 0.25 0.30 0.35 0.50 \
-    --strategies cache_disp \
-    --output-dir logs/cachedisp_knee
-```
 
 The Nimbus main path is the online `run_engine.py --policy nimbus --weight v2`
 experiment above.

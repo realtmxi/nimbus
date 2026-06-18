@@ -10,10 +10,6 @@ Usage:
     python experiments/run_offload_strategies.py --sglang-url http://localhost:8200 \
         --mode compare --fraction 0.25 --strategies cache_disp
 
-    # Sweep fractions for several strategies
-    python experiments/run_offload_strategies.py --sglang-url http://localhost:8200 \
-        --mode knee --fractions 0.0 0.15 0.20 0.25 0.30 \
-        --strategies cache_disp
 """
 
 from __future__ import annotations
@@ -1060,174 +1056,9 @@ async def run_compare(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 # Main: knee-finding sweep mode
 # ---------------------------------------------------------------------------
-async def run_knee(args: argparse.Namespace) -> None:
-    """Sweep fractions and strategies to find capacity knees."""
-    aiohttp = _require_aiohttp()
-    collect_loop = _require_collect_loop()
-    fractions = args.fractions
-    strat_names = args.strategies or DEFAULT_KNEE_STRATEGIES
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    sweep_dir = Path(args.output_dir) / f"knee_{ts}"
-    sweep_dir.mkdir(parents=True, exist_ok=True)
-
-    print("=== Phase 2.6: Capacity Knee Finding ===")
-    print(f"SGLang:       {args.sglang_url}")
-    print(f"Window:       {args.start_hours}h–{args.start_hours + args.duration_hours}h "
-          f"at {args.time_scale}x")
-    print(f"Fractions:    {[f'{f:.0%}' for f in fractions]}")
-    print(f"Strategies:   {', '.join(strat_names)}")
-    print(f"Output:       {sweep_dir}")
-    print()
-
-    print("Loading trace...")
-    trace = load_trace(
-        args.trace_file, args.max_requests, args.duration_hours, args.start_hours,
-    )
-    if not trace:
-        print("No requests loaded!")
-        return
-    print(f"  {len(trace)} requests loaded")
-
-    config = {
-        "sglang_url": args.sglang_url,
-        "model": args.model,
-        "trace_file": args.trace_file,
-        "start_hours": args.start_hours,
-        "duration_hours": args.duration_hours,
-        "time_scale": args.time_scale,
-        "fractions": fractions,
-        "strategies": strat_names,
-        "seed": args.seed,
-        "timestamp": ts,
-    }
-    with open(sweep_dir / "config.json", "w") as f:
-        json.dump(config, f, indent=2)
-
-    all_stats: list[dict] = []
-    run_count = 0
-    total_runs = len(fractions) * len(strat_names)
-
-    for frac in fractions:
-        frac_tag = f"f{int(frac * 100):02d}"
-        frac_dir = sweep_dir / f"strategies_{ts}_{frac_tag}"
-        frac_dir.mkdir(parents=True, exist_ok=True)
-        frac_config = {
-            **config,
-            "fraction": frac,
-            "num_requests": len(trace),
-            "num_sessions": len({r["session_id"] for r in trace}),
-        }
-        with open(frac_dir / "config.json", "w") as f:
-            json.dump(frac_config, f, indent=2)
-
-        frac_stats: list[dict] = []
-        strategies = build_strategies(strat_names, frac, args, trace)
-
-        for name, strategy in strategies:
-            run_count += 1
-            run_dir = frac_dir / name
-            run_dir.mkdir(parents=True, exist_ok=True)
-
-            print(f"\n{'#' * 60}")
-            print(
-                f"Run {run_count}/{total_runs}: {name} "
-                f"(target {frac:.0%})"
-            )
-            print(f"{'#' * 60}")
-
-            print("  Flushing SGLang cache...")
-            try:
-                async with aiohttp.ClientSession() as flush_sess:
-                    async with flush_sess.post(
-                        f"{args.sglang_url.rstrip('/')}/flush_cache"
-                    ) as resp:
-                        print(f"  Flush response: {resp.status}")
-            except Exception as e:
-                print(f"  Flush failed: {e}")
-
-            await wait_for_cooldown(args.sglang_url)
-            if run_count > 1:
-                await asyncio.sleep(args.cooldown)
-
-            metrics_csv = run_dir / "metrics.csv"
-            requests_csv = run_dir / "requests.csv"
-
-            metrics_url = f"{args.sglang_url.rstrip('/')}/metrics"
-            stop_event = asyncio.Event()
-            collector_task = asyncio.create_task(
-                collect_loop(metrics_url, metrics_csv, interval_s=0.1, stop_event=stop_event)
-            )
-
-            try:
-                results = await replay_with_strategy(
-                    args.sglang_url, args.model, trace, args.time_scale,
-                    strategy, requests_csv,
-                )
-            finally:
-                stop_event.set()
-                await asyncio.sleep(0.2)
-                collector_task.cancel()
-                try:
-                    await collector_task
-                except asyncio.CancelledError:
-                    pass
-
-            stats = compute_stats(results, name)
-            stats["target_fraction"] = frac
-            stats["actual_outsource_pct"] = strategy.actual_fraction
-            frac_stats.append(stats)
-            all_stats.append(stats)
-            print(f"  Actual outsource rate: {strategy.actual_fraction:.1%}")
-
-        frac_summary = frac_dir / "strategy_summary.csv"
-        cols = [
-            "label", "target_fraction", "actual_outsource_pct",
-            "total_requests", "local_requests", "outsourced_requests",
-            "local_success", "local_success_rate",
-            "ttft_p50", "ttft_p90", "ttft_p95", "ttft_p99", "ttft_max",
-            "latency_p50", "latency_p99",
-        ]
-        with open(frac_summary, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=cols)
-            w.writeheader()
-            w.writerows(frac_stats)
-
-    summary_path = sweep_dir / "knee_summary.csv"
-    cols = [
-        "label", "target_fraction", "actual_outsource_pct",
-        "total_requests", "local_requests", "outsourced_requests",
-        "local_success", "local_success_rate",
-        "ttft_p50", "ttft_p90", "ttft_p95", "ttft_p99", "ttft_max",
-        "latency_p50", "latency_p99",
-    ]
-    with open(summary_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=cols)
-        w.writeheader()
-        w.writerows(all_stats)
-
-    print(f"\n{'=' * 70}")
-    print("KNEE-FINDING SUMMARY")
-    print(f"{'=' * 70}")
-    print(f"{'Strategy':<16} {'Frac':>6} {'Outsrc%':>8} {'Success%':>9} "
-          f"{'TTFT_p50':>10} {'TTFT_p99':>10}")
-    print("-" * 70)
-    for s in all_stats:
-        print(f"{s['label']:<16} {s['target_fraction']:>5.0%} "
-              f"{s['actual_outsource_pct']:>7.1%} "
-              f"{s['local_success_rate']:>8.1%} "
-              f"{s['ttft_p50']:>9.0f}ms {s['ttft_p99']:>9.0f}ms")
-
-    print(f"\nSummary: {summary_path}")
-
-
-# ---------------------------------------------------------------------------
-# Main: policy invariance verification (Idea 5)
-# ---------------------------------------------------------------------------
 async def run(args: argparse.Namespace) -> None:
     if args.mode == "compare":
         await run_compare(args)
-    elif args.mode == "knee":
-        await run_knee(args)
     elif args.mode == "bistability":
         await run_bistability(args)
 
@@ -1261,10 +1092,9 @@ def main() -> None:
 
     # Mode selection
     parser.add_argument(
-        "--mode", choices=["compare", "knee", "bistability"],
+        "--mode", choices=["compare", "bistability"],
         default="compare",
         help="'compare': 3 strategies at matched budget. "
-             "'knee': fraction sweep. "
              "'bistability': steady-state hold + trigger-removal validation.",
     )
     # For compare mode
