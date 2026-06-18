@@ -64,9 +64,8 @@ important:**
 $0.0458, p99 1112 ms) — the prompt-length cap collapses the heavy tail to a single value
 (28000), so both oracles select the same requests. **The weight claim (paper C2/C3) is
 NOT validated by synthetic data; it requires a real trace** (ShareGPT/BurstGPT/Rednote)
-with continuous, independent (prompt, decode) variation. Recommend
-`scripts/download_data.sh` + re-run, or the offline selection analysis
-(`scripts/analysis/exp_oracle_analysis.py`) on real token counts.
+with continuous, independent (prompt, decode) variation. (Done in the follow-up
+real-trace runs; see `docs/results_rednote_weight.md`.)
 
 ### (b) 🚩 Real bug: nimbus underperforms all_local on near-uniform large-prompt load
 On this workload all_local is fine (0 % viol, service p50 323 ms) — 40 huge requests
