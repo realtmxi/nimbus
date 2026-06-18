@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Cache Displacement vs FLOP knee sweep
-# Runs 4 strategies (flop_based, cache_disp, session_aware, oracle_size)
+# Runs 1 strategy (cache_disp)
 # across a fraction grid to find the knee point.
 #
 # Expected runtime: ~1h trace × 5x speedup × 4 strategies × N fractions
@@ -18,7 +18,7 @@ OUT="logs/cachedisp_${TAG}"
 PY="${PYTHON:-python3}"
 SCRIPT="experiments/run_offload_strategies.py"
 
-STRATEGIES="flop_based cache_disp session_aware oracle_size"
+STRATEGIES="cache_disp"
 FRACTIONS="0.0 0.15 0.20 0.25 0.30 0.35 0.50"
 SEED=42
 START_HOURS=0.8

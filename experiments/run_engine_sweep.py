@@ -88,6 +88,7 @@ async def run_sweep(args: argparse.Namespace) -> None:
                 "synthetic_n": args.synthetic_n,
                 "synthetic_prompt_mode": args.synthetic_prompt_mode,
                 "synthetic_prompt_token_cap": args.synthetic_prompt_token_cap,
+                "synthetic_prompt_salt": args.synthetic_prompt_salt,
                 "time_scale": args.time_scale,
                 "slo_s": args.slo_s,
                 "remote_cache_ttl_s": args.remote_cache_ttl_s,
@@ -116,7 +117,7 @@ def main() -> None:
     parser.add_argument(
         "--policies",
         nargs="+",
-        default=["nimbus", "cachedisp_oracle", "flop_oracle", "random", "all_local", "all_cloud"],
+        default=["nimbus", "cachedisp_oracle", "random", "all_local", "all_cloud"],
         choices=["nimbus", *sorted(BASELINE_POLICIES)],
     )
     parser.add_argument("--fractions", type=float, nargs="+", default=[0.10, 0.15, 0.20, 0.25, 0.30])
@@ -140,6 +141,7 @@ def main() -> None:
         help="stub uses tiny prompt text; sized creates capped word-count prompts",
     )
     parser.add_argument("--synthetic-prompt-token-cap", type=int, default=2048)
+    parser.add_argument("--synthetic-prompt-salt", default="")
     parser.add_argument("--output-dir", default="logs/engine_sweep")
     parser.add_argument("--local", choices=["real", "mock"], default="mock")
     parser.add_argument("--cloud", choices=["sim"], default="sim")

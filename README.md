@@ -36,10 +36,8 @@ experiments/                     End-to-end trace replay against live serving en
 
 scripts/analysis/                Offline analysis (no GPU required)
   exp_knapsack_vs_sorting.py     Knapsack vs greedy comparison
-  exp_oracle_analysis.py         Why size-based oracle is suboptimal
   exp_motivation_figure.py       Memory-bottleneck motivation figure
   plot_engine_sweep.py           Online iso-SLO cost/violation plot
-  plot_cachedisp_knee.py         Knee sweep plot
 
 docs/
   nimbus_v2_pitch.md             Paper pitch (Cache Displacement story)
@@ -80,7 +78,6 @@ fixed-fraction baselines/oracles behind a unified `OffloadStrategy` interface:
 |----------|----------|-------------|
 | SizeOutsourceLongStrategy | `size_long` | Outsource largest-prefill requests |
 | SizeOutsourceShortStrategy | `size_short` | Outsource smallest-prefill requests (worst case) |
-| FlopBasedStrategy | `flop_based` | Legacy FLOP baseline, not the Nimbus main path |
 
 ### Fixed-Fraction Heuristic
 
@@ -116,9 +113,6 @@ See `data/README.md` for details on available datasets.
 ```bash
 # Knapsack vs greedy sorting comparison
 python scripts/analysis/exp_knapsack_vs_sorting.py
-
-# Why size-based oracle is suboptimal
-python scripts/analysis/exp_oracle_analysis.py
 
 # Motivation: memory is the bottleneck
 python scripts/analysis/exp_motivation_figure.py
@@ -284,7 +278,7 @@ locally or kicked to cloud. The service-only component is kept separately as
 ### Run Online Iso-SLO Sweep
 ```bash
 python experiments/run_engine_sweep.py \
-    --policies nimbus cachedisp_oracle flop_oracle random all_local all_cloud \
+    --policies nimbus cachedisp_oracle random all_local all_cloud \
     --fractions 0.10 0.15 0.20 0.25 0.30 \
     --nimbus-weights v2 \
     --local real \
@@ -342,12 +336,12 @@ python experiments/run_offload_strategies.py \
     --sglang-url http://localhost:8200 \
     --mode knee \
     --fractions 0.0 0.15 0.20 0.25 0.30 0.35 0.50 \
-    --strategies flop_based cache_disp session_aware oracle_size \
+    --strategies cache_disp session_aware oracle_size \
     --output-dir logs/cachedisp_knee
 ```
 
-`flop_based` is kept only as a legacy comparison point. The Nimbus main path is
-the online `run_engine.py --policy nimbus --weight v2` experiment above.
+The Nimbus main path is the online `run_engine.py --policy nimbus --weight v2`
+experiment above.
 
 ## Data
 

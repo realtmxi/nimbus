@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Near-knee repeat runs for error bars
-# 3 seeds x 3 fractions x 2 strategies (cache_disp, flop_based) = 18 runs
-# Plus session_aware for comparison = 27 runs
+# 3 seeds x 3 fractions x 1 strategy (cache_disp)
+# = 9 runs
 # ~20 min per run = ~9h
 
 set -euo pipefail
@@ -13,7 +13,7 @@ OUT="logs/cachedisp_repeats"
 PY="${PYTHON:-python3}"
 SCRIPT="experiments/run_offload_strategies.py"
 
-STRATEGIES="flop_based cache_disp session_aware"
+STRATEGIES="cache_disp"
 FRACTIONS="0.15 0.20 0.25"
 SEEDS="42 123 456"
 START_HOURS=0.8

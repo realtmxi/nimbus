@@ -8,12 +8,12 @@ and the core package ``nimbus/decision.py``.
 Usage:
     # Compare selected strategies at one fraction
     python experiments/run_offload_strategies.py --sglang-url http://localhost:8200 \
-        --mode compare --fraction 0.25 --strategies cache_disp session_aware
+        --mode compare --fraction 0.25 --strategies cache_disp
 
     # Sweep fractions for several strategies
     python experiments/run_offload_strategies.py --sglang-url http://localhost:8200 \
         --mode knee --fractions 0.0 0.15 0.20 0.25 0.30 \
-        --strategies flop_based cache_disp session_aware oracle_size
+        --strategies cache_disp
 """
 
 from __future__ import annotations
@@ -310,34 +310,6 @@ class AllCloudStrategy(OffloadStrategy):
         return True
 
 
-class FIFOStrategy(OffloadStrategy):
-    """Outsource the first `fraction` of requests by arrival order.
-
-    Oblivious baseline: no per-request features, just "send the first
-    N% of arrivals to the cloud, keep the rest local".  Tests whether
-    intelligent selection beats arrival-order shedding.
-    """
-
-    def __init__(self, fraction: float, seed: int, trace: list[dict]):
-        super().__init__(fraction, seed)
-        n = len(trace)
-        cutoff = int(n * fraction)
-        # Sort by arrival time and mark the first `cutoff` indices.
-        sorted_indices = sorted(range(n), key=lambda i: trace[i]["arrived_at"])
-        self.outsource_set: set[int] = set(sorted_indices[:cutoff])
-        # Map from request key (use index in trace order if no id field)
-        # to outsource decision.  Caller must pass the trace in same
-        # order so we can match by sequential index.
-        self._idx = 0
-
-    def should_outsource(self, req: dict, kv_pressure: float) -> bool:
-        self.n_total += 1
-        decide = self._idx in self.outsource_set
-        self._idx += 1
-        if decide:
-            self.n_outsourced += 1
-        return decide
-
 
 class RandomRequestStrategy(OffloadStrategy):
     """Random per-request outsourcing at a fixed fraction (baseline).
@@ -354,169 +326,8 @@ class RandomRequestStrategy(OffloadStrategy):
         return False
 
 
-class PressureGatedStrategy(OffloadStrategy):
-    """Only outsource when KV pressure exceeds threshold.
-
-    Uses a higher per-request probability during high-pressure periods
-    to match the target overall fraction.
-    """
-
-    def __init__(self, fraction: float, seed: int, kv_threshold: float = 0.90):
-        super().__init__(fraction, seed)
-        self.kv_threshold = kv_threshold
-        # During high-pressure windows, outsource at elevated rate.
-        # Empirically ~32% of time is memory-bound (Phase 2 finding),
-        # so to match overall fraction f, gate rate ≈ f / 0.32
-        self.gate_rate = min(fraction / 0.32, 0.95)
-
-    def should_outsource(self, req: dict, kv_pressure: float) -> bool:
-        self.n_total += 1
-        if kv_pressure >= self.kv_threshold:
-            if self.rng.random() < self.gate_rate:
-                self.n_outsourced += 1
-                return True
-        return False
 
 
-class SessionAwareStrategy(OffloadStrategy):
-    """Outsource entire sessions to preserve prefix continuity.
-
-    Pre-selects a fraction of sessions to outsource ALL their requests.
-    Once a session is outsourced, all its turns go remote.
-    """
-
-    def __init__(self, fraction: float, seed: int, trace: list[dict]):
-        super().__init__(fraction, seed)
-        # Pre-compute session IDs and select which ones to outsource
-        session_ids = list({req["session_id"] for req in trace})
-        self.rng.shuffle(session_ids)
-        n_outsource = int(len(session_ids) * fraction)
-        self.outsourced_sessions: set[object] = set(session_ids[:n_outsource])
-
-    def should_outsource(self, req: dict, kv_pressure: float) -> bool:
-        self.n_total += 1
-        if req["session_id"] in self.outsourced_sessions:
-            self.n_outsourced += 1
-            return True
-        return False
-
-
-class SizeOutsourceLongStrategy(OffloadStrategy):
-    """Outsource the LONGEST requests by prefill tokens (oracle).
-
-    Keeps short requests locally — should be 'best case' for scheduling since
-    short requests consume less KV memory and finish faster.  Uses oracle
-    knowledge of the full trace to set a percentile threshold.
-    """
-
-    def __init__(self, fraction: float, seed: int, trace: list[dict]):
-        super().__init__(fraction, seed)
-        prefills = sorted(r["num_prefill_tokens"] for r in trace)
-        if fraction <= 0:
-            self.threshold = float("inf")
-        else:
-            idx = max(0, int(len(prefills) * (1 - fraction)))
-            self.threshold = prefills[min(idx, len(prefills) - 1)]
-
-    def should_outsource(self, req: dict, kv_pressure: float) -> bool:
-        self.n_total += 1
-        p = req["num_prefill_tokens"]
-        if p > self.threshold:
-            self.n_outsourced += 1
-            return True
-        if p == self.threshold and self.rng.random() < self.fraction:
-            self.n_outsourced += 1
-            return True
-        return False
-
-
-class SizeOutsourceShortStrategy(OffloadStrategy):
-    """Outsource the SHORTEST requests by prefill tokens (oracle).
-
-    Keeps long requests locally — should be 'worst case' since long requests
-    consume more KV memory and have longer service times.
-    """
-
-    def __init__(self, fraction: float, seed: int, trace: list[dict]):
-        super().__init__(fraction, seed)
-        prefills = sorted(r["num_prefill_tokens"] for r in trace)
-        if fraction <= 0:
-            self.threshold = -1
-        else:
-            idx = min(int(len(prefills) * fraction), len(prefills) - 1)
-            self.threshold = prefills[idx]
-
-    def should_outsource(self, req: dict, kv_pressure: float) -> bool:
-        self.n_total += 1
-        p = req["num_prefill_tokens"]
-        if p < self.threshold:
-            self.n_outsourced += 1
-            return True
-        if p == self.threshold and self.rng.random() < self.fraction:
-            self.n_outsourced += 1
-            return True
-        return False
-
-
-class FlopBasedStrategy(OffloadStrategy):
-    """Outsource requests with highest FLOP cost (legacy V0 baseline).
-
-    Uses the same SimpleFLOPCalculator formula as the legacy FLOP path with
-    Qwen2.5-7B architecture params. Weight =
-        compute_prefill_flops(prefill) + 0.6 * compute_decode_flops(decode)
-    matching the legacy default decode_weight_ratio.
-
-    Pre-computes a percentile threshold on the full trace (oracle for threshold,
-    but the scoring function is the legacy comparison point).
-    """
-
-    def __init__(
-        self,
-        fraction: float,
-        seed: int,
-        trace: list[dict],
-        hidden_dim: int = 3584,
-        num_layers: int = 28,
-        num_attention_heads: int = 28,
-        decode_weight_ratio: float = 0.6,
-    ):
-        super().__init__(fraction, seed)
-        self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
-        self.decode_weight_ratio = decode_weight_ratio
-
-        # Pre-compute scores and threshold from full trace
-        scores = [self._score(r) for r in trace]
-        scores_sorted = sorted(scores)
-        if fraction <= 0:
-            self.threshold = float("inf")
-        else:
-            idx = max(0, int(len(scores_sorted) * (1 - fraction)))
-            self.threshold = scores_sorted[min(idx, len(scores_sorted) - 1)]
-
-    def _score(self, req: dict) -> float:
-        """Match production SimpleFLOPCalculator formulas exactly."""
-        n = req["num_prefill_tokens"]
-        m = req["num_decode_tokens"]
-        d = self.hidden_dim
-        L = self.num_layers
-        # Prefill: 2*n^2*d*L (attention) + 4*n*d^2*L (FFN)
-        prefill_flops = 2 * n * n * d * L + 4 * n * d * d * L
-        # Decode: m*k*d*L (kv-attention, k=n since num_processed_tokens=0 at arrival)
-        #         + 4*m*d^2*L (FFN)
-        decode_flops = m * n * d * L + 4 * m * d * d * L
-        return prefill_flops + self.decode_weight_ratio * decode_flops
-
-    def should_outsource(self, req: dict, kv_pressure: float) -> bool:
-        self.n_total += 1
-        s = self._score(req)
-        if s > self.threshold:
-            self.n_outsourced += 1
-            return True
-        if s == self.threshold and self.rng.random() < self.fraction:
-            self.n_outsourced += 1
-            return True
-        return False
 
 
 class CacheDispStrategy(OffloadStrategy):
@@ -554,87 +365,30 @@ class CacheDispStrategy(OffloadStrategy):
         return False
 
 
-class GatedSessionAwareStrategy(OffloadStrategy):
-    """Pressure-gated session-aware outsourcing.
-
-    Combines *when* to shed (pressure gate) with *who* to shed (session-level
-    sticky decisions).  Only makes outsource decisions for new sessions when
-    KV pressure exceeds the threshold; once a session is marked outsourced or
-    local, that decision is sticky for all subsequent turns.
-    """
-
-    def __init__(self, fraction: float, seed: int, kv_threshold: float = 0.90):
-        super().__init__(fraction, seed)
-        self.kv_threshold = kv_threshold
-        self.gate_rate = min(fraction / 0.32, 0.95)
-        self.outsourced_sessions: set[int] = set()
-        self.local_sessions: set[int] = set()
-
-    def should_outsource(self, req: dict, kv_pressure: float) -> bool:
-        self.n_total += 1
-        sid = req["session_id"]
-
-        # Sticky: already decided
-        if sid in self.outsourced_sessions:
-            self.n_outsourced += 1
-            return True
-        if sid in self.local_sessions:
-            return False
-
-        # First request of a new session: admission decision
-        if kv_pressure >= self.kv_threshold and self.rng.random() < self.gate_rate:
-            self.outsourced_sessions.add(sid)
-            self.n_outsourced += 1
-            return True
-        else:
-            self.local_sessions.add(sid)
-            return False
 
 
 DEFAULT_COMPARE_STRATEGIES = [
     "all_local",
     "all_cloud",
-    "fifo",
     "random_request",
-    "pressure_gated",
-    "session_aware",
-    "gated_session_aware",
-    "size_long",
-    "size_short",
-    "flop_based",
     "cache_disp",
 ]
 
 DEFAULT_KNEE_STRATEGIES = [
-    "flop_based",
     "cache_disp",
-    "session_aware",
-    "oracle_size",
 ]
 
 
 def make_strategy_factories(frac: float, args: argparse.Namespace, trace: list[dict]):
     """Return strategy factories keyed by CLI strategy name.
 
-    ``oracle_size`` is kept as a compatibility alias for the largest-prefill
-    oracle used by the analysis scripts.
     """
     return {
         # Intuitive baselines (oblivious / extremes).
         "all_local": lambda: AllLocalStrategy(frac, args.seed),
         "all_cloud": lambda: AllCloudStrategy(frac, args.seed),
-        "fifo": lambda: FIFOStrategy(frac, args.seed, trace),
         "random_request": lambda: RandomRequestStrategy(frac, args.seed),
-        # System-state baselines.
-        "pressure_gated": lambda: PressureGatedStrategy(frac, args.seed),
-        "session_aware": lambda: SessionAwareStrategy(frac, args.seed, trace),
-        "gated_session_aware": lambda: GatedSessionAwareStrategy(frac, args.seed),
-        # Feature-aware baselines.
-        "size_long": lambda: SizeOutsourceLongStrategy(frac, args.seed, trace),
-        "oracle_size": lambda: SizeOutsourceLongStrategy(frac, args.seed, trace),
-        "size_short": lambda: SizeOutsourceShortStrategy(frac, args.seed, trace),
-        # Legacy baseline and current fixed-fraction heuristic.
-        "flop_based": lambda: FlopBasedStrategy(frac, args.seed, trace),
+        # Current fixed-fraction heuristic.
         "cache_disp": lambda: CacheDispStrategy(frac, args.seed, trace),
     }
 
@@ -1855,8 +1609,6 @@ async def run_policy_invariance(args: argparse.Namespace) -> None:
     for frac in fractions:
         strategy_defs = [
             ("random_request", lambda f=frac: RandomRequestStrategy(f, args.seed)),
-            ("outsource_long", lambda f=frac: SizeOutsourceLongStrategy(f, args.seed, trace)),
-            ("outsource_short", lambda f=frac: SizeOutsourceShortStrategy(f, args.seed, trace)),
         ]
 
         for strat_name, make_strat in strategy_defs:
@@ -2025,9 +1777,8 @@ def main() -> None:
     parser.add_argument(
         "--strategies", type=str, nargs="+", default=None,
         help="Strategies to run (default: all). "
-             "Choose from: all_local, all_cloud, fifo, random_request, "
-             "pressure_gated, session_aware, gated_session_aware, size_long, "
-             "oracle_size, size_short, flop_based, cache_disp",
+             "Choose from: all_local, all_cloud, random_request, "
+             "cache_disp",
     )
     # For knee mode
     parser.add_argument(

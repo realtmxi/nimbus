@@ -17,27 +17,17 @@ from pathlib import Path
 LABELS = {
     "nimbus": "Nimbus",
     "cachedisp_oracle": "CacheDisp fixed",
-    "flop_oracle": "FLOP fixed",
     "random": "Random",
     "all_local": "All local",
     "all_cloud": "All cloud",
-    "fifo": "FIFO",
-    "pressure_gated": "Pressure gated",
-    "session_aware": "Session aware",
-    "size_long": "Size-long",
 }
 
 COLORS = {
     "nimbus": "#111111",
     "cachedisp_oracle": "#2ca02c",
-    "flop_oracle": "#d62728",
     "random": "#7f7f7f",
     "all_local": "#1f77b4",
     "all_cloud": "#9467bd",
-    "fifo": "#8c564b",
-    "pressure_gated": "#ff7f0e",
-    "session_aware": "#17becf",
-    "size_long": "#bcbd22",
 }
 
 

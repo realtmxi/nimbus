@@ -48,8 +48,7 @@ from nimbus.request import OutsourcingRequestInfo  # noqa: E402
 from nimbus.tpot_profile import TPOTProfile  # noqa: E402
 
 BASELINE_POLICIES = {
-    "all_local", "all_cloud", "random", "fifo", "pressure_gated",
-    "session_aware", "size_long", "flop_oracle", "cachedisp_oracle",
+    "all_local", "all_cloud", "random", "cachedisp_oracle",
 }
 
 
@@ -318,9 +317,19 @@ class RealCloud:
         )
 
 
-def _sized_synthetic_prompt(prompt_tokens: int) -> str:
-    """Return a simple prompt whose word count tracks the synthetic token count."""
-    return " ".join(["hello"] * max(1, int(prompt_tokens)))
+def _sized_synthetic_prompt(prompt_tokens: int, request_id: int = 0, salt: str = "") -> str:
+    """Return a prompt whose word count tracks the synthetic token count.
+
+    Synthetic stress runs should not accidentally benchmark a degenerate
+    all-requests-share-one-prefix workload. Include a deterministic run/request
+    marker so vLLM prefix cache cannot leak across policies while preserving the
+    same token-count metadata for apples-to-apples scheduling comparisons.
+    """
+    n = max(1, int(prompt_tokens))
+    marker = f"{salt or 'synthetic'}_req_{request_id}"
+    if n == 1:
+        return marker
+    return " ".join([marker] + ["hello"] * (n - 1))
 
 
 def synthetic_burst_trace(
@@ -328,6 +337,7 @@ def synthetic_burst_trace(
     seed: int,
     prompt_mode: str = "stub",
     prompt_token_cap: int = 2048,
+    prompt_salt: str = "",
 ) -> list[dict]:
     """Bursty synthetic trace (dense cluster in the middle) for no-GPU/no-trace smoke tests."""
     rng = random.Random(seed)
@@ -338,7 +348,11 @@ def synthetic_burst_trace(
         prompt_tokens = rng.choice([512, 2048, 8000, 32000, 64000])
         if prompt_mode == "sized":
             prompt_tokens = min(prompt_tokens, max(1, int(prompt_token_cap)))
-            prompt_text = _sized_synthetic_prompt(prompt_tokens)
+            prompt_text = _sized_synthetic_prompt(
+                prompt_tokens,
+                request_id=i,
+                salt=prompt_salt,
+            )
         else:
             prompt_text = "ping"
         rows.append({
@@ -357,19 +371,12 @@ def make_decider(args: argparse.Namespace, trace: list[dict]):
     if p == "nimbus":
         return None
     from run_offload_strategies import (
-        AllLocalStrategy, AllCloudStrategy, RandomRequestStrategy, FIFOStrategy,
-        PressureGatedStrategy, SessionAwareStrategy, SizeOutsourceLongStrategy,
-        FlopBasedStrategy, CacheDispStrategy,
+        AllLocalStrategy, AllCloudStrategy, RandomRequestStrategy, CacheDispStrategy,
     )
     return {
         "all_local": lambda: AllLocalStrategy(f, s),
         "all_cloud": lambda: AllCloudStrategy(f, s),
         "random": lambda: RandomRequestStrategy(f, s),
-        "fifo": lambda: FIFOStrategy(f, s, trace),
-        "pressure_gated": lambda: PressureGatedStrategy(f, s, kv_threshold=args.admit_kv),
-        "session_aware": lambda: SessionAwareStrategy(f, s, trace),
-        "size_long": lambda: SizeOutsourceLongStrategy(f, s, trace),
-        "flop_oracle": lambda: FlopBasedStrategy(f, s, trace),
         "cachedisp_oracle": lambda: CacheDispStrategy(f, s, trace),
     }[p]()
 
@@ -457,17 +464,36 @@ class LocalAdmissionState:
 
     def __init__(self) -> None:
         self.inflight = 0
-        self.mock_kv_used = 0.0
+        self._reserved_kv_tokens = 0.0
+
+    @property
+    def mock_kv_used(self) -> float:
+        """Compatibility alias for tests and mock-mode accounting."""
+        return self._reserved_kv_tokens
 
     def reserve(self, req: OutsourcingRequestInfo, local_mode: str) -> None:
         self.inflight += 1
-        if local_mode == "mock":
-            self.mock_kv_used += req.num_prompt_tokens
+        self._reserved_kv_tokens += max(0.0, float(req.num_prompt_tokens))
 
     def release(self, req: OutsourcingRequestInfo, local_mode: str) -> None:
         self.inflight = max(0, self.inflight - 1)
+        self._reserved_kv_tokens = max(
+            0.0,
+            self._reserved_kv_tokens - max(0.0, float(req.num_prompt_tokens)),
+        )
+
+    def effective_used_tokens(self, observed_used_tokens: float, local_mode: str) -> float:
+        """Return KV used for controller decisions.
+
+        In real serving mode, vLLM/SGLang metrics can lag behind requests that
+        the harness has already admitted. Use the larger of observed engine KV
+        and locally reserved prompt tokens so the admission loop cannot dump an
+        entire kept queue before metrics catches up. Mock mode has no external
+        metrics, so the reservation is the modeled KV usage.
+        """
         if local_mode == "mock":
-            self.mock_kv_used = max(0.0, self.mock_kv_used - req.num_prompt_tokens)
+            return self._reserved_kv_tokens
+        return max(float(observed_used_tokens), self._reserved_kv_tokens)
 
 
 def _estimate_decode_batch_size(
@@ -709,10 +735,14 @@ async def replay(args: argparse.Namespace, trace: list[dict]) -> list[dict]:
             if args.local == "real":
                 try:
                     async with session.get(metrics_url) as resp:
-                        return kv_metrics.record_text(await resp.text())
+                        used, max_tokens = kv_metrics.record_text(await resp.text())
                 except Exception:
-                    return kv_metrics.fallback_on_error()
-            return local_state.mock_kv_used, args.local_kv_tokens
+                    used, max_tokens = kv_metrics.fallback_on_error()
+                return local_state.effective_used_tokens(used, args.local), max_tokens
+            return (
+                local_state.effective_used_tokens(local_state.mock_kv_used, args.local),
+                args.local_kv_tokens,
+            )
 
         async def admit_local(req: OutsourcingRequestInfo) -> None:
             res = {"success": False, "ttft_ms": None}
@@ -942,6 +972,14 @@ def effective_fraction(args: argparse.Namespace) -> str | float:
     return args.fraction
 
 
+def synthetic_prompt_salt(args: argparse.Namespace) -> str:
+    """Return the per-run salt used to isolate synthetic prompt-cache state."""
+    explicit = getattr(args, "synthetic_prompt_salt", "")
+    if explicit:
+        return explicit
+    return f"{args.policy}_{effective_fraction(args)}_{args.weight}_{args.seed}"
+
+
 async def run_engine(args: argparse.Namespace) -> None:
     if args.synthetic_burst or not args.trace_file:
         trace = synthetic_burst_trace(
@@ -949,6 +987,7 @@ async def run_engine(args: argparse.Namespace) -> None:
             args.seed,
             prompt_mode=args.synthetic_prompt_mode,
             prompt_token_cap=args.synthetic_prompt_token_cap,
+            prompt_salt=synthetic_prompt_salt(args),
         )
         print(f"[synthetic-burst] {len(trace)} requests")
     else:
@@ -1043,6 +1082,11 @@ def main() -> None:
         type=int,
         default=2048,
         help="cap synthetic prompt metadata/text length when --synthetic-prompt-mode sized",
+    )
+    p.add_argument(
+        "--synthetic-prompt-salt",
+        default="",
+        help="optional salt for sized synthetic prompt text; default isolates each policy run",
     )
     p.add_argument("--output-dir", default="logs/engine")
     p.add_argument("--local", choices=["real", "mock"], default="mock")

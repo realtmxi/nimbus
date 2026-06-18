@@ -8,6 +8,7 @@ from experiments.run_engine import (
     RealCloud,
     SimCloud,
     _effective_tpot_seconds,
+    _sized_synthetic_prompt,
     _estimate_decode_batch_size,
     _loop_sleep_seconds,
     _mock_service_times,
@@ -285,6 +286,15 @@ class ReplayAccountingTests(unittest.TestCase):
         self.assertTrue(all(row["num_prefill_tokens"] <= 128 for row in trace))
         self.assertTrue(all(len(row["prompt_text"].split()) == row["num_prefill_tokens"] for row in trace))
 
+    def test_sized_synthetic_prompt_is_request_unique_without_changing_length(self):
+        first = _sized_synthetic_prompt(5, request_id=1, salt="run-a")
+        second = _sized_synthetic_prompt(5, request_id=2, salt="run-a")
+        other_run = _sized_synthetic_prompt(5, request_id=1, salt="run-b")
+
+        self.assertEqual(len(first.split()), 5)
+        self.assertNotEqual(first, second)
+        self.assertNotEqual(first, other_run)
+
     def test_local_admission_state_reserves_and_releases_mock_kv_synchronously(self):
         req = make_request("r1", session_id=1, prompt_tokens=800)
         state = LocalAdmissionState()
@@ -299,14 +309,47 @@ class ReplayAccountingTests(unittest.TestCase):
         self.assertEqual(state.inflight, 0)
         self.assertEqual(state.mock_kv_used, 0)
 
-    def test_local_admission_state_real_mode_only_tracks_inflight(self):
+    def test_local_admission_state_real_mode_reserves_kv_until_release(self):
         req = make_request("r1", session_id=1, prompt_tokens=800)
         state = LocalAdmissionState()
 
         state.reserve(req, local_mode="real")
 
         self.assertEqual(state.inflight, 1)
+        self.assertEqual(state.mock_kv_used, 800)
+        self.assertEqual(state.effective_used_tokens(100, local_mode="real"), 800)
+
+        state.release(req, local_mode="real")
+
+        self.assertEqual(state.inflight, 0)
         self.assertEqual(state.mock_kv_used, 0)
+
+    def test_local_admission_state_real_mode_preserves_external_metric_if_larger(self):
+        req = make_request("r1", session_id=1, prompt_tokens=800)
+        state = LocalAdmissionState()
+        state.reserve(req, local_mode="real")
+
+        self.assertEqual(state.effective_used_tokens(1200, local_mode="real"), 1200)
+
+    def test_local_admission_state_real_reservation_stops_metric_lag_overadmission(self):
+        state = LocalAdmissionState()
+        max_tokens = 90_064
+        admit_kv = 0.90
+        admitted = 0
+        for idx in range(10):
+            if state.effective_used_tokens(0, local_mode="real") / max_tokens >= admit_kv:
+                break
+            state.reserve(
+                make_request(f"r{idx}", session_id=idx, prompt_tokens=28_000),
+                local_mode="real",
+            )
+            admitted += 1
+
+        self.assertEqual(admitted, 3)
+        self.assertGreaterEqual(
+            state.effective_used_tokens(0, local_mode="real") / max_tokens,
+            admit_kv,
+        )
 
     def test_queue_delay_scales_only_when_requested(self):
         req = make_request("r1", session_id=1, prompt_tokens=100)
