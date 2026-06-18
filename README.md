@@ -14,13 +14,11 @@ p50** than FLOP-based outsourcing on the ShareGPT+BurstGPT trace
 
 ```
 nimbus/                          Core algorithm (Python module)
-  decision.py                    OutsourcingEngine: KV-time budget + iterative knapsack
+  decision.py                    OutsourcingEngine: KV-time-budget knapsack (decide_by_kv_time_budget)
   knapsack.py                    KnapsackSolver: dp_scaled, fractional, dp, random
-  violation_detection.py         Legacy FLOP TTFT detector (baseline only)
   candidate_selection.py         Candidate request filtering
   cost_calculator.py             API cost model
-  flop_calculator.py             Compute cost (Nimbus v0)
-  profiled_flop_calculator.py    Profiled compute cost
+  flop_calculator.py             Compute cost (Nimbus v0 weight)
   request.py                     OutsourcingRequestInfo dataclass
   request_tracker.py             Outsourced request tracking
   queue.py                       WaitingQueueInterface
@@ -36,13 +34,12 @@ experiments/                     End-to-end trace replay against live serving en
 
 scripts/analysis/                Offline analysis (no GPU required)
   exp_knapsack_vs_sorting.py     Knapsack vs greedy comparison
-  exp_motivation_figure.py       Memory-bottleneck motivation figure
   plot_engine_sweep.py           Online iso-SLO cost/violation plot
 
 docs/
   nimbus_v2_pitch.md             Paper pitch (Cache Displacement story)
-  tcpo_oracle_design.md          Trace-Clairvoyant Pressure Oracle design
   exp_knapsack_vs_sorting_design.md
+  results_*.md                   Real-GPU result writeups (32b sweep, unique-prompt, rednote weight)
 
 scripts/download_data.sh         Compose/copy trace data
 data/                            Local trace files (gitignored)
@@ -55,35 +52,19 @@ core `nimbus.decision.OutsourcingEngine` with the default v2 token-seconds
 cache-displacement weight. `experiments/run_offload_strategies.py` implements
 fixed-fraction baselines/oracles behind a unified `OffloadStrategy` interface:
 
-### Intuitive baselines (oblivious / extremes)
+### Baselines (`run_engine.py --policy`)
 
-| Strategy | CLI name | Description |
-|----------|----------|-------------|
-| AllLocalStrategy | `all_local` | No outsourcing (cost lower bound, latency upper bound) |
-| AllCloudStrategy | `all_cloud` | Outsource everything (cost upper bound, no local pressure) |
-| FIFOStrategy | `fifo` | Outsource the first N% requests by arrival order |
-| RandomRequestStrategy | `random_request` | Outsource each request i.i.d. with probability `fraction` |
+| Policy | Description |
+|--------|-------------|
+| `all_local` | No outsourcing (cost lower bound, latency upper bound) |
+| `all_cloud` | Outsource everything (cost upper bound, no local pressure) |
+| `random` | Outsource each request i.i.d. with probability `fraction` |
+| `cachedisp_oracle` | Fixed-fraction cache-displacement selection (`prefill_tokens * decode_tokens`) — our method *without* the adaptive controller |
 
-### System-state baselines (use system signals, not request features)
-
-| Strategy | CLI name | Description |
-|----------|----------|-------------|
-| PressureGatedStrategy | `pressure_gated` | Outsource only when KV pressure exceeds threshold |
-| SessionAwareStrategy | `session_aware` | Outsource entire sessions to preserve prefix continuity |
-| GatedSessionAwareStrategy | `gated_session_aware` | Pressure gate + session-sticky decisions |
-
-### Feature-aware baselines (use per-request features)
-
-| Strategy | CLI name | Description |
-|----------|----------|-------------|
-| SizeOutsourceLongStrategy | `size_long` | Outsource largest-prefill requests |
-| SizeOutsourceShortStrategy | `size_short` | Outsource smallest-prefill requests (worst case) |
-
-### Fixed-Fraction Heuristic
-
-| Strategy | CLI name | Description |
-|----------|----------|-------------|
-| **CacheDispStrategy** | `cache_disp` | Weight = `prefill_tokens * decode_tokens` (memory-time product) |
+`nimbus` (`--policy nimbus`) is the adaptive online controller and the main path;
+the baselines above are fixed-fraction. The offline `run_offload_strategies.py`
+compare/knee/bistability modes expose the same classes via
+`--strategies {all_local, all_cloud, random_request, cache_disp}`.
 
 ## Quick Start
 
@@ -113,9 +94,6 @@ See `data/README.md` for details on available datasets.
 ```bash
 # Knapsack vs greedy sorting comparison
 python scripts/analysis/exp_knapsack_vs_sorting.py
-
-# Motivation: memory is the bottleneck
-python scripts/analysis/exp_motivation_figure.py
 ```
 
 ### Run Online Nimbus Smoke Test (no GPU)
@@ -312,8 +290,7 @@ delay. `CLOUD_TTFT_GUARD_MULTIPLIER` defaults to `1.5` so Nimbus makes cloud
 handoff decisions before modeled cloud jitter consumes the TTFT deadline.
 
 ### Run Bistability Validation
-The old `--mode hysteresis` ramp is only a quick exploratory smoke. For paper
-numbers, use the steady-state hold plus trigger-removal protocol:
+Use the steady-state hold plus trigger-removal protocol for paper numbers:
 ```bash
 python experiments/run_offload_strategies.py \
     --mode bistability \
@@ -336,7 +313,7 @@ python experiments/run_offload_strategies.py \
     --sglang-url http://localhost:8200 \
     --mode knee \
     --fractions 0.0 0.15 0.20 0.25 0.30 0.35 0.50 \
-    --strategies cache_disp session_aware oracle_size \
+    --strategies cache_disp \
     --output-dir logs/cachedisp_knee
 ```
 
