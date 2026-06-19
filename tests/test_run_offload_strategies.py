@@ -56,6 +56,40 @@ class TraceLoaderTests(unittest.TestCase):
 
         self.assertEqual([row["session_id"] for row in trace], ["burst-a", "api:1"])
 
+    def test_load_trace_arrived_window_selects_named_scenario_slice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trace.jsonl"
+            path.write_text(
+                "\n".join(
+                    json.dumps({
+                        "arrived_at": t, "session_id": 0, "prompt_text": "x",
+                        "num_prefill_tokens": 10, "num_decode_tokens": 5,
+                    })
+                    for t in (100, 150, 200, 250, 300)
+                ) + "\n"
+            )
+            trace = load_trace(
+                str(path), max_requests=None, duration_hours=None,
+                arrived_window=(150, 250),
+            )
+        # window is inclusive and ignores start_hours/duration_hours
+        self.assertEqual([int(r["arrived_at"]) for r in trace], [150, 200, 250])
+
+    def test_run_engine_scenarios_match_baseline_harness(self):
+        import re
+        import sys
+        sys.path.insert(0, "experiments")
+        from run_engine import SCENARIOS
+
+        vblock = re.search(
+            r"SCENARIOS\s*=\s*\{(.*?)\}", Path("vllm/run.py").read_text(), re.S
+        ).group(1)
+        baseline = {
+            m[0]: (int(m[1]), int(m[2]))
+            for m in re.findall(r'"(\w+)":\s*\((\d+),\s*(\d+)\)', vblock)
+        }
+        self.assertEqual({k: tuple(v) for k, v in SCENARIOS.items()}, baseline)
+
 
 class BistabilityProtocolTests(unittest.TestCase):
     def test_steady_state_reached_uses_recent_segment_cv(self):

@@ -89,6 +89,7 @@ async def run_sweep(args: argparse.Namespace) -> None:
                 "synthetic_prompt_mode": args.synthetic_prompt_mode,
                 "synthetic_prompt_token_cap": args.synthetic_prompt_token_cap,
                 "synthetic_prompt_salt": args.synthetic_prompt_salt,
+                "scenario": args.scenario,
                 "time_scale": args.time_scale,
                 "slo_s": args.slo_s,
                 "remote_cache_ttl_s": args.remote_cache_ttl_s,
@@ -142,6 +143,7 @@ def main() -> None:
     )
     parser.add_argument("--synthetic-prompt-token-cap", type=int, default=2048)
     parser.add_argument("--synthetic-prompt-salt", default="")
+    parser.add_argument("--scenario", default=None)
     parser.add_argument("--output-dir", default="logs/engine_sweep")
     parser.add_argument("--local", choices=["real", "mock"], default="mock")
     parser.add_argument("--cloud", choices=["sim"], default="sim")

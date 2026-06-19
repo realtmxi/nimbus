@@ -58,6 +58,18 @@ WEIGHT_MODES = {
     "v2": "v2_token_seconds",
 }
 
+# Named burst-load tiers as absolute arrived_at windows on the ShareGPT+BurstGPT
+# trace. Kept in sync with the baseline harness (vllm/run.py SCENARIOS) so nimbus
+# and the baselines run on the IDENTICAL low/mid/high pressure slices.
+SCENARIOS = {
+    "normal": (1477007, 1478206),               # ~0.18 req/s  (low)
+    "burst_300": (1700593, 1700892),
+    "burst_1200": (1700032, 1701231),           # ~2.3 req/s   (mid)
+    "burst": (1698942, 1702541),
+    "extreme_burst_1200": (1260532, 1261731),   # ~9.7 req/s   (high)
+    "extreme_burst": (1255679, 1266478),
+}
+
 
 @contextlib.asynccontextmanager
 async def null_session():
@@ -992,8 +1004,13 @@ async def run_engine(args: argparse.Namespace) -> None:
         print(f"[synthetic-burst] {len(trace)} requests")
     else:
         from run_offload_strategies import load_trace
-        trace = load_trace(args.trace_file, args.max_requests, args.duration_hours, args.start_hours)
-        print(f"[trace] {len(trace)} requests from {args.trace_file}")
+        window = SCENARIOS[args.scenario] if args.scenario else None
+        trace = load_trace(
+            args.trace_file, args.max_requests, args.duration_hours, args.start_hours,
+            arrived_window=window,
+        )
+        tag = f" scenario={args.scenario}" if args.scenario else ""
+        print(f"[trace]{tag} {len(trace)} requests from {args.trace_file}")
     if not trace:
         print("No requests!")
         return
@@ -1069,6 +1086,8 @@ def main() -> None:
     )
     p.add_argument("--model", default="Qwen2.5-7B-Instruct")
     p.add_argument("--trace-file", default=None)
+    p.add_argument("--scenario", choices=sorted(SCENARIOS), default=None,
+                   help="named burst-load tier (arrived_at window); matches vllm/run.py SCENARIOS")
     p.add_argument("--synthetic-burst", action="store_true", help="in-memory bursty trace (no GPU/trace)")
     p.add_argument("--synthetic-n", type=int, default=400)
     p.add_argument(

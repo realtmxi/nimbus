@@ -72,8 +72,14 @@ def load_trace(
     max_requests: int | None,
     duration_hours: float | None,
     start_hours: float = 0.0,
+    arrived_window: tuple[float, float] | None = None,
 ) -> list[dict]:
-    """Load JSONL trace, optionally skipping initial quiet period."""
+    """Load JSONL trace, optionally skipping initial quiet period.
+
+    If ``arrived_window`` (start, end) is given, keep only requests whose
+    ``arrived_at`` falls in that absolute window (the named-scenario path,
+    matching vllm/run.py SCENARIOS) and ignore start_hours/duration_hours.
+    """
     requests: list[dict] = []
     first_ts: float | None = None
     skipped = 0
@@ -84,14 +90,21 @@ def load_trace(
                 break
             row = json.loads(line)
             ts = float(row["arrived_at"])
-            if first_ts is None:
-                first_ts = ts
-            elapsed_h = (ts - first_ts) / 3600
-            if elapsed_h < start_hours:
-                skipped += 1
-                continue
-            if duration_hours is not None and elapsed_h > start_hours + duration_hours:
-                break
+            if arrived_window is not None:
+                w_start, w_end = arrived_window
+                if ts < w_start:
+                    continue
+                if ts > w_end:
+                    break  # trace is arrived_at-ordered
+            else:
+                if first_ts is None:
+                    first_ts = ts
+                elapsed_h = (ts - first_ts) / 3600
+                if elapsed_h < start_hours:
+                    skipped += 1
+                    continue
+                if duration_hours is not None and elapsed_h > start_hours + duration_hours:
+                    break
             session_id = row.get("session_id", 0)
             if session_id is None or session_id == "":
                 session_id = 0
