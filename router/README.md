@@ -9,8 +9,8 @@ nimbus knapsack 尚未接入(将作为队列上的 policy 插件)。
 | 文件 | 作用 |
 |---|---|
 | `run.py` | **唯一入口**:外部 FIFO + work-conserving dispatcher + CLI |
-| `common.py` | 共享库:`one_request`/`load_trace`/SCENARIOS(逐行取自 `vllm/run.py`)、Endpoint、Policy、NullCloud、计费、summarize |
-| `test_run.py` / `test_common.py` | 29 个单元测试,无需网络/aiohttp |
+| `common.py` | 共享库:`one_request`/`load_trace`/SCENARIOS(逐行取自 **`vllm/run.py` @ `dff1a81`**,即 Jialu 分支 mtp 版——她实际在跑、gpu1 上 md5 核对过的版本;main 上的旧版 payload 略有差异:有 temperature/top_p、无 stream_options)、Endpoint、Policy、NullCloud、计费、summarize |
+| `test_run.py` / `test_common.py` | 31 个单元测试,无需网络/aiohttp |
 
 ## 架构
 
@@ -37,7 +37,7 @@ nimbus knapsack 尚未接入(将作为队列上的 policy 插件)。
 token 数/成本(`--max-tokens` 语义与真实 payload 完全一致:替换 trace 值),
 **不建模延迟、不参与 SLO 统计**(`routed_only` 标记,summary 自动排除)。
 
-`--cloud real --cloud-url ... --cloud-model ... --cloud-api-key-env KEY`:真实流式调用。
+`--cloud real --cloud-url ... --cloud-model ... --cloud-api-key-env KEY`:真实流式调用,`--cloud-max-concurrency`(默认 32)防 burst 下自打 429。
 等实验需要云侧延迟数字时再用(Jialu 有 14k 条真实 OpenRouter 测量在 gpu1
 `/scratch/jialu/initial_result/` 可估分布;qwen3-32b 实测 TTFT p50≈10s——reasoning+排队,云并不"快")。
 

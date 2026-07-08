@@ -11,7 +11,7 @@ Nimbus 的 local/cloud 请求路由框架,从零重写。它取代的不是某�
 
 三条设计原则:
 
-1. **可信源优先**:凡是能抄 Jialu 验证过的代码(`vllm/run.py`)的,逐行抄,不重新发明
+1. **可信源优先**:凡是能抄 Jialu 验证过的代码的,逐行抄,不重新发明。注意版本锚点:抄的是 **`vllm/run.py` @ `dff1a81`**(Jialu 分支 mtp 版,她实际在跑的那份,gpu1 md5 核对);main 上的旧版 payload 有 temperature/top_p、无 stream_options,与本包不同——对照实验须用 dff1a81 版
 2. **第一性原理**:不预建层。KV 感知、云延迟建模、nimbus 算法都被有意排除(§7)
 3. **每层可验收**:新加一层,必须能和上一层对比出"没有引入行为差异"
 
@@ -25,7 +25,7 @@ router/
 ├── run.py               唯一入口:外部队列 + work-conserving dispatcher + CLI
 ├── common.py            共享库:one_request/load_trace/Policy/NullCloud/计费/summarize
 ├── test_run.py          ┐
-├── test_common.py       ┘ 29 个单元测试(stub session,无需网络/aiohttp/GPU)
+├── test_common.py       ┘ 31 个单元测试(stub session,无需网络/aiohttp/GPU)
 ├── README.md            用法 + 验证记录(实测数字)
 └── __init__.py          空,使 router 成为包(python -m router.run)
 ```
@@ -78,7 +78,7 @@ shedding policy 要"挑着踢",挑人得有名单——名单只能在自己手�
 |---|---|---|---|
 | `Endpoint` | common.py | 一个 OpenAI 兼容端点(url/model/key/单价) | frozen dataclass |
 | `Policy` | common.py | 到达时路由决策;三个 policy = 同一规则的 p=0/1/f | `outsource(req) -> bool` |
-| `one_request` | common.py | 发一条流式请求并测 TTFT/TPOT/错误(**逐行取自 vllm/run.py**) | `await one_request(session, endpoint, req, due)` |
+| `one_request` | common.py | 发一条流式请求并测 TTFT/TPOT/错误(**逐行取自 vllm/run.py @ dff1a81**) | `await one_request(session, endpoint, req, due)` |
 | `NullCloud` | common.py | fake 云 sink:只记 routed + token 计数,不建模延迟 | `serve(req, due) -> result dict` |
 | `LocalAdmission` | run.py | 本地并发闸门 + 峰值遥测 | `fits / reserve / release` |
 
@@ -126,7 +126,7 @@ Jialu vllm/run.py(团队已验证,= baseline)
                └── nimbus vs random/all_local/all_cloud             ← 未来:算法收益
 ```
 
-外加 29 个单元测试锁行为规约(分流确定性、失败不计费、名额不泄漏、FIFO、
+外加 31 个单元测试锁行为规约(分流确定性、失败不计费、名额不泄漏、FIFO、
 routed_only 不进 SLO),以及 CLI 冒烟(单测覆盖不到 replay 主循环——历史上真漏过一个
 改名残留 NameError,教训:**每次改动后单测 + CLI 冒烟都要跑**)。
 具体实测数字见 [router/README.md](../router/README.md) 的验证阶梯表。

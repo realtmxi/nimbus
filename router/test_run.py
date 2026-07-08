@@ -36,13 +36,13 @@ def mk_trace(n: int, prompt_tokens: int = 100, max_tokens: int = 50,
 
 
 def mk_args(policy: str = "all_local", max_inflight: int = 128,
-            fraction: float = 0.5) -> object:
+            fraction: float = 0.5, extra: list | None = None) -> object:
     out_dir = Path(tempfile.mkdtemp())
     argv = ["--data", "t.jsonl", "--scenario", "normal", "--policy", policy,
             "--fraction", str(fraction),
             "--local-url", "http://x", "--local-model", "m",
             "--max-inflight", str(max_inflight),
-            "--out-dir", str(out_dir)]
+            "--out-dir", str(out_dir)] + (extra or [])
     return parse_args(argv)
 
 
@@ -72,11 +72,12 @@ class RecordingSender:
         }
 
 
-def run(args, trace, policy, sink=None, sender=None):
+def run(args, trace, policy, sink=None, sender=None, cloud_sender=None):
     sender = sender or RecordingSender()
+    has_cloud = sink is not None or cloud_sender is not None
     results, admission = asyncio.run(replay_queued(
-        args, trace, policy, LOCAL, CLOUD if sink is not None else None,
-        sink=sink, send_local=sender))
+        args, trace, policy, LOCAL, CLOUD if has_cloud else None,
+        sink=sink, send_local=sender, send_cloud=cloud_sender))
     return results, admission, sender
 
 
@@ -167,6 +168,40 @@ class TestCloudPath(unittest.TestCase):
         self.assertGreaterEqual(stats["peak_inflight"], 1)
 
 
+class TestCloudConcurrencyGate(unittest.TestCase):
+    def test_real_cloud_concurrency_capped(self):
+        """Regression (codex review): real-cloud sends must respect
+        --cloud-max-concurrency so burst outsourcing can't self-inflict 429s."""
+        class CloudRecorder:
+            def __init__(self):
+                self.active = 0
+                self.peak = 0
+                self.n = 0
+            async def __call__(self, req, due):
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+                await asyncio.sleep(0.02)
+                self.active -= 1
+                self.n += 1
+                return {"request_id": req["request_id"], "arrived_at": req["arrived_at"],
+                        "relative_arrival_s": req["relative_arrival_s"],
+                        "scheduled_lag_ms": 0.0, "endpoint": "cloud", "model": "m",
+                        "success": True, "error": None, "error_type": None,
+                        "http_status": 200, "ttft_ms": 5.0, "e2e_ms": 20.0,
+                        "tpot_ms": 1.0, "chunks": 2, "prompt_tokens": 10,
+                        "completion_tokens": 5, "output_chars": 4, "cost_usd": 0.0001}
+        rec = CloudRecorder()
+        args = mk_args(policy="all_cloud",
+                       extra=["--cloud", "real", "--cloud-url", "http://c",
+                              "--cloud-model", "m", "--cloud-max-concurrency", "2"])
+        results, _, _ = run(args, mk_trace(10), Policy("all_cloud", 1.0, 0),
+                            cloud_sender=rec)
+        self.assertEqual(rec.n, 10)
+        self.assertEqual(len(results), 10)
+        self.assertLessEqual(rec.peak, 2)                 # gate binds
+        self.assertGreaterEqual(rec.peak, 2)              # and is actually exercised
+
+
 class TestParseArgsQueued(unittest.TestCase):
     def test_random_default_cloud_is_null_sink(self):
         args = parse_args(["--data", "t", "--scenario", "normal", "--policy", "random",
@@ -201,6 +236,16 @@ class TestParseArgsQueued(unittest.TestCase):
         self.assertEqual(out, Path("results/day1/run.jsonl"))
         self.assertEqual(out.with_name(out.stem + ".summary.json"),
                          Path("results/day1/run.summary.json"))
+
+    def test_nonpositive_max_tokens_rejected(self):
+        """Regression (codex review): --max-tokens 0 sent payload max_tokens=0
+        while NullCloud billed 1 — reject non-positive values at parse."""
+        base = ["--data", "t", "--scenario", "normal", "--policy", "all_local",
+                "--local-url", "http://x", "--local-model", "m"]
+        for bad in ("0", "-5"):
+            with self.assertRaises(SystemExit):
+                parse_args(base + ["--max-tokens", bad])
+        self.assertEqual(parse_args(base + ["--max-tokens", "1"]).max_tokens, 1)
 
     def test_zero_max_inflight_rejected(self):
         """Regression (PR #3 review): max_inflight=0 would tight-loop the drain."""

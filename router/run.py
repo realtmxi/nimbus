@@ -82,9 +82,10 @@ async def replay_queued(
     cloud: Endpoint | None,
     sink: 'NullCloud | None' = None,
     send_local: Callable[..., Awaitable[dict[str, Any]]] | None = None,
+    send_cloud: Callable[..., Awaitable[dict[str, Any]]] | None = None,
 ) -> tuple[list[dict[str, Any]], LocalAdmission]:
-    """Queued replay. `send_local` is injectable for tests (defaults to the
-    verified streaming primitive one_request)."""
+    """Queued replay. `send_local`/`send_cloud` are injectable for tests
+    (default to the verified streaming primitive one_request)."""
     out = resolve_output_path(args)
     out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -94,16 +95,24 @@ async def replay_queued(
     pending: set[asyncio.Task] = set()
 
     needs_http = ((local is not None and send_local is None)
-                  or (cloud is not None and sink is None))
+                  or (cloud is not None and sink is None and send_cloud is None))
     if needs_http and aiohttp is None:
         raise RuntimeError("aiohttp is required to send requests (run on a host that has it)")
     session_cm = (aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=0))
                   if needs_http else _null_session())
 
+    cloud_gate = (asyncio.Semaphore(args.cloud_max_concurrency)
+                  if getattr(args, "cloud_max_concurrency", 0) > 0 else None)
+
     async with session_cm as session:
         if send_local is None:
             async def send_local(endpoint, req, due):  # noqa: F811 - default sender
                 return await one_request(session, endpoint, req, due,
+                                         max_tokens_override=args.max_tokens,
+                                         timeout_s=args.timeout_s)
+        if send_cloud is None:
+            async def send_cloud(req, due):  # noqa: F811 - default sender
+                return await one_request(session, cloud, req, due,
                                          max_tokens_override=args.max_tokens,
                                          timeout_s=args.timeout_s)
 
@@ -159,18 +168,17 @@ async def replay_queued(
                 record(res)
             else:
                 async def cloud_task():
-                    res = await send_cloud(req, due)
+                    if cloud_gate is not None:
+                        async with cloud_gate:
+                            res = await send_cloud(req, due)
+                    else:
+                        res = await send_cloud(req, due)
                     res["queue_delay_ms"] = 0.0
                     res["service_ttft_ms"] = res.get("ttft_ms")
                     record(res)
                 task = asyncio.create_task(cloud_task())
                 pending.add(task)
                 task.add_done_callback(pending.discard)
-
-        async def send_cloud(req: dict[str, Any], due: float) -> dict[str, Any]:
-            return await one_request(session, cloud, req, due,
-                                     max_tokens_override=args.max_tokens,
-                                     timeout_s=args.timeout_s)
 
         try:
             for req in trace:
@@ -217,6 +225,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cloud-url", default=None)
     parser.add_argument("--cloud-model", default=None)
     parser.add_argument("--cloud-api-key-env", default=None)
+    parser.add_argument("--cloud-max-concurrency", type=int, default=32,
+                        help="cap concurrent REAL cloud requests (0 = unlimited); "
+                             "guards against self-inflicted 429s under burst")
     parser.add_argument("--in-price", type=float, default=0.15)
     parser.add_argument("--out-price", type=float, default=1.20)
 
@@ -230,6 +241,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     if args.max_inflight <= 0:
         parser.error("--max-inflight must be >= 1 (0 would deadlock the dispatcher)")
+    if args.max_tokens is not None and args.max_tokens <= 0:
+        parser.error("--max-tokens must be >= 1 (it replaces the trace decode count "
+                     "in the payload; 0 breaks fake/real parity)")
     needs_local = args.policy in ("all_local", "random")
     needs_cloud = args.policy in ("all_cloud", "random")
     if needs_local and not (args.local_url and args.local_model):

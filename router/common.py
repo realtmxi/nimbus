@@ -1,6 +1,9 @@
 """Shared building blocks for the hybrid router (see router/run.py for the entry point).
 
-Contents: SCENARIOS / load_trace (line-for-line from the verified vllm/run.py),
+Contents: SCENARIOS / load_trace / one_request, line-for-line from the verified
+baseline at its mtp revision (vllm/run.py @ dff1a81, branch Jialu — the version
+she actually runs, md5-matched on the GPU host; main's older copy differs:
+temperature/top_p, no stream_options),
 Endpoint, Policy (all_local / all_cloud / random), one_request (the verified
 streaming request primitive), NullCloud (fake cloud sink), billing, summarize.
 
@@ -153,9 +156,9 @@ class NullCloud:
 
     def serve(self, req: dict[str, Any], due_time: float, *,
               max_tokens_override: int | None = None) -> dict[str, Any]:
-        # same semantics as make_payload: --max-tokens REPLACES the trace value.
-        # completion_tokens therefore reflects the payload cap (an upper bound
-        # on what a real call would bill; the fake sink has no model to EOS early).
+        # exact mirror of make_payload: --max-tokens REPLACES the trace value,
+        # and completion_tokens == the payload's max_tokens (an upper bound on
+        # what a real call would bill; the fake sink has no model to EOS early).
         effective = (int(max_tokens_override) if max_tokens_override is not None
                      else int(req["max_tokens"]))
         result = {
@@ -171,7 +174,7 @@ class NullCloud:
             "ttft_ms": None, "e2e_ms": None, "tpot_ms": None,
             "chunks": 0,
             "prompt_tokens": int(req.get("prompt_tokens") or 0),
-            "completion_tokens": max(1, effective),
+            "completion_tokens": effective,
             "output_chars": 0,
             "cost_usd": 0.0,
         }
@@ -377,6 +380,7 @@ def summarize(results: list[dict[str, Any]], policy: Policy, slo_s: float) -> di
             "ttft_p99_ms": _percentile(ttfts, 99),
             "tpot_p50_ms": _percentile(tpots, 50),
             "slo_violations": viol,
+            "slo_measured_n": len(measured),   # SLO denominator (routed_only excluded)
             "slo_violation_pct": 100.0 * viol / max(len(measured), 1),
             "cost_usd": sum(r["cost_usd"] for r in rows),
         }

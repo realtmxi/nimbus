@@ -241,6 +241,9 @@ class TestNullCloud(unittest.TestCase):
                          make_payload(CLOUD, req, 512)["max_tokens"])
         r3 = NullCloud(CLOUD).serve(req, 0.0)
         self.assertEqual(r3["completion_tokens"], 200)        # no override -> trace
+        r4 = NullCloud(CLOUD).serve(dict(req, max_tokens=0), 0.0)
+        self.assertEqual(r4["completion_tokens"], 0)          # trace 0 -> payload 0, bill 0
+        self.assertAlmostEqual(r4["cost_usd"], (1000 * 0.15) / 1e6)
 
     def test_routed_only_excluded_from_slo_stats(self):
         from router.common import NullCloud
@@ -253,6 +256,8 @@ class TestNullCloud(unittest.TestCase):
         self.assertEqual(s["cloud"]["routed_only"], 3)
         self.assertEqual(s["cloud"]["slo_violations"], 0)      # no latency claim -> no viol
         self.assertEqual(s["cloud"]["slo_violation_pct"], 0.0)
+        self.assertEqual(s["cloud"]["slo_measured_n"], 0)      # denominator is explicit
+        self.assertEqual(s["overall"]["slo_measured_n"], 1)    # only the local row measured
         self.assertEqual(s["overall"]["slo_violations"], 0)
         self.assertGreater(s["cloud"]["cost_usd"], 0.0)        # but still counted & billed
 
