@@ -22,34 +22,25 @@ Nimbus 的 local/cloud 请求路由框架,从零重写。它取代的不是某�
 
 ```
 router/
-├── run.py               590 行  Step 1:open-loop 路由器 + 全部共享构件
-├── run_queued.py        279 行  Step 2:外部队列 + work-conserving dispatcher
-├── test_run.py          295 行  ┐
-├── test_run_queued.py   178 行  ┘ 29 个单元测试(stub session,无需网络/aiohttp/GPU)
-├── README.md                    用法 + 验证阶梯(实测数字)
-└── __init__.py                  空,使 router 成为包(python -m router.run_queued)
+├── run.py               唯一入口:外部队列 + work-conserving dispatcher + CLI
+├── common.py            共享库:one_request/load_trace/Policy/NullCloud/计费/summarize
+├── test_run.py          ┐
+├── test_common.py       ┘ 29 个单元测试(stub session,无需网络/aiohttp/GPU)
+├── README.md            用法 + 验证记录(实测数字)
+└── __init__.py          空,使 router 成为包(python -m router.run)
 ```
+
+> 历史注记:PR #3 初版有两个入口("Step 1" open-loop runner + "Step 2" queued runner)。
+> open-loop runner 在完成 parity 锚定后按第一性原理删除,baseline 对照回归 Jialu 的
+> `vllm/run.py`;剩余共享构件沉淀为 `common.py`,queued runner 更名为 `run.py`。
 
 依赖:标准库 + aiohttp(仅真实发请求时;`--cloud null` 的纯云路径连 aiohttp 都不需要)。
 **不 import `nimbus/`、`experiments/` 的任何东西**——和旧 harness 零耦合。
 
-## 3. 两种运行架构
-
-### Step 1:open-loop(`run.py`)——和 Jialu 压测同构
+## 3. 运行架构
 
 ```
-到达时刻一到 ──Policy──┬─local──> vLLM(排队发生在引擎内部)
-                       └─cloud──> cloud sink
-```
-
-无队列、无闸门,请求到达即派发。存在的意义:**基准参照物**。它的 all_local 路径和
-`vllm/run.py` 行为等价(同 open-loop、同 payload、同 TTFT 口径),所以它的数字可以直接
-和 Jialu 的历史结果/复跑结果对齐——这是整个信任链的锚点。
-
-### Step 2:queued(`run_queued.py`)——为可拓展性而生
-
-```
-到达 ──Policy(到达时决策)──cloud──> cloud sink
+到达 ──Policy(到达时决策)──cloud──> cloud sink(默认 fake / 可选真实)
         │local
         v
    [外部 FIFO] ──dispatcher: inflight < max_inflight ──> vLLM(内部队列≈空)
@@ -58,7 +49,8 @@ router/
 dispatcher 是 **work-conserving** 的:有空位立刻放行,绝不无谓扣请求。
 `--max-inflight` 对齐 server 的 `--max-num-seqs`,于是:
 
-- 无压力 ⇒ 外部队列恒空 ⇒ 行为**退化为 open-loop**(可验收:queue 中立性)
+- 无压力 ⇒ 外部队列恒空 ⇒ 行为**退化为 open-loop**,与 baseline(Jialu 的
+  `vllm/run.py`)同构——这就是 queue 中立性验收(gpu1 实测 110 vs 111ms)
 - 有压力 ⇒ 溢出堆在**我们的**队列里(带完整身份),vLLM 内部几乎不排队
 
 为什么必须自己维护队列:引擎只暴露排队**计数**(vLLM `/metrics` 的
@@ -66,7 +58,7 @@ dispatcher 是 **work-conserving** 的:有空位立刻放行,绝不无谓扣请�
 (真正的队列是 `scheduler.py` 里的 `self.waiting`,无任何 HTTP 端点)。将来的
 shedding policy 要"挑着踢",挑人得有名单——名单只能在自己手里。
 
-## 4. 请求的一生(queued 版)
+## 4. 请求的一生
 
 1. **加载**:`load_trace` 按 `--scenario` 的 `arrived_at` 窗口切 BurstGPT JSONL,
    得到 `{request_id, relative_arrival_s, prompt, max_tokens, prompt_tokens, session_id}`
@@ -84,17 +76,17 @@ shedding policy 要"挑着踢",挑人得有名单——名单只能在自己手�
 
 | 抽象 | 位置 | 一句话 | 关键接口 |
 |---|---|---|---|
-| `Endpoint` | run.py | 一个 OpenAI 兼容端点(url/model/key/单价) | frozen dataclass |
-| `Policy` | run.py | 到达时路由决策;三个 policy = 同一规则的 p=0/1/f | `outsource(req) -> bool` |
-| `one_request` | run.py | 发一条流式请求并测 TTFT/TPOT/错误(**逐行取自 vllm/run.py**) | `await one_request(session, endpoint, req, due)` |
-| `NullCloud` | run.py | fake 云 sink:只记 routed + token 计数,不建模延迟 | `serve(req, due) -> result dict` |
-| `LocalAdmission` | run_queued.py | 本地并发闸门 + 峰值遥测 | `fits / reserve / release` |
+| `Endpoint` | common.py | 一个 OpenAI 兼容端点(url/model/key/单价) | frozen dataclass |
+| `Policy` | common.py | 到达时路由决策;三个 policy = 同一规则的 p=0/1/f | `outsource(req) -> bool` |
+| `one_request` | common.py | 发一条流式请求并测 TTFT/TPOT/错误(**逐行取自 vllm/run.py**) | `await one_request(session, endpoint, req, due)` |
+| `NullCloud` | common.py | fake 云 sink:只记 routed + token 计数,不建模延迟 | `serve(req, due) -> result dict` |
+| `LocalAdmission` | run.py | 本地并发闸门 + 峰值遥测 | `fits / reserve / release` |
 
 ## 6. 数据口径(读结果前必看)
 
 - **结果行**(JSONL,每请求一条):`endpoint`(local/cloud)、`success`、`ttft_ms`、
   `tpot_ms`、`e2e_ms`、`prompt_tokens`/`completion_tokens`(来自 usage 或 trace)、
-  `cost_usd`、错误三元组;queued 版另有 `queue_delay_ms`/`service_ttft_ms`
+  `cost_usd`、错误三元组;另有 `queue_delay_ms`/`service_ttft_ms`
 - **`routed_only=true`**(null sink 产物):此行**无延迟主张**,summary 自动把它排除在
   SLO 统计外,只计入数量与成本——避免"云侧 100% 违约"这种假数字
 - **计费**:`cost = prompt×in_price + completion×out_price`(per Mtok);**失败请求 $0**;
@@ -128,10 +120,10 @@ budget 单位(tokens vs token·s)、触发信号、KV 信号来源(客户端账�
 每层的验收都是**和已验证参照物的可复跑对比**,不是一次性演示:
 
 ```
-Jialu vllm/run.py(团队已验证)
-   └── Step 1 all_local 背靠背:paired TTFT p50 ratio = 1.003     ← 锚点
-         └── Step 2 queued all_local:110 vs 111ms(queue 零开销)  ← queue 中立性
-               └── Step 3 nimbus vs random/all_local/all_cloud     ← 未来:算法收益
+Jialu vllm/run.py(团队已验证,= baseline)
+   └── open-loop all_local 背靠背:paired TTFT p50 ratio = 1.003   ← 锚点(锚定后该 runner 已删)
+         └── 本框架 all_local:110 vs 111ms(queue 零开销)          ← queue 中立性
+               └── nimbus vs random/all_local/all_cloud             ← 未来:算法收益
 ```
 
 外加 29 个单元测试锁行为规约(分流确定性、失败不计费、名额不泄漏、FIFO、

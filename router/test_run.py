@@ -1,4 +1,4 @@
-"""Unit tests for router/run.py. No network, no aiohttp: the HTTP session is stubbed.
+"""Unit tests for router/run.py (the router entry point). No network: sender injected.
 
 Run from the repo root:  python3 -m unittest router.test_run -v
 """
@@ -7,306 +7,212 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
-import time
 import unittest
 from pathlib import Path
 
+from router.common import Endpoint, Policy
 from router.run import (
-    SCENARIOS,
-    Endpoint,
-    Policy,
-    compute_cost_usd,
-    load_trace,
-    make_payload,
-    one_request,
+    LocalAdmission,
     parse_args,
-    summarize,
+    queue_stats,
+    replay_queued,
 )
 
-LOCAL = Endpoint(name="local", url="http://x/v1/chat/completions", model="m")
-CLOUD = Endpoint(name="cloud", url="http://c/v1/chat/completions", model="m",
+LOCAL = Endpoint(name="local", url="http://x", model="m")
+CLOUD = Endpoint(name="cloud", url="fake://", model="m",
                  input_price_per_mtok=0.15, output_price_per_mtok=1.20)
 
-REQ = {"request_id": 0, "arrived_at": 123, "relative_arrival_s": 0.0,
-       "prompt": "hi", "max_tokens": 64}
+def mk_trace(n: int, prompt_tokens: int = 100, max_tokens: int = 50,
+             gap_s: float = 0.0) -> list[dict]:
+    return [{
+        "request_id": i,
+        "arrived_at": 1477007 + i,
+        "relative_arrival_s": i * gap_s,
+        "prompt": f"req {i}",
+        "max_tokens": max_tokens,
+        "prompt_tokens": prompt_tokens,
+        "session_id": 0,
+    } for i in range(n)]
 
 
-class FakeResp:
-    def __init__(self, status: int, sse_lines: list[str], text: str = ""):
-        self.status = status
-        self._chunks = [line.encode() for line in sse_lines]
-        self._text = text
-
-    async def text(self) -> str:
-        return self._text
-
-    @property
-    def content(self):
-        return self
-
-    async def iter_chunked(self, _n: int):
-        for c in self._chunks:
-            yield c
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
+def mk_args(policy: str = "all_local", max_inflight: int = 128,
+            fraction: float = 0.5) -> object:
+    out_dir = Path(tempfile.mkdtemp())
+    argv = ["--data", "t.jsonl", "--scenario", "normal", "--policy", policy,
+            "--fraction", str(fraction),
+            "--local-url", "http://x", "--local-model", "m",
+            "--max-inflight", str(max_inflight),
+            "--out-dir", str(out_dir)]
+    return parse_args(argv)
 
 
-class FakeSession:
-    def __init__(self, resp: FakeResp):
-        self._resp = resp
-        self.calls: list[dict] = []
+class RecordingSender:
+    """Injectable local sender: records dispatch times/concurrency, sleeps a bit."""
 
-    def post(self, url, headers=None, json=None, timeout=None):
-        self.calls.append({"url": url, "headers": headers, "json": json})
-        return self._resp
+    def __init__(self, service_s: float = 0.02):
+        self.service_s = service_s
+        self.dispatch_order: list[int] = []
+        self.active = 0
+        self.peak_active = 0
 
-
-def sse_ok() -> list[str]:
-    return [
-        'data: {"choices":[{"delta":{"content":"Hello"}}]}\n',
-        'data: {"choices":[{"delta":{"content":" world"}}]}\n',
-        'data: {"usage":{"prompt_tokens":10,"completion_tokens":2},"choices":[]}\n',
-        "data: [DONE]\n",
-    ]
-
-
-class TestPolicy(unittest.TestCase):
-    def test_all_local_never_outsources(self):
-        p = Policy("all_local", 0.5, seed=1)
-        self.assertFalse(any(p.outsource(REQ) for _ in range(200)))
-        self.assertEqual(p.actual_fraction, 0.0)
-
-    def test_all_cloud_always_outsources(self):
-        p = Policy("all_cloud", 0.5, seed=1)
-        self.assertTrue(all(p.outsource(REQ) for _ in range(200)))
-        self.assertEqual(p.actual_fraction, 1.0)
-
-    def test_random_fraction_and_determinism(self):
-        a = Policy("random", 0.3, seed=42)
-        b = Policy("random", 0.3, seed=42)
-        da = [a.outsource(REQ) for _ in range(2000)]
-        db = [b.outsource(REQ) for _ in range(2000)]
-        self.assertEqual(da, db)                      # same seed -> same decisions
-        self.assertAlmostEqual(a.actual_fraction, 0.3, delta=0.05)
-
-    def test_bad_inputs(self):
-        with self.assertRaises(ValueError):
-            Policy("random", 1.5, seed=0)
-        with self.assertRaises(ValueError):
-            Policy("nimbus", 0.5, seed=0)
+    async def __call__(self, endpoint, req, due):
+        self.dispatch_order.append(req["request_id"])
+        self.active += 1
+        self.peak_active = max(self.peak_active, self.active)
+        await asyncio.sleep(self.service_s)
+        self.active -= 1
+        return {
+            "request_id": req["request_id"], "arrived_at": req["arrived_at"],
+            "relative_arrival_s": req["relative_arrival_s"], "scheduled_lag_ms": 0.0,
+            "endpoint": "local", "model": "m", "success": True, "error": None,
+            "error_type": None, "http_status": 200, "ttft_ms": 10.0,
+            "e2e_ms": self.service_s * 1000, "tpot_ms": 5.0, "chunks": 3,
+            "prompt_tokens": req.get("prompt_tokens"), "completion_tokens": req["max_tokens"],
+            "output_chars": 12, "cost_usd": 0.0,
+        }
 
 
-class TestLoadTrace(unittest.TestCase):
-    def test_window_filter_sort_reindex(self):
-        start, end = SCENARIOS["normal"]
-        rows = [
-            {"arrived_at": start + 5, "prompt_text": "b", "num_decode_tokens": 7},
-            {"arrived_at": start - 1, "prompt_text": "out-of-window", "num_decode_tokens": 1},
-            {"arrived_at": start + 1, "prompt_text": "a", "num_decode_tokens": 3},
-            {"arrived_at": start + 2, "prompt_text": "", "num_decode_tokens": 9},  # empty prompt dropped
-            {"arrived_at": end + 1, "prompt_text": "late", "num_decode_tokens": 1},
-        ]
-        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
-            for r in rows:
-                f.write(json.dumps(r) + "\n")
-        trace = load_trace(Path(f.name), "normal")
-        self.assertEqual([r["prompt"] for r in trace], ["a", "b"])       # sorted by arrival
-        self.assertEqual([r["request_id"] for r in trace], [0, 1])       # reindexed
-        self.assertEqual(trace[0]["relative_arrival_s"], 1)
-        self.assertEqual(trace[1]["max_tokens"], 7)
+def run(args, trace, policy, sink=None, sender=None):
+    sender = sender or RecordingSender()
+    results, admission = asyncio.run(replay_queued(
+        args, trace, policy, LOCAL, CLOUD if sink is not None else None,
+        sink=sink, send_local=sender))
+    return results, admission, sender
 
 
-class TestOneRequest(unittest.TestCase):
-    def run_req(self, endpoint: Endpoint, resp: FakeResp) -> tuple[dict, FakeSession]:
-        session = FakeSession(resp)
-        res = asyncio.run(one_request(session, endpoint, REQ, time.perf_counter()))
-        return res, session
-
-    def test_success_parses_stream_and_usage(self):
-        res, session = self.run_req(LOCAL, FakeResp(200, sse_ok()))
-        self.assertTrue(res["success"])
-        self.assertEqual(res["chunks"], 2)
-        self.assertEqual(res["prompt_tokens"], 10)
-        self.assertEqual(res["completion_tokens"], 2)
-        self.assertIsNotNone(res["ttft_ms"])
-        self.assertIsNotNone(res["tpot_ms"])          # gen_count=2 > 1
-        self.assertEqual(res["endpoint"], "local")
-        self.assertEqual(res["cost_usd"], 0.0)        # local is not billed
-        self.assertEqual(session.calls[0]["json"]["max_tokens"], 64)
-
-    def test_cloud_success_is_billed_from_usage(self):
-        res, _ = self.run_req(CLOUD, FakeResp(200, sse_ok()))
-        self.assertTrue(res["success"])
-        expected = (10 * 0.15 + 2 * 1.20) / 1e6
-        self.assertAlmostEqual(res["cost_usd"], expected)
-
-    def test_http_error_records_and_bills_zero(self):
-        res, _ = self.run_req(CLOUD, FakeResp(429, [], text="rate limited"))
-        self.assertFalse(res["success"])
-        self.assertEqual(res["http_status"], 429)
-        self.assertEqual(res["error_type"], "HTTP 429")
-        self.assertEqual(res["cost_usd"], 0.0)        # failed request: never bill
-
-    def test_stream_error_records(self):
-        lines = ['data: {"error":{"message":"boom"}}\n']
-        res, _ = self.run_req(LOCAL, FakeResp(200, lines))
-        self.assertFalse(res["success"])
-        self.assertEqual(res["error_type"], "StreamError")
-        self.assertEqual(res["error"], "boom")
-
-    def test_max_tokens_override(self):
-        session = FakeSession(FakeResp(200, sse_ok()))
-        asyncio.run(one_request(session, LOCAL, REQ, time.perf_counter(),
-                                max_tokens_override=512))
-        self.assertEqual(session.calls[0]["json"]["max_tokens"], 512)
-
-    def test_payload_shape_matches_baseline(self):
-        payload = make_payload(LOCAL, REQ, None)
-        self.assertEqual(payload, {
-            "model": "m", "stream": True, "max_tokens": 64,
-            "messages": [{"role": "user", "content": "hi"}],
-            "stream_options": {"include_usage": True},
-        })
+class TestAdmissionGate(unittest.TestCase):
+    def test_concurrency_gate(self):
+        adm = LocalAdmission(max_inflight=2)
+        req = {"prompt_tokens": 100, "max_tokens": 50}
+        self.assertTrue(adm.fits(req))
+        adm.reserve(req)
+        adm.reserve(req)
+        self.assertFalse(adm.fits(req))          # slots full
+        adm.release(req)
+        self.assertTrue(adm.fits(req))
+        adm.release(req)
+        self.assertEqual(adm.inflight, 0)
+        self.assertEqual(adm.peak_inflight, 2)
 
 
-class TestCost(unittest.TestCase):
-    def test_missing_usage_bills_zero(self):
-        res = {"success": True, "prompt_tokens": None, "completion_tokens": None}
-        self.assertEqual(compute_cost_usd(CLOUD, res), 0.0)
+class TestWorkConserving(unittest.TestCase):
+    def test_no_pressure_dispatches_immediately_fifo(self):
+        """Queue neutrality at the unit level: with free slots every request
+        dispatches the moment it arrives — no added queue delay."""
+        args = mk_args(max_inflight=128)
+        trace = mk_trace(20)
+        results, admission, sender = run(args, trace, Policy("all_local", 0, 0))
+        self.assertEqual(len(results), 20)
+        self.assertEqual(sender.dispatch_order, list(range(20)))     # FIFO
+        for r in results:
+            self.assertLess(r["queue_delay_ms"], 20.0)               # ~0
+            self.assertEqual(r["ttft_ms"], r["queue_delay_ms"] + r["service_ttft_ms"])
+
+    def test_pressure_paces_and_accounts_queue_delay(self):
+        """A single slot: dispatch serializes, later requests accrue queue
+        delay, and ttft = queue_delay + service."""
+        args = mk_args(max_inflight=1)
+        trace = mk_trace(5)                               # all arrive at t=0
+        results, admission, sender = run(args, trace, Policy("all_local", 0, 0),
+                                         sender=RecordingSender(service_s=0.03))
+        self.assertEqual(sender.peak_active, 1)                        # serialized
+        self.assertEqual(sender.dispatch_order, list(range(5)))        # FIFO preserved
+        by_id = {r["request_id"]: r for r in results}
+        self.assertLess(by_id[0]["queue_delay_ms"], 15.0)
+        self.assertGreater(by_id[4]["queue_delay_ms"], 100.0)          # waited ~4x30ms
+        self.assertAlmostEqual(
+            by_id[4]["ttft_ms"], by_id[4]["queue_delay_ms"] + 10.0, places=5)
+
+    def test_slot_released_on_sender_exception(self):
+        class Boom(RecordingSender):
+            async def __call__(self, endpoint, req, due):
+                raise RuntimeError("kaboom")
+        args = mk_args()
+        results, admission, _ = run(args, mk_trace(4), Policy("all_local", 0, 0),
+                                    sender=Boom())
+        self.assertEqual(len(results), 4)
+        self.assertTrue(all(not r["success"] for r in results))
+        self.assertEqual(admission.inflight, 0)           # nothing leaked
 
 
-class TestSummarize(unittest.TestCase):
-    def mk(self, endpoint: str, ttft: float | None, success: bool = True,
-           cost: float = 0.0, error_type: str | None = None) -> dict:
-        return {"endpoint": endpoint, "success": success, "ttft_ms": ttft,
-                "tpot_ms": 20.0 if success else None, "cost_usd": cost,
-                "error_type": error_type}
+class TestCloudPath(unittest.TestCase):
+    def test_random_split_with_null_cloud(self):
+        from router.common import NullCloud
+        args = mk_args(policy="random", fraction=0.4)
+        sink = NullCloud(CLOUD)
+        trace = mk_trace(200)
+        results, _, sender = run(args, trace, Policy("random", 0.4, seed=1), sink=sink)
+        cloud = [r for r in results if r["endpoint"] == "cloud"]
+        local = [r for r in results if r["endpoint"] == "local"]
+        self.assertEqual(len(cloud) + len(local), 200)
+        self.assertAlmostEqual(len(cloud) / 200, 0.4, delta=0.12)
+        self.assertEqual(len(sender.dispatch_order), len(local))  # cloud never local
+        for r in cloud:
+            self.assertEqual(r["queue_delay_ms"], 0.0)            # cloud skips queue
+            self.assertTrue(r["routed_only"])                     # fake sink: routed & counted
+            self.assertIsNone(r["ttft_ms"])                       # no latency claim
+            self.assertGreater(r["cost_usd"], 0.0)
+        for r in local:
+            self.assertEqual(r["cost_usd"], 0.0)
 
-    def test_split_violations_cost(self):
-        results = [
-            self.mk("local", 100.0),
-            self.mk("local", 9000.0),                                   # SLO violation
-            self.mk("local", None, success=False, error_type="TimeoutError"),
-            self.mk("cloud", 800.0, cost=0.001),
-            self.mk("cloud", 900.0, cost=0.002),
-        ]
-        p = Policy("random", 0.4, seed=0)
-        p.n_total, p.n_outsourced = 5, 2
-        s = summarize(results, p, slo_s=5.0)
-        self.assertEqual(s["overall"]["n"], 5)
-        self.assertEqual(s["local"]["n"], 3)
-        self.assertEqual(s["cloud"]["n"], 2)
-        self.assertEqual(s["local"]["slo_violations"], 2)               # 9s + failure
-        self.assertEqual(s["cloud"]["slo_violations"], 0)
-        self.assertAlmostEqual(s["overall"]["cost_usd"], 0.003)
-        self.assertEqual(s["actual_fraction"], 0.4)
-        self.assertEqual(s["local"]["errors"], {"TimeoutError": 1})
-        self.assertEqual(s["local"]["ttft_p50_ms"], 100.0)              # nearest-rank of [100, 9000]
-
-    def test_empty_side(self):
-        s = summarize([self.mk("local", 100.0)], Policy("all_local", 0, 0), 5.0)
-        self.assertEqual(s["cloud"]["n"], 0)
-        self.assertIsNone(s["cloud"]["ttft_p50_ms"])
-        self.assertEqual(s["cloud"]["slo_violation_pct"], 0.0)
+    def test_results_are_json_serializable_and_persisted(self):
+        args = mk_args()
+        results, admission, _ = run(args, mk_trace(3), Policy("all_local", 0, 0))
+        from router.common import resolve_output_path
+        out = resolve_output_path(args)
+        lines = [json.loads(l) for l in out.read_text().splitlines()]
+        self.assertEqual(len(lines), 3)
+        stats = queue_stats(results, admission)
+        self.assertIn("queue_delay_p50_ms", stats)
+        self.assertGreaterEqual(stats["peak_inflight"], 1)
 
 
-class TestOutputPaths(unittest.TestCase):
+class TestParseArgsQueued(unittest.TestCase):
+    def test_random_default_cloud_is_null_sink(self):
+        args = parse_args(["--data", "t", "--scenario", "normal", "--policy", "random",
+                           "--local-url", "http://l", "--local-model", "m"])
+        self.assertEqual(args.cloud, "null")  # default: fake sink, no url/key needed
+
+    def test_real_cloud_requires_url_and_model(self):
+        base = ["--data", "t", "--scenario", "normal", "--policy", "all_cloud",
+                "--cloud", "real"]
+        with self.assertRaises(SystemExit):
+            parse_args(base)                                   # no url
+        with self.assertRaises(SystemExit):
+            parse_args(base + ["--cloud-url", "http://c"])     # url but no model
+        args = parse_args(base + ["--cloud-url", "http://c",
+                                  "--cloud-model", "qwen3-32b"])
+        self.assertEqual(args.cloud_model, "qwen3-32b")
+
+    def test_cloud_model_defaults_to_local_model(self):
+        from router.common import build_endpoints
+        args = parse_args(["--data", "t", "--scenario", "normal", "--policy", "random",
+                           "--local-url", "http://l", "--local-model", "m",
+                           "--cloud-url", "http://c"])
+        _, cloud = build_endpoints(args)
+        self.assertEqual(cloud.model, "m")
+
     def test_summary_lives_next_to_raw_output(self):
-        from router.run import resolve_output_path
-        args = parse_args(["--data", "t.jsonl", "--scenario", "normal",
-                           "--policy", "all_local",
+        from router.common import resolve_output_path
+        args = parse_args(["--data", "t", "--scenario", "normal", "--policy", "all_local",
                            "--local-url", "http://l", "--local-model", "m",
                            "--output", "day1/run.jsonl"])
         out = resolve_output_path(args)
         self.assertEqual(out, Path("results/day1/run.jsonl"))
-        summary = out.with_name(out.stem + ".summary.json")
-        self.assertEqual(summary, Path("results/day1/run.summary.json"))
+        self.assertEqual(out.with_name(out.stem + ".summary.json"),
+                         Path("results/day1/run.summary.json"))
 
-
-class TestParseArgs(unittest.TestCase):
-    BASE = ["--data", "t.jsonl", "--scenario", "normal"]
-
-    def test_random_real_cloud_requires_url(self):
+    def test_zero_max_inflight_rejected(self):
+        """Regression (PR #3 review): max_inflight=0 would tight-loop the drain."""
         with self.assertRaises(SystemExit):
-            parse_args(self.BASE + ["--policy", "random", "--cloud", "real",
-                                    "--local-url", "http://l", "--local-model", "m"])
+            parse_args(["--data", "t", "--scenario", "normal", "--policy", "all_local",
+                        "--local-url", "http://x", "--local-model", "m",
+                        "--max-inflight", "0"])
 
-    def test_random_default_cloud_is_null_sink(self):
-        args = parse_args(self.BASE + ["--policy", "random",
-                                       "--local-url", "http://l", "--local-model", "m"])
-        self.assertEqual(args.cloud, "null")  # default: fake sink, no url/key/profile needed
-
-    def test_all_local_needs_no_cloud(self):
-        args = parse_args(self.BASE + ["--policy", "all_local",
-                                       "--local-url", "http://l", "--local-model", "m"])
-        self.assertEqual(args.policy, "all_local")
-
-    def test_real_cloud_requires_a_real_model_name(self):
-        """Regression (PR #3 review): never send the placeholder model to a
-        real endpoint — all_cloud --cloud real without any model must error."""
-        with self.assertRaises(SystemExit):
-            parse_args(self.BASE + ["--policy", "all_cloud", "--cloud", "real",
-                                    "--cloud-url", "http://c"])
-        args = parse_args(self.BASE + ["--policy", "all_cloud", "--cloud", "real",
-                                       "--cloud-url", "http://c",
-                                       "--cloud-model", "qwen3-32b"])
-        self.assertEqual(args.cloud_model, "qwen3-32b")
-
-    def test_cloud_model_defaults_to_local_model(self):
-        from router.run import build_endpoints
-        args = parse_args(self.BASE + ["--policy", "random",
-                                       "--local-url", "http://l", "--local-model", "m",
-                                       "--cloud-url", "http://c"])
-        _, cloud = build_endpoints(args)
-        self.assertEqual(cloud.model, "m")
-
-
-class TestNullCloud(unittest.TestCase):
-    """The default architecture-proof sink: route & count, no latency claims."""
-
-    def test_routes_counts_and_makes_no_latency_claim(self):
-        from router.run import NullCloud
-        req = dict(REQ, prompt_tokens=1000, max_tokens=200)
-        r = NullCloud(CLOUD).serve(req, 0.0)
-        self.assertTrue(r["success"])
-        self.assertTrue(r["routed_only"])
-        self.assertEqual(r["endpoint"], "cloud")
-        self.assertIsNone(r["ttft_ms"])                    # nothing modeled
-        self.assertEqual(r["prompt_tokens"], 1000)
-        self.assertEqual(r["completion_tokens"], 200)
-        self.assertAlmostEqual(r["cost_usd"], (1000 * 0.15 + 200 * 1.20) / 1e6)
-
-    def test_max_tokens_override_replaces_like_payload(self):
-        """Regression (PR #3 review): NullCloud must mirror make_payload —
-        --max-tokens REPLACES the trace value in both directions."""
-        from router.run import NullCloud
-        req = dict(REQ, prompt_tokens=1000, max_tokens=200)
-        r = NullCloud(CLOUD).serve(req, 0.0, max_tokens_override=16)
-        self.assertEqual(r["completion_tokens"], 16)          # downward
-        r2 = NullCloud(CLOUD).serve(req, 0.0, max_tokens_override=512)
-        self.assertEqual(r2["completion_tokens"], 512)        # upward, = payload
-        self.assertEqual(r2["completion_tokens"],
-                         make_payload(CLOUD, req, 512)["max_tokens"])
-        r3 = NullCloud(CLOUD).serve(req, 0.0)
-        self.assertEqual(r3["completion_tokens"], 200)        # no override -> trace
-
-    def test_routed_only_excluded_from_slo_stats(self):
-        from router.run import NullCloud
-        req = dict(REQ, prompt_tokens=10, max_tokens=5)
-        cloud_rows = [NullCloud(CLOUD).serve(req, 0.0) for _ in range(3)]
-        local_row = {"endpoint": "local", "success": True, "ttft_ms": 100.0,
-                     "tpot_ms": 5.0, "cost_usd": 0.0, "error_type": None}
-        s = summarize(cloud_rows + [local_row], Policy("random", 0.5, 0), slo_s=5.0)
-        self.assertEqual(s["cloud"]["n"], 3)
-        self.assertEqual(s["cloud"]["routed_only"], 3)
-        self.assertEqual(s["cloud"]["slo_violations"], 0)      # no latency claim -> no viol
-        self.assertEqual(s["cloud"]["slo_violation_pct"], 0.0)
-        self.assertEqual(s["overall"]["slo_violations"], 0)
-        self.assertGreater(s["cloud"]["cost_usd"], 0.0)        # but still counted & billed
+    def test_minimal_args_suffice(self):
+        args = parse_args(["--data", "t", "--scenario", "normal", "--policy", "all_local",
+                           "--local-url", "http://x", "--local-model", "m"])
+        self.assertEqual(args.max_inflight, 128)
 
 
 if __name__ == "__main__":
