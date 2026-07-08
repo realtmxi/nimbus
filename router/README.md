@@ -7,18 +7,6 @@ policy, recording latency, cost, and the split. Single entry point:
 `python -m router.run`. The nimbus knapsack is not here yet — it will plug in
 as a queue-level policy.
 
-Built from scratch to be verified line by line, on three principles:
-
-1. **Trusted source first** — anything that could be copied from the verified
-   baseline (`vllm/run.py` @ `dff1a81`, the mtp revision Jialu actually runs)
-   was copied line-for-line, not reinvented. (Note: main's older copy of
-   `vllm/run.py` differs — it has `temperature`/`top_p` and no
-   `stream_options`; comparisons must use the `dff1a81` revision.)
-2. **First principles** — no pre-built layers. KV awareness, cloud-latency
-   modeling, and the nimbus algorithm are deliberately absent (see Non-goals).
-3. **Every layer acceptance-tested** — each addition is compared against the
-   previous layer to show it introduces no behavioral difference.
-
 ## Files
 
 | File | Role |
