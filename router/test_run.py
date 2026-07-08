@@ -245,6 +245,17 @@ class TestParseArgs(unittest.TestCase):
                                        "--local-url", "http://l", "--local-model", "m"])
         self.assertEqual(args.policy, "all_local")
 
+    def test_real_cloud_requires_a_real_model_name(self):
+        """Regression (PR #3 review): never send the placeholder model to a
+        real endpoint — all_cloud --cloud real without any model must error."""
+        with self.assertRaises(SystemExit):
+            parse_args(self.BASE + ["--policy", "all_cloud", "--cloud", "real",
+                                    "--cloud-url", "http://c"])
+        args = parse_args(self.BASE + ["--policy", "all_cloud", "--cloud", "real",
+                                       "--cloud-url", "http://c",
+                                       "--cloud-model", "qwen3-32b"])
+        self.assertEqual(args.cloud_model, "qwen3-32b")
+
     def test_cloud_model_defaults_to_local_model(self):
         from router.run import build_endpoints
         args = parse_args(self.BASE + ["--policy", "random",
@@ -269,12 +280,19 @@ class TestNullCloud(unittest.TestCase):
         self.assertEqual(r["completion_tokens"], 200)
         self.assertAlmostEqual(r["cost_usd"], (1000 * 0.15 + 200 * 1.20) / 1e6)
 
-    def test_max_tokens_override_caps_completion(self):
+    def test_max_tokens_override_replaces_like_payload(self):
+        """Regression (PR #3 review): NullCloud must mirror make_payload —
+        --max-tokens REPLACES the trace value in both directions."""
         from router.run import NullCloud
         req = dict(REQ, prompt_tokens=1000, max_tokens=200)
         r = NullCloud(CLOUD).serve(req, 0.0, max_tokens_override=16)
-        self.assertEqual(r["completion_tokens"], 16)
-        self.assertAlmostEqual(r["cost_usd"], (1000 * 0.15 + 16 * 1.20) / 1e6)
+        self.assertEqual(r["completion_tokens"], 16)          # downward
+        r2 = NullCloud(CLOUD).serve(req, 0.0, max_tokens_override=512)
+        self.assertEqual(r2["completion_tokens"], 512)        # upward, = payload
+        self.assertEqual(r2["completion_tokens"],
+                         make_payload(CLOUD, req, 512)["max_tokens"])
+        r3 = NullCloud(CLOUD).serve(req, 0.0)
+        self.assertEqual(r3["completion_tokens"], 200)        # no override -> trace
 
     def test_routed_only_excluded_from_slo_stats(self):
         from router.run import NullCloud

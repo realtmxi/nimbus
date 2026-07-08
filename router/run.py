@@ -165,9 +165,11 @@ class NullCloud:
 
     def serve(self, req: dict[str, Any], due_time: float, *,
               max_tokens_override: int | None = None) -> dict[str, Any]:
-        effective = int(req["max_tokens"])
-        if max_tokens_override is not None:
-            effective = min(effective, int(max_tokens_override))
+        # same semantics as make_payload: --max-tokens REPLACES the trace value.
+        # completion_tokens therefore reflects the payload cap (an upper bound
+        # on what a real call would bill; the fake sink has no model to EOS early).
+        effective = (int(max_tokens_override) if max_tokens_override is not None
+                     else int(req["max_tokens"]))
         result = {
             "request_id": req["request_id"],
             "arrived_at": req["arrived_at"],
@@ -529,6 +531,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error(f"--policy {args.policy} requires --local-url and --local-model")
     if needs_cloud and args.cloud == "real" and not args.cloud_url:
         parser.error(f"--policy {args.policy} --cloud real requires --cloud-url")
+    if needs_cloud and args.cloud == "real" and not (args.cloud_model or args.local_model):
+        parser.error("--cloud real requires --cloud-model (or --local-model to inherit); "
+                     "refusing to send a placeholder model name to a real endpoint")
 
     return args
 

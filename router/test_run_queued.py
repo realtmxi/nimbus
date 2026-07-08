@@ -168,6 +168,13 @@ class TestCloudPath(unittest.TestCase):
 
 
 class TestParseArgsQueued(unittest.TestCase):
+    def test_zero_max_inflight_rejected(self):
+        """Regression (PR #3 review): max_inflight=0 would tight-loop the drain."""
+        with self.assertRaises(SystemExit):
+            parse_args(["--data", "t", "--scenario", "normal", "--policy", "all_local",
+                        "--local-url", "http://x", "--local-model", "m",
+                        "--max-inflight", "0"])
+
     def test_minimal_args_suffice(self):
         args = parse_args(["--data", "t", "--scenario", "normal", "--policy", "all_local",
                            "--local-url", "http://x", "--local-model", "m"])

@@ -227,12 +227,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     args = parser.parse_args(argv)
 
+    if args.max_inflight <= 0:
+        parser.error("--max-inflight must be >= 1 (0 would deadlock the dispatcher)")
     needs_local = args.policy in ("all_local", "random")
     needs_cloud = args.policy in ("all_cloud", "random")
     if needs_local and not (args.local_url and args.local_model):
         parser.error(f"--policy {args.policy} requires --local-url and --local-model")
     if needs_cloud and args.cloud == "real" and not args.cloud_url:
         parser.error(f"--policy {args.policy} --cloud real requires --cloud-url")
+    if needs_cloud and args.cloud == "real" and not (args.cloud_model or args.local_model):
+        parser.error("--cloud real requires --cloud-model (or --local-model to inherit); "
+                     "refusing to send a placeholder model name to a real endpoint")
 
     return args
 
