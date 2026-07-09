@@ -3,8 +3,8 @@
 # router/ — hybrid routing 框架
 
 把 trace 里的请求按 policy 分发给本地 vLLM 和云 sink,记录延迟、成本和分流比例。
-**单一入口**:`python -m router.run`。nimbus knapsack 尚未接入——将来作为队列上的
-policy 插件进来。
+**单一入口**:`python -m router.run`。policy:三个 baseline(`all_local`/`all_cloud`/
+`random`)+ **nimbus** 甩负载 policy(队列级背包,见下)。
 
 
 ## 文件
@@ -60,7 +60,7 @@ python -m router.run --data <trace.jsonl> --scenario burst_300 \
 每段都带 `slo_measured_n`——排除 `routed_only` 后的 SLO 显式分母。
 计费:失败请求 $0;local 侧恒 $0。
 
-本地测试(无需网络/GPU):`python3 -m unittest router.test_common router.test_run`
+本地测试(无需网络/GPU):`python3 -m unittest router.test_common router.test_run router.test_nimbus`
 
 ## Baseline 与验证记录
 
@@ -83,20 +83,20 @@ baseline = **Jialu 的 `vllm/run.py`**(团队已验证的 open-loop 压测)。�
 
 | 不做 | 为什么 | 何时回来 |
 |---|---|---|
-| nimbus knapsack | 当前目标只是打通分发框架 | 下一步,作为队列上的 policy |
-| KV 感知 admission | KV 属于 nimbus 算法(budget=KV) | 随 nimbus |
 | 云延迟建模 | 路由决策不读任何云侧指标,fake sink 足以证明架构 | 画 cost-vs-SLO 图时 |
-| sweep/画图驱动 | 还没有要扫的实验 | 随 nimbus |
+| sweep/画图驱动 | 第一个目标格子刚测出来 | 随 frontier 实验 |
 
-## 扩展点:nimbus 怎么插
+(nimbus 和 KV 感知 admission 到 2026-07-09 为止都在这个表里——现已实现:
+nimbus 的 kick 检查在 dispatch **之前**跑,`--policy nimbus` 下引擎饱和时
+即使 slots 空闲,新到达也会被甩。)
 
-在到达时钩子(现有 `Policy.outsource`)之外,加一个**队列级钩子**:
+## nimbus policy(`--policy nimbus --kv-capacity-tokens N`)
 
-```
-policy.on_tick(queue, admission) -> [要踢去云的请求]     # 每次到达/完成时调用
-```
-
-knapsack 的 item 就是队列元素(身份、token 数、已等待时长齐全);被踢请求走现有
-cloud sink,`queue_delay` 记到被踢时刻。开工前需定:budget 单位(tokens vs
-token·s)、触发信号、KV 信号来源(客户端账本 vs `/metrics`)——前两个是算法口径,
-open questions 记录在 Notion 算法文档里。
+队列级甩负载,每次到达/完成时在本地 dispatch **之前**裁决。语义(2026-07 拍板):
+**容量用 KV tokens、背包 value 用 API $、token·s displacement 做踢出优先级**——
+`while Σ footprint(waiting) > K_avail(/metrics): 解背包(weight=tokens, value=$)
+→ 出局者按最差 $/displacement 先踢`。
+注意:这是"**KV token 预算下的成本最小化甩负载,displacement 为次级优先**",
+不是纯"踢最高 displacement"的 CacheDisp 规则;displacement 做背包 weight 的
+变体是计划中的消融。剩余开放旋钮:触发条件(装不下 vs 队头等待逼近 SLO,
+即决策 2)。

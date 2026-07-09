@@ -11,8 +11,9 @@ The dispatcher is WORK-CONSERVING: whenever the local engine has a free slot,
 the queue head is dispatched immediately; requests are never held back
 gratuitously. Headroom = concurrency slots: inflight < --max-inflight (align it
 with the server's --max-num-seqs so vLLM's internal queue stays ~empty).
-KV-aware admission is deliberately NOT here — it returns with the nimbus
-policy in Step 3, where KV is actually part of the algorithm.
+The dispatcher itself stays KV-blind; KV awareness lives in the nimbus policy,
+whose kick check runs BEFORE dispatch on every arrival/completion — so with a
+real KV signal, admission is effectively KV-aware under --policy nimbus.
 Consequences:
   - no pressure  -> queue is always empty -> behavior degrades to open-loop,
     i.e. equivalent to the verified baseline load generator vllm/run.py
@@ -23,9 +24,9 @@ Consequences:
 TTFT accounting: ttft_ms = queue_delay_ms + service_ttft_ms, i.e. measured from
 the request's trace arrival time, comparable with an open-loop run (vllm/run.py).
 
-Policies here are the same arrival-time baselines (all_local / all_cloud /
-random). The queue only paces local dispatch for them; a queue-level shedding
-policy (knapsack) plugs into this file later as an on-tick hook.
+Policies: the arrival-time baselines (all_local / all_cloud / random, for whom
+the queue only paces local dispatch) and the queue-level nimbus shedding policy
+(router/nimbus.py), hooked in via on_tick.
 """
 from __future__ import annotations
 
@@ -209,8 +210,8 @@ async def replay_queued(
             if res.get("e2e_ms") is not None:
                 res["e2e_ms"] = queue_delay_ms + res["e2e_ms"]
             record(res)
-            maybe_dispatch()
             await maybe_kick()
+            maybe_dispatch()
 
         def spawn_local(req: dict[str, Any], arrival_due: float) -> None:
             admission.reserve(req)
@@ -243,11 +244,24 @@ async def replay_queued(
                 record(res)
             else:
                 async def cloud_task():
-                    if cloud_gate is not None:
-                        async with cloud_gate:
+                    try:
+                        if cloud_gate is not None:
+                            async with cloud_gate:
+                                res = await send_cloud(req, due)
+                        else:
                             res = await send_cloud(req, due)
-                    else:
-                        res = await send_cloud(req, due)
+                    except Exception as exc:  # a sender bug must not lose the row
+                        res = {"request_id": req["request_id"],
+                               "arrived_at": req["arrived_at"],
+                               "relative_arrival_s": req["relative_arrival_s"],
+                               "endpoint": "cloud",
+                               "model": getattr(cloud, "model", None),
+                               "success": False, "error": str(exc),
+                               "error_type": type(exc).__name__, "http_status": None,
+                               "ttft_ms": None, "e2e_ms": None, "tpot_ms": None,
+                               "chunks": 0, "prompt_tokens": None,
+                               "completion_tokens": None, "output_chars": 0,
+                               "cost_usd": 0.0, "scheduled_lag_ms": 0.0}
                     _finalize_cloud(res, queue_delay_ms)
                     record(res)
                 task = asyncio.create_task(cloud_task())
@@ -296,8 +310,11 @@ async def replay_queued(
                     route_cloud(req, due)
                 else:
                     queue.append((req, due))
-                    maybe_dispatch()
+                    # policy adjudicates BEFORE local admission: with a real KV
+                    # signal this is KV-aware admission — a saturated engine
+                    # (avail ~ 0) sheds new arrivals even while slots are free
                     await maybe_kick()
+                    maybe_dispatch()
 
             # drain: everything left in queue/in flight completes through the
             # same dispatcher (completions re-trigger maybe_dispatch)
@@ -361,6 +378,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.max_tokens is not None and args.max_tokens <= 0:
         parser.error("--max-tokens must be >= 1 (it replaces the trace decode count "
                      "in the payload; 0 breaks fake/real parity)")
+    if args.prefill_tput <= 0:
+        parser.error("--prefill-tput must be > 0")
+    if args.tpot_ms < 0:
+        parser.error("--tpot-ms must be >= 0")
+    if args.in_price < 0 or args.out_price < 0:
+        parser.error("--in-price/--out-price must be >= 0")
+    if args.cloud_max_concurrency < 0:
+        parser.error("--cloud-max-concurrency must be >= 0 (0 = unlimited)")
+    if args.slo_s <= 0 or args.timeout_s <= 0:
+        parser.error("--slo-s and --timeout-s must be > 0")
     needs_local = args.policy in ("all_local", "random", "nimbus")
     needs_cloud = args.policy in ("all_cloud", "random", "nimbus")
     if args.policy == "nimbus" and (args.kv_capacity_tokens is None
@@ -412,7 +439,8 @@ async def main() -> None:
     if args.policy == "nimbus":
         from router.nimbus import NimbusPolicy
         policy = NimbusPolicy(args.in_price, args.out_price,
-                              args.prefill_tput, args.tpot_ms / 1000.0, seed=args.seed)
+                              args.prefill_tput, args.tpot_ms / 1000.0, seed=args.seed,
+                              max_tokens_override=args.max_tokens)
     else:
         policy = Policy(args.policy, args.fraction, args.seed)
     needs_cloud = args.policy in ("all_cloud", "random", "nimbus")

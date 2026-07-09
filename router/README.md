@@ -4,8 +4,8 @@
 
 Dispatches trace requests between a local vLLM and a cloud sink according to a
 policy, recording latency, cost, and the split. Single entry point:
-`python -m router.run`. The nimbus knapsack is not here yet — it will plug in
-as a queue-level policy.
+`python -m router.run`. Policies: three baselines (`all_local` / `all_cloud` /
+`random`) plus the **nimbus** shedding policy (queue-level knapsack, see below).
 
 ## Files
 
@@ -69,7 +69,7 @@ measured from the trace arrival time, comparable with open-loop) plus
 reports `slo_measured_n` — the explicit SLO denominator after `routed_only`
 rows are excluded. Billing: failed requests cost $0; the local side always $0.
 
-Local tests (no network/GPU): `python3 -m unittest router.test_common router.test_run`
+Local tests (no network/GPU): `python3 -m unittest router.test_common router.test_run router.test_nimbus`
 
 ## Baseline & validation record
 
@@ -93,22 +93,21 @@ All measured on the GPU host, Qwen3.6-35B-A3B, `burst_300`, n = 756:
 
 | Not here | Why | Returns when |
 |---|---|---|
-| nimbus knapsack | current goal is only the dispatch framework | next step, as a queue-level policy |
-| KV-aware admission | KV belongs to the nimbus algorithm (budget = KV) | with nimbus |
 | cloud latency modeling | routing reads no cloud-side metric; a fake sink proves the architecture | when plotting cost-vs-SLO frontiers |
-| sweep / plotting drivers | nothing to sweep yet | with nimbus |
+| sweep / plotting drivers | first target cell only just measured | with the frontier experiments |
 
-## Extension point: how nimbus plugs in
+(nimbus + KV-aware admission were in this table until 2026-07-09 — both now
+implemented: the nimbus kick check runs BEFORE dispatch, so under
+`--policy nimbus` a saturated engine sheds new arrivals even with free slots.)
 
-Besides the arrival-time hook (`Policy.outsource`), add one queue-level hook:
+## The nimbus policy (`--policy nimbus --kv-capacity-tokens N`)
 
-```
-policy.on_tick(queue, admission) -> [requests to kick to cloud]   # on arrival/completion
-```
-
-Knapsack items are the queue elements (identity, token counts, waiting time all
-present); kicked requests go through the existing cloud sink with `queue_delay`
-accounted up to the kick. Decisions gating the start: budget unit
-(tokens vs token·seconds), trigger signal, KV signal source (client-side ledger
-vs `/metrics`) — the first two are algorithm calls recorded as open questions
-in the Notion algorithm doc.
+Queue-level shedding, adjudicated BEFORE local dispatch on every
+arrival/completion. Semantics (decided 2026-07): **capacity in KV tokens,
+API-$ value in the knapsack, token·s displacement as kick priority** —
+`while Σ token_footprint(waiting) > K_avail(/metrics): solve knapsack
+(weight=tokens, value=$saved) → kick the out-set worst-$/displacement first`.
+So this is *cost-minimizing shedding under a KV-token budget with displacement
+as secondary priority* — NOT a pure pick-highest-displacement CacheDisp rule;
+a displacement-weighted knapsack variant is a planned ablation. Remaining open
+knob: the trigger (fits-in-KV vs SLO-bound head wait = Notion decision 2).

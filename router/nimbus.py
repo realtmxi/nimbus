@@ -30,12 +30,19 @@ import random
 from typing import Any
 
 
-def token_footprint(req: dict[str, Any]) -> int:
+def effective_decode(req: dict[str, Any], max_tokens_override: int | None = None) -> int:
+    """Decode length as the payload will actually request it: --max-tokens
+    REPLACES the trace value (same semantics as make_payload/NullCloud)."""
+    return int(max_tokens_override) if max_tokens_override is not None else int(req["max_tokens"])
+
+
+def token_footprint(req: dict[str, Any], max_tokens_override: int | None = None) -> int:
     """KV occupancy upper bound in tokens: full prompt + full decode."""
-    return int(req.get("prompt_tokens") or 0) + int(req["max_tokens"])
+    return int(req.get("prompt_tokens") or 0) + effective_decode(req, max_tokens_override)
 
 
-def displacement_token_s(req: dict[str, Any], prefill_tput: float, tpot_s: float) -> float:
+def displacement_token_s(req: dict[str, Any], prefill_tput: float, tpot_s: float,
+                         max_tokens_override: int | None = None) -> float:
     """Cache displacement: KV footprint (tokens) x residence time (s).
 
     Uses the prompt as the footprint (the decode tail grows gradually and is
@@ -43,14 +50,17 @@ def displacement_token_s(req: dict[str, Any], prefill_tput: float, tpot_s: float
     CLI-tunable; only the RELATIVE ordering matters for kick priority.
     """
     prompt = int(req.get("prompt_tokens") or 0)
-    residence_s = prompt / max(prefill_tput, 1e-9) + int(req["max_tokens"]) * tpot_s
+    residence_s = (prompt / max(prefill_tput, 1e-9)
+                   + effective_decode(req, max_tokens_override) * tpot_s)
     return max(prompt, 1) * residence_s
 
 
-def value_usd(req: dict[str, Any], in_price_mtok: float, out_price_mtok: float) -> float:
+def value_usd(req: dict[str, Any], in_price_mtok: float, out_price_mtok: float,
+              max_tokens_override: int | None = None) -> float:
     """API $ saved by serving this request locally (= cost if outsourced)."""
     prompt = int(req.get("prompt_tokens") or 0)
-    return (prompt * in_price_mtok + int(req["max_tokens"]) * out_price_mtok) / 1e6
+    return (prompt * in_price_mtok
+            + effective_decode(req, max_tokens_override) * out_price_mtok) / 1e6
 
 
 def solve_knapsack(
@@ -108,11 +118,13 @@ class NimbusPolicy:
     p = None   # no target fraction: the policy self-selects its split
 
     def __init__(self, in_price_mtok: float, out_price_mtok: float,
-                 prefill_tput: float, tpot_s: float, seed: int = 0):
+                 prefill_tput: float, tpot_s: float, seed: int = 0,
+                 max_tokens_override: int | None = None):
         self.in_price = in_price_mtok
         self.out_price = out_price_mtok
         self.prefill_tput = prefill_tput
         self.tpot_s = tpot_s
+        self.mto = max_tokens_override
         self.rng = random.Random(seed)   # unused; parity with Policy
         self.n_total = 0
         self.n_outsourced = 0
@@ -152,25 +164,30 @@ class NimbusPolicy:
         self.ticks += 1
         remaining = list(waiting)
         kicked: list[dict[str, Any]] = []
-
-        def fits() -> bool:
-            return sum(token_footprint(r) for r in remaining) <= kv_available_tokens
+        total = sum(token_footprint(r, self.mto) for r in remaining)   # incremental, O(n) once
 
         def density(r: dict[str, Any]) -> float:
-            return (value_usd(r, self.in_price, self.out_price)
-                    / max(displacement_token_s(r, self.prefill_tput, self.tpot_s), 1e-9))
+            return (value_usd(r, self.in_price, self.out_price, self.mto)
+                    / max(displacement_token_s(r, self.prefill_tput, self.tpot_s,
+                                               self.mto), 1e-9))
 
-        while remaining and not fits():
+        while remaining and total > kv_available_tokens:
             self.kick_rounds += 1
-            items = [(str(r["request_id"]), token_footprint(r),
-                      value_usd(r, self.in_price, self.out_price)) for r in remaining]
+            items = [(str(r["request_id"]), token_footprint(r, self.mto),
+                      value_usd(r, self.in_price, self.out_price, self.mto))
+                     for r in remaining]
             keep = solve_knapsack(items, int(kv_available_tokens))
-            out = [r for r in remaining if str(r["request_id"]) not in keep]
+            keep_set = keep
+            out = [r for r in remaining if str(r["request_id"]) not in keep_set]
             if not out:                 # degenerate (e.g. budget <= 0 kept nothing)
                 out = remaining
+            out_ids = {id(r) for r in out}
+            survivors = [r for r in remaining if id(r) not in out_ids]
             for victim in sorted(out, key=density):   # worst density first
-                if fits():
-                    break
-                remaining.remove(victim)
+                if total <= kv_available_tokens:
+                    survivors.append(victim)          # spared: fits again
+                    continue
+                total -= token_footprint(victim, self.mto)
                 kicked.append(victim)
+            remaining = survivors
         return kicked

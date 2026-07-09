@@ -198,6 +198,77 @@ class TestReviewRegressions(unittest.TestCase):
             self.assertGreater(r["queue_delay_ms"], 0.0)   # it actually waited
 
 
+class TestCodexRegressions(unittest.TestCase):
+    def test_kv_zero_kicks_even_with_free_slots(self):
+        """Regression (codex P1): the kick check must run BEFORE dispatch —
+        with 128 free slots but ZERO KV available, nothing may enter local."""
+        results, pol, sender = run_nimbus2(mk_trace(20), kv_avail=0, max_inflight=128)
+        cloud = [r for r in results if r["endpoint"] == "cloud"]
+        self.assertEqual(len(cloud), 20)                       # all shed
+        self.assertEqual(len(sender.dispatch_order), 0)        # engine untouched
+        self.assertGreater(pol.ticks, 0)
+
+    def test_max_tokens_override_changes_policy_arithmetic(self):
+        """Regression (codex P2): footprint/value/displacement must use the
+        effective decode (--max-tokens replaces trace), like payload & billing."""
+        from router.nimbus import token_footprint, value_usd, displacement_token_s
+        req = {"request_id": 1, "prompt_tokens": 100, "max_tokens": 1000}
+        self.assertEqual(token_footprint(req), 1100)
+        self.assertEqual(token_footprint(req, max_tokens_override=1), 101)
+        self.assertAlmostEqual(value_usd(req, 0.15, 1.20, max_tokens_override=1),
+                               (100 * 0.15 + 1 * 1.20) / 1e6)
+        self.assertLess(displacement_token_s(req, 20000, 0.0095, max_tokens_override=1),
+                        displacement_token_s(req, 20000, 0.0095))
+        # policy-level: with override=1 the 20-req queue fits into 3000 tokens
+        pol = mk_policy(max_tokens_override=1)                 # footprint 101 each
+        waiting = [dict(req, request_id=i) for i in range(20)]
+        self.assertEqual(pol.on_tick(waiting, kv_available_tokens=3000), [])
+        pol2 = mk_policy()                                     # footprint 1100 each
+        self.assertGreater(len(pol2.on_tick(waiting, kv_available_tokens=3000)), 0)
+
+    def test_kicked_real_cloud_sender_exception_records_failure(self):
+        """Regression (codex P2): a raising cloud sender must still produce a
+        failure row for every kicked request (no lost results)."""
+        import tempfile
+        from pathlib import Path
+        from router.run import parse_args, replay_queued
+        from router.test_run import RecordingSender
+
+        async def boom_cloud(req, due):
+            raise RuntimeError("cloud down")
+
+        out_dir = Path(tempfile.mkdtemp())
+        args = parse_args(["--data", "t", "--scenario", "normal", "--policy", "nimbus",
+                           "--local-url", "http://x", "--local-model", "m",
+                           "--cloud", "real", "--cloud-url", "http://c",
+                           "--cloud-model", "m",
+                           "--kv-capacity-tokens", "1000000", "--max-inflight", "2",
+                           "--out-dir", str(out_dir)])
+        results, _, _ = asyncio.run(replay_queued(
+            args, mk_trace(10), mk_policy(), LOCAL, CLOUD,
+            sink=None, send_local=RecordingSender(service_s=0.05),
+            send_cloud=boom_cloud, kv_monitor=FakeKV(200)))
+        self.assertEqual(len(results), 10)                     # nothing lost
+        cloud = [r for r in results if r["endpoint"] == "cloud"]
+        self.assertGreater(len(cloud), 0)
+        for r in cloud:
+            self.assertFalse(r["success"])
+            self.assertEqual(r["error_type"], "RuntimeError")
+            self.assertEqual(r["cost_usd"], 0.0)
+
+    def test_bad_nimbus_args_rejected(self):
+        """Regression (codex P3): reject nonsense constants at parse time."""
+        from router.run import parse_args
+        base = ["--data", "t", "--scenario", "normal", "--policy", "nimbus",
+                "--local-url", "http://x", "--local-model", "m",
+                "--kv-capacity-tokens", "1000"]
+        for bad in (["--prefill-tput", "0"], ["--tpot-ms", "-1"],
+                    ["--in-price", "-0.1"], ["--cloud-max-concurrency", "-1"],
+                    ["--slo-s", "0"]):
+            with self.assertRaises(SystemExit, msg=bad):
+                parse_args(base + bad)
+
+
 class FakeKV:
     """Injectable monitor: fixed available tokens."""
     def __init__(self, avail):
@@ -205,6 +276,24 @@ class FakeKV:
         self.read_failures = 0
     async def available_tokens(self):
         return self.avail
+
+
+def run_nimbus2(trace, kv_avail, max_inflight=2, sender=None):
+    from router.run import parse_args
+    import tempfile
+    from pathlib import Path
+    out_dir = Path(tempfile.mkdtemp())
+    args = parse_args(["--data", "t", "--scenario", "normal", "--policy", "nimbus",
+                       "--local-url", "http://x", "--local-model", "m",
+                       "--kv-capacity-tokens", "1000000",
+                       "--max-inflight", str(max_inflight),
+                       "--out-dir", str(out_dir)])
+    pol = mk_policy()
+    sender = sender or RecordingSender()
+    results, admission, _ = asyncio.run(replay_queued(
+        args, trace, pol, LOCAL, CLOUD, sink=NullCloud(CLOUD),
+        send_local=sender, kv_monitor=FakeKV(kv_avail)))
+    return results, pol, sender
 
 
 def run_nimbus(trace, kv_avail, sender=None):
