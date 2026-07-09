@@ -103,11 +103,18 @@ implemented: the nimbus kick check runs BEFORE dispatch, so under
 ## The nimbus policy (`--policy nimbus --kv-capacity-tokens N`)
 
 Queue-level shedding, adjudicated BEFORE local dispatch on every
-arrival/completion. Semantics (decided 2026-07): **capacity in KV tokens,
-API-$ value in the knapsack, token·s displacement as kick priority** —
-`while Σ token_footprint(waiting) > K_avail(/metrics): solve knapsack
-(weight=tokens, value=$saved) → kick the out-set worst-$/displacement first`.
-So this is *cost-minimizing shedding under a KV-token budget with displacement
-as secondary priority* — NOT a pure pick-highest-displacement CacheDisp rule;
-a displacement-weighted knapsack variant is a planned ablation. Remaining open
-knob: the trigger (fits-in-KV vs SLO-bound head wait = Notion decision 2).
+arrival/completion. Semantics — the CacheDisp core (reaffirmed 2026-07-09
+after review caught an implementation drift):
+
+```
+displacement(req) ≈ prompt_tokens × (prefill_time + decode_tokens × TPOT)   [token·s]
+while Σ token_footprint(waiting) > K_avail(/metrics):
+    kick the LARGEST displacer
+```
+
+Shed the requests that pin the most cache for the longest — API cost does not
+enter the shed rule (it belongs to the frontier comparison). Cost-aware
+knapsack variants (minimize cloud $ s.t. enough displacement released, or
+maximize released displacement s.t. a cloud budget) are planned ablations;
+`solve_knapsack`/`value_usd` are retained for them. Remaining open knob: the
+trigger (fits-in-KV vs SLO-bound head wait = Notion decision 2).

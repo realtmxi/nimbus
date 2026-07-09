@@ -78,8 +78,7 @@ class TestFormulas(unittest.TestCase):
 
 
 def mk_policy(**kw):
-    return NimbusPolicy(in_price_mtok=0.15, out_price_mtok=1.20,
-                        prefill_tput=20000, tpot_s=0.0095, **kw)
+    return NimbusPolicy(prefill_tput=20000, tpot_s=0.0095, **kw)
 
 
 class TestOnTick(unittest.TestCase):
@@ -100,23 +99,16 @@ class TestOnTick(unittest.TestCase):
         self.assertLessEqual(sum(token_footprint(r) for r in remaining), 5000)
         self.assertGreater(len(kicked), 0)
 
-    def test_knapsack_keeps_higher_value_within_token_budget(self):
-        """By design: the knapsack (token capacity) decides WHO stays, by $ value.
-        B is worth 4.6x A, so A is kicked even though B displaces more cache."""
+    def test_kicks_largest_displacement_first(self):
+        """The CacheDisp core (Murphy 2026-07-09): shed the request that pins
+        the most cache-time, regardless of its API price."""
         pol = mk_policy()
-        a = self.req("A", 2900, 100)    # $555e-6, short residence
-        b = self.req("B", 1000, 2000)   # $2550e-6, long decode
+        a = self.req("A", 2900, 100)    # displacement ~3,176 token·s
+        b = self.req("B", 1000, 2000)   # displacement ~19,050 token·s -> kicked
         kicked = pol.on_tick([a, b], kv_available_tokens=3000)   # only one fits
-        self.assertEqual([r["request_id"] for r in kicked], ["A"])
-
-    def test_displacement_orders_kicks_within_the_out_set(self):
-        """token·s enters as PRIORITY: when several requests are out, the worst
-        $/displacement density is kicked first."""
-        pol = mk_policy()
-        a = self.req("A", 2900, 100)    # density ~1.75e-7 $/token·s
-        b = self.req("B", 1000, 2000)   # density ~1.34e-7  (worse) -> first
-        kicked = pol.on_tick([a, b], kv_available_tokens=100)    # neither fits
-        self.assertEqual([r["request_id"] for r in kicked], ["B", "A"])
+        self.assertEqual([r["request_id"] for r in kicked], ["B"])
+        kicked2 = pol.on_tick([a, b], kv_available_tokens=100)   # neither fits
+        self.assertEqual([r["request_id"] for r in kicked2], ["B", "A"])
 
     def test_arrival_hook_never_outsources(self):
         pol = mk_policy()
@@ -134,27 +126,21 @@ class TestReviewRegressions(unittest.TestCase):
         keep = solve_knapsack([a, b], budget=4097)
         self.assertEqual(keep, {"A"})            # optimal: keep the big one
 
-    def test_single_solve_matches_iterative_semantics(self):
-        """The batched kick (one solve, density-ordered out-set) must shed the
-        same SET as literal kick-1-recheck on a static snapshot."""
+    def test_matches_literal_kick_one_recheck(self):
+        """Batched shedding == literal kick-max-displacement-then-recheck."""
         pol = mk_policy()
         rng = random.Random(3)
         waiting = [{"request_id": i, "prompt_tokens": rng.randint(50, 3000),
                     "max_tokens": rng.randint(10, 800)} for i in range(40)]
         budget = 20_000
-        kicked = {r["request_id"] for r in pol.on_tick(list(waiting), budget)}
-        # literal reference implementation
+        kicked = [r["request_id"] for r in pol.on_tick(list(waiting), budget)]
         remaining = list(waiting)
-        ref = set()
+        ref = []
         while remaining and sum(token_footprint(r) for r in remaining) > budget:
-            items = [(str(r["request_id"]), token_footprint(r),
-                      value_usd(r, 0.15, 1.20)) for r in remaining]
-            keep = solve_knapsack(items, budget)
-            out = [r for r in remaining if str(r["request_id"]) not in keep] or remaining
-            victim = min(out, key=lambda r: value_usd(r, 0.15, 1.20)
-                         / max(displacement_token_s(r, 20000, 0.0095), 1e-9))
+            victim = max(remaining,
+                         key=lambda r: displacement_token_s(r, 20000, 0.0095))
             remaining.remove(victim)
-            ref.add(victim["request_id"])
+            ref.append(victim["request_id"])
         self.assertEqual(kicked, ref)
 
     def test_kicked_real_cloud_ttft_includes_queue_wait(self):

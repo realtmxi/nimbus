@@ -92,11 +92,16 @@ nimbus 的 kick 检查在 dispatch **之前**跑,`--policy nimbus` 下引擎饱�
 
 ## nimbus policy(`--policy nimbus --kv-capacity-tokens N`)
 
-队列级甩负载,每次到达/完成时在本地 dispatch **之前**裁决。语义(2026-07 拍板):
-**容量用 KV tokens、背包 value 用 API $、token·s displacement 做踢出优先级**——
-`while Σ footprint(waiting) > K_avail(/metrics): 解背包(weight=tokens, value=$)
-→ 出局者按最差 $/displacement 先踢`。
-注意:这是"**KV token 预算下的成本最小化甩负载,displacement 为次级优先**",
-不是纯"踢最高 displacement"的 CacheDisp 规则;displacement 做背包 weight 的
-变体是计划中的消融。剩余开放旋钮:触发条件(装不下 vs 队头等待逼近 SLO,
-即决策 2)。
+队列级甩负载,每次到达/完成时在本地 dispatch **之前**裁决。语义——CacheDisp
+核心(2026-07-09 review 抓到实现漂移后由 Murphy 重申):
+
+```
+displacement(req) ≈ prompt_tokens × (prefill时间 + decode_tokens × TPOT)   [token·s]
+while Σ footprint(waiting) > K_avail(/metrics):
+    踢 displacement 最大的请求
+```
+
+踢的是"占最多缓存、占最久"的请求——API 成本**不进**踢出规则(它属于 frontier
+对比)。成本感知的背包变体(min 云成本 s.t. 释放足够 displacement / max 释放
+displacement s.t. 云预算)是计划中的消融,`solve_knapsack`/`value_usd` 为此保留。
+剩余开放旋钮:触发条件(装不下 vs 队头等待逼近 SLO,即决策 2)。

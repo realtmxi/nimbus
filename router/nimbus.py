@@ -1,27 +1,27 @@
-"""Nimbus policy: knapsack-based shedding over the waiting queue.
+"""Nimbus policy: cache-displacement shedding over the waiting queue.
 
-The written algorithm (Notion "Algorithm Design"), with the budget-unit fix
-decided 2026-07 (Murphy): the knapsack CAPACITY is physical — KV tokens — while
-cache displacement (token·seconds) enters only as the KICK PRIORITY. This
-answers the doc's open question ("if weight unit is token·seconds, what is the
-new budget?"): weight and budget answer different questions and need not share
-a unit.
+The core rule (Notion "Algorithm Design", reaffirmed by Murphy 2026-07-09 after
+an implementation drift was caught in review):
+
+    displacement(req) = KV footprint x residence time            [token*s]
+                      ~ prompt_tokens x (prefill_time + decode_tokens x TPOT)
 
     while Σ token_footprint(waiting) > kv_available_tokens:      # fits-in-KV trigger
-        keep = knapsack(items, weight=token_footprint, value=$saved,
-                        budget=kv_available_tokens)
-        kick the request NOT kept with the worst $value per token·second of
-        displacement (cheapest to buy back per unit of local cache-time freed)
+        kick the request with the LARGEST displacement
 
-Kicked requests go to the cloud sink; everything else stays queued for the
-work-conserving dispatcher. No pressure (everything fits) -> zero kicks -> the
-policy degrades to all_local.
+It answers: how much KV does this request pin, and for how long? Shedding the
+largest displacers frees the most cache-time per kick. API cost does NOT enter
+the shed rule — it belongs to the frontier comparison and to the planned
+cost-aware knapsack ablations (Murphy's objectives: minimize cloud cost s.t.
+enough displacement released / maximize released displacement s.t. cloud
+budget), for which solve_knapsack/value_usd below are retained.
 
-Definitions per request (from trace fields):
-  token_footprint = prompt_tokens + max_tokens        [tokens]   (KV upper bound)
-  displacement    = prompt_tokens * residence_s       [token·s]
-      residence_s = prompt_tokens/prefill_tput + max_tokens * tpot_s
-  value           = prompt*in_price + max_tokens*out_price   [$ saved if local]
+History note: between 2026-07-08 and 07-09 this file briefly implemented
+"maximize kept API value under a token budget" — that was drift introduced
+during the budget-unit fix, not the design; reverted.
+
+Trigger/capacity stays physical (tokens, decision 2026-07: budget = K_avail
+from real /metrics). No pressure -> zero kicks -> degrades to all_local.
 """
 from __future__ import annotations
 
@@ -117,11 +117,8 @@ class NimbusPolicy:
     name = "nimbus"
     p = None   # no target fraction: the policy self-selects its split
 
-    def __init__(self, in_price_mtok: float, out_price_mtok: float,
-                 prefill_tput: float, tpot_s: float, seed: int = 0,
+    def __init__(self, prefill_tput: float, tpot_s: float, seed: int = 0,
                  max_tokens_override: int | None = None):
-        self.in_price = in_price_mtok
-        self.out_price = out_price_mtok
         self.prefill_tput = prefill_tput
         self.tpot_s = tpot_s
         self.mto = max_tokens_override
@@ -146,48 +143,26 @@ class NimbusPolicy:
         waiting: list[dict[str, Any]],
         kv_available_tokens: float,
     ) -> list[dict[str, Any]]:
-        """Decide which waiting requests to kick to the cloud right now.
+        """Kick the largest cache-displacers until the waiting set fits KV.
 
-        Semantics = the Notion iterative loop (solve knapsack, kick worst
-        $/displacement from the out-set, recheck), computed efficiently: on a
-        static snapshot with a fixed budget, removing an out-set member leaves
-        the kept set optimal, so one solve per round suffices — victims are the
-        out-set in ascending density order, taken until the remainder fits.
-        The outer while re-solves only if scaling slack leaves the remainder
-        still over budget after the whole out-set is gone (rare).
-
-        NOTE: this method is pure w.r.t. shared state (no counters beyond
-        telemetry) and is safe to run in a worker thread; the caller accounts
-        for actually-kicked requests (a victim may have been dispatched while
-        this computed).
+        Pure w.r.t. shared state (telemetry counters only) — safe to run in a
+        worker thread; the caller accounts for actually-kicked requests (a
+        victim may have been dispatched while this computed).
         """
         self.ticks += 1
-        remaining = list(waiting)
+        total = sum(token_footprint(r, self.mto) for r in waiting)
+        if total <= kv_available_tokens:
+            return []
+        self.kick_rounds += 1
+        by_displacement = sorted(
+            waiting,
+            key=lambda r: displacement_token_s(r, self.prefill_tput, self.tpot_s,
+                                               self.mto),
+            reverse=True)                       # largest displacer first
         kicked: list[dict[str, Any]] = []
-        total = sum(token_footprint(r, self.mto) for r in remaining)   # incremental, O(n) once
-
-        def density(r: dict[str, Any]) -> float:
-            return (value_usd(r, self.in_price, self.out_price, self.mto)
-                    / max(displacement_token_s(r, self.prefill_tput, self.tpot_s,
-                                               self.mto), 1e-9))
-
-        while remaining and total > kv_available_tokens:
-            self.kick_rounds += 1
-            items = [(str(r["request_id"]), token_footprint(r, self.mto),
-                      value_usd(r, self.in_price, self.out_price, self.mto))
-                     for r in remaining]
-            keep = solve_knapsack(items, int(kv_available_tokens))
-            keep_set = keep
-            out = [r for r in remaining if str(r["request_id"]) not in keep_set]
-            if not out:                 # degenerate (e.g. budget <= 0 kept nothing)
-                out = remaining
-            out_ids = {id(r) for r in out}
-            survivors = [r for r in remaining if id(r) not in out_ids]
-            for victim in sorted(out, key=density):   # worst density first
-                if total <= kv_available_tokens:
-                    survivors.append(victim)          # spared: fits again
-                    continue
-                total -= token_footprint(victim, self.mto)
-                kicked.append(victim)
-            remaining = survivors
+        for victim in by_displacement:
+            if total <= kv_available_tokens:
+                break
+            total -= token_footprint(victim, self.mto)
+            kicked.append(victim)
         return kicked

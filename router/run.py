@@ -438,8 +438,7 @@ async def main() -> None:
 
     if args.policy == "nimbus":
         from router.nimbus import NimbusPolicy
-        policy = NimbusPolicy(args.in_price, args.out_price,
-                              args.prefill_tput, args.tpot_ms / 1000.0, seed=args.seed,
+        policy = NimbusPolicy(args.prefill_tput, args.tpot_ms / 1000.0, seed=args.seed,
                               max_tokens_override=args.max_tokens)
     else:
         policy = Policy(args.policy, args.fraction, args.seed)
