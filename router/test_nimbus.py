@@ -255,6 +255,51 @@ class TestCodexRegressions(unittest.TestCase):
                 parse_args(base + bad)
 
 
+class TestTickDispatchRace(unittest.TestCase):
+    def test_completion_during_slow_tick_cannot_dispatch_the_victim(self):
+        """Regression (codex round-3 P1): while a shed decision computes
+        off-thread, a completing request must NOT admit the victim locally.
+        Reproduction: r1 (huge displacer, queue head) is about to be kicked by
+        a slow tick; r0 completes mid-tick; old code dispatched r1 local."""
+        import time as _time
+        from router.nimbus import NimbusPolicy
+
+        class SleepyPolicy(NimbusPolicy):
+            def on_tick(self, waiting, kv):
+                if len(waiting) >= 2:
+                    _time.sleep(0.12)          # slow decision window
+                return super().on_tick(waiting, kv)
+
+        # r0 small (dispatches first, completes during the slow tick),
+        # r1 HUGE displacer at the queue head (the victim),
+        # r2 small (should be the only other local request)
+        trace = [
+            {"request_id": 0, "arrived_at": 1477007, "relative_arrival_s": 0.0,
+             "prompt": "r0", "max_tokens": 10, "prompt_tokens": 40, "session_id": 0},
+            {"request_id": 1, "arrived_at": 1477007, "relative_arrival_s": 0.0,
+             "prompt": "r1", "max_tokens": 2000, "prompt_tokens": 100, "session_id": 0},
+            {"request_id": 2, "arrived_at": 1477007, "relative_arrival_s": 0.0,
+             "prompt": "r2", "max_tokens": 10, "prompt_tokens": 40, "session_id": 0},
+        ]
+        import tempfile
+        from pathlib import Path
+        from router.run import parse_args, replay_queued
+        out_dir = Path(tempfile.mkdtemp())
+        args = parse_args(["--data", "t", "--scenario", "normal", "--policy", "nimbus",
+                           "--local-url", "http://x", "--local-model", "m",
+                           "--kv-capacity-tokens", "1000000", "--max-inflight", "1",
+                           "--out-dir", str(out_dir)])
+        pol = SleepyPolicy(prefill_tput=20000, tpot_s=0.0095)
+        sender = RecordingSender(service_s=0.05)   # r0 completes inside the 0.12s tick
+        results, _, _ = asyncio.run(replay_queued(
+            args, trace, pol, LOCAL, CLOUD, sink=NullCloud(CLOUD),
+            send_local=sender, kv_monitor=FakeKV(150)))   # r1+r2 don't fit -> kick r1
+        cloud_ids = {r["request_id"] for r in results if r["endpoint"] == "cloud"}
+        self.assertIn(1, cloud_ids)                        # the victim went to CLOUD
+        self.assertNotIn(1, sender.dispatch_order)         # never dispatched locally
+        self.assertEqual(pol.n_outsourced, len(cloud_ids))
+
+
 class FakeKV:
     """Injectable monitor: fixed available tokens."""
     def __init__(self, avail):

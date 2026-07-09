@@ -4,7 +4,7 @@
 
 把 trace 里的请求按 policy 分发给本地 vLLM 和云 sink,记录延迟、成本和分流比例。
 **单一入口**:`python -m router.run`。policy:三个 baseline(`all_local`/`all_cloud`/
-`random`)+ **nimbus** 甩负载 policy(队列级背包,见下)。
+`random`)+ **nimbus** 甩负载 policy(cache-displacement,见下)。
 
 
 ## 文件
@@ -13,7 +13,7 @@
 |---|---|
 | `run.py` | **唯一入口**:外部 FIFO + work-conserving dispatcher + KV 读数器 + CLI |
 | `common.py` | 共享库:`one_request`/`load_trace`/`SCENARIOS`(逐行取自 `vllm/run.py` @ `dff1a81`)、`Endpoint`、`Policy`、`NullCloud`、计费、`summarize` |
-| `nimbus.py` | nimbus 甩负载 policy:等待队列上的 tokens 预算背包,token·s displacement 做踢出优先级(`--policy nimbus --kv-capacity-tokens N`) |
+| `nimbus.py` | nimbus 甩负载 policy:等待集合超出真实 KV 余量时,踢 displacement 最大的请求(`--policy nimbus --kv-capacity-tokens N`);背包 solver 为成本感知消融保留 |
 | `test_run.py` / `test_common.py` / `test_nimbus.py` | 47 个单元测试,无需网络/aiohttp/GPU |
 
 ## 架构
@@ -33,7 +33,7 @@
 - 有压力 ⇒ 溢出堆在**我们的**队列里(带完整身份)——未来 nimbus knapsack 的操作对象。
   为什么队列必须自己维护:引擎只暴露排队**计数**(vLLM `/metrics` 三个 gauge,已对
   v0.19 源码验证),不暴露排队者身份;选择性外包需要名单
-- **KV 意识故意不在这里**:它属于 nimbus 算法本身(budget=KV),随算法一起进来
+- **KV 意识在 nimbus policy 里**,不在 dispatcher:kick 检查先于 dispatch,且甩负载决策计算期间 admission 冻结(正在完成的请求不可能把待踢者放进本地)
 
 ## 云 sink 两档
 
@@ -76,8 +76,8 @@ baseline = **Jialu 的 `vllm/run.py`**(团队已验证的 open-loop 压测)。�
 | 3 | 压力下 pacing:排队在 client 侧、引擎不淹没、无泄漏 | ✅ queue_delay p50=83.8s 而引擎 service TTFT p50=90ms(756/756 成功);机制现为纯并发闸门,同性质由 `max_inflight=1` 串行化单测覆盖 |
 | 4 | random 端到端:比例 29.4%/目标 30%、计费重算精确相等、local 侧 $0 | ✅ |
 | 5 | null cloud:`routed_only` 不进 SLO 统计、`--max-tokens` 与 payload 语义一致 | ✅ 单元测试 |
-| 6 | **nimbus 中立性**:容量充足时 0 踢出,≡ all_local | ✅ p50 113 vs 112ms,0 次触发 |
-| 7 | **nimbus 压力测试**(slots=4、KV 预算 3k):自选外包 29.0%,本地 SLO 违约 **0%**,同约束 all_local **91.1%**(p50 435ms vs 32.8s) | ✅ 真实 trace + 真实 KV /metrics 读数(803 ticks 零失败) |
+| 6 | **nimbus 中立性**:容量充足时 0 踢出,≡ all_local | ✅ p50 113 vs 112ms(旧策略下测得;无压力时新旧策略行为相同——都是 0 踢出;kick 先于 dispatch 后 tick 每次到达都会触发) |
+| 7 | **nimbus 压力测试**(slots=4、KV 预算 3k):自选外包 29.0%,本地 SLO 违约 **0%**,同约束 all_local **91.1%**(p50 435ms vs 32.8s) | ⚠️ **旧($-背包)策略下测得**——仅作机制演示;修正后的 CacheDisp 策略待 GPU 复位后在 extreme_burst 格上复测 |
 
 ## 有意不做的事(边界即设计)
 

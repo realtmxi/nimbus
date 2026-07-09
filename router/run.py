@@ -220,6 +220,11 @@ async def replay_queued(
             task.add_done_callback(pending.discard)
 
         def maybe_dispatch() -> None:
+            # policy first: while a shed decision is in flight, admission is
+            # frozen — otherwise a completing request could dispatch a victim
+            # the policy is about to kick (race caught in review)
+            if has_tick and tick_busy:
+                return
             # work-conserving: admit the head while a slot is free
             while queue and admission.fits(queue[0][0]):
                 req, due = queue.pop(0)
@@ -269,33 +274,45 @@ async def replay_queued(
                 task.add_done_callback(pending.discard)
 
         # ---- queue-level policy hook (nimbus): kick overflow to the cloud ----
+        # Invariant: the policy adjudicates BEFORE any local admission. While a
+        # shed decision is computing off-thread, admission is FROZEN (see
+        # maybe_dispatch); events that land meanwhile set tick_rerun so the
+        # decision re-runs on the fresh queue before admission resumes.
         has_tick = hasattr(policy, "on_tick")
         tick_busy = False
+        tick_rerun = False
 
         async def maybe_kick() -> None:
-            nonlocal tick_busy
-            if not has_tick or tick_busy or not queue:
+            nonlocal tick_busy, tick_rerun
+            if not has_tick:
+                return
+            if tick_busy:
+                tick_rerun = True       # missed wakeup: re-adjudicate after
+                return
+            if not queue:
                 return
             tick_busy = True
             try:
-                kv_avail = (await kv_monitor.available_tokens()
-                            if kv_monitor is not None else float("inf"))
-                snapshot = [r for r, _ in queue]
-                # heavy DP runs off-thread so a deep-queue solve cannot stall
-                # arrival pacing / completions / the KV scrape
-                victims = await asyncio.get_running_loop().run_in_executor(
-                    None, policy.on_tick, snapshot, kv_avail)
-                for v in victims:
-                    # tolerant lookup: the queue kept moving while we decided —
-                    # a victim may have been dispatched already; skip it
-                    idx = next((i for i, (r, _) in enumerate(queue)
-                                if r["request_id"] == v["request_id"]), None)
-                    if idx is None:
-                        continue
-                    req, due = queue.pop(idx)
-                    waited_ms = max(0.0, (time.perf_counter() - due) * 1000)
-                    policy.n_outsourced += 1
-                    route_cloud(req, due, queue_delay_ms=waited_ms)
+                while True:
+                    tick_rerun = False
+                    kv_avail = (await kv_monitor.available_tokens()
+                                if kv_monitor is not None else float("inf"))
+                    snapshot = [r for r, _ in queue]
+                    # heavy work runs off-thread so a deep-queue decision cannot
+                    # stall arrival pacing / completions / the KV scrape
+                    victims = await asyncio.get_running_loop().run_in_executor(
+                        None, policy.on_tick, snapshot, kv_avail)
+                    for v in victims:
+                        idx = next((i for i, (r, _) in enumerate(queue)
+                                    if r["request_id"] == v["request_id"]), None)
+                        if idx is None:      # defensive; admission is frozen,
+                            continue         # so victims should still be here
+                        req, due = queue.pop(idx)
+                        waited_ms = max(0.0, (time.perf_counter() - due) * 1000)
+                        policy.n_outsourced += 1
+                        route_cloud(req, due, queue_delay_ms=waited_ms)
+                    if not tick_rerun or not queue:
+                        break               # queue unchanged since snapshot
             finally:
                 tick_busy = False
 

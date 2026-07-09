@@ -5,7 +5,7 @@
 Dispatches trace requests between a local vLLM and a cloud sink according to a
 policy, recording latency, cost, and the split. Single entry point:
 `python -m router.run`. Policies: three baselines (`all_local` / `all_cloud` /
-`random`) plus the **nimbus** shedding policy (queue-level knapsack, see below).
+`random`) plus the **nimbus** shedding policy (cache-displacement, see below).
 
 ## Files
 
@@ -13,7 +13,7 @@ policy, recording latency, cost, and the split. Single entry point:
 |---|---|
 | `run.py` | **The entry point**: external FIFO + work-conserving dispatcher + KV monitor + CLI |
 | `common.py` | Shared library: `one_request` / `load_trace` / `SCENARIOS` (line-for-line from `vllm/run.py` @ `dff1a81`), `Endpoint`, `Policy`, `NullCloud`, billing, `summarize` |
-| `nimbus.py` | The nimbus shedding policy: tokens-budget knapsack over the waiting queue, token·s displacement as kick priority (`--policy nimbus --kv-capacity-tokens N`) |
+| `nimbus.py` | The nimbus shedding policy: kick the largest cache-displacers when the waiting set exceeds real KV headroom (`--policy nimbus --kv-capacity-tokens N`); knapsack solver retained for the cost-aware ablations |
 | `test_run.py` / `test_common.py` / `test_nimbus.py` | 47 unit tests; no network / aiohttp / GPU needed |
 
 ## Architecture
@@ -37,8 +37,9 @@ arrival ──Policy (decided at arrival)──cloud──> fake sink (default) 
   expose only queue *counts* (three `/metrics` gauges, verified against vLLM
   v0.19 source), never the identity of waiting requests; selective offloading
   needs names
-- **KV awareness is deliberately not here**: it belongs to the nimbus
-  algorithm itself (budget = KV) and arrives with it
+- **KV awareness lives in the nimbus policy**, not the dispatcher: the kick
+  check runs BEFORE dispatch, and admission is frozen while a shed decision
+  is computing (so a completing request can never admit a victim mid-decision)
 
 ## Cloud sinks
 
@@ -86,8 +87,8 @@ All measured on the GPU host, Qwen3.6-35B-A3B, `burst_300`, n = 756:
 | 3 | Pacing under pressure: queueing stays client-side, engine never drowns, nothing leaks | ✅ queue_delay p50 = 83.8 s while engine service TTFT p50 = 90 ms (756/756 success); the mechanism is now a pure concurrency gate, same property covered by the `max_inflight=1` serialization unit test |
 | 4 | `random` end-to-end: fraction 29.4 % vs target 30 %, billing recomputes exactly, local bills $0 | ✅ |
 | 5 | Null cloud: `routed_only` excluded from SLO stats; `--max-tokens` mirrors the payload | ✅ unit tests |
-| 6 | **nimbus neutrality**: with free capacity, 0 kicks, ≡ all_local | ✅ p50 113 vs 112 ms, 0 ticks fired |
-| 7 | **nimbus under pressure** (slots=4, KV budget 3k): self-selected 29.0 % outsourcing, local SLO violations **0 %** vs **91.1 %** for all_local under the identical constraint (p50 435 ms vs 32.8 s) | ✅ real trace, real KV /metrics reads (0 failures over 803 ticks) |
+| 6 | **nimbus neutrality**: with free capacity, 0 kicks, ≡ all_local | ✅ p50 113 vs 112 ms (measured pre-revert; at no pressure old and corrected policies are identical — 0 kicks either way; ticks now fire per arrival since kick-before-dispatch) |
+| 7 | **nimbus under pressure** (slots=4, KV budget 3k): self-selected 29.0 % outsourcing, local SLO violations **0 %** vs **91.1 %** for all_local under the identical constraint (p50 435 ms vs 32.8 s) | ⚠️ measured with the PRE-REVERT ($-knapsack) policy — mechanism demonstration only; re-measure with the corrected CacheDisp policy on the extreme_burst cell (queued, pending GPU reset) |
 
 ## Non-goals (the boundary is the design)
 
