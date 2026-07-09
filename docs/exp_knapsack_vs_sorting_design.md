@@ -1,3 +1,5 @@
+**English** | [简体中文](exp_knapsack_vs_sorting_design.zh-CN.md)
+
 # Experiment: Knapsack vs Greedy Sorting
 
 ## Motivation

@@ -1,3 +1,5 @@
+**English** | [简体中文](tcpo_oracle_design.zh-CN.md)
+
 # TCPO: Trace-Clairvoyant Pressure Oracle for Nimbus
 
 ## 1. Why We Need an Offline Oracle
