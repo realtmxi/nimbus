@@ -399,12 +399,14 @@ def summarize(results: list[dict[str, Any]], policy: Policy, slo_s: float) -> di
     }
 
 
-def build_endpoints(args: argparse.Namespace) -> tuple[Endpoint | None, Endpoint | None]:
+def build_endpoints(args: argparse.Namespace,
+                    needs_cloud: bool | None = None) -> tuple[Endpoint | None, Endpoint | None]:
     local = None
     if args.local_url:
         local = Endpoint(name="local", url=args.local_url, model=args.local_model)
     cloud = None
-    needs_cloud = args.policy in ("all_cloud", "random")
+    if needs_cloud is None:
+        needs_cloud = args.policy in ("all_cloud", "random")
     if args.cloud_url or (needs_cloud and args.cloud == "null"):
         model = args.cloud_model or args.local_model or "fake-cloud"
         cloud = Endpoint(
@@ -423,7 +425,7 @@ def build_cloud_sink(
 ) -> tuple[Endpoint | None, Endpoint | None, NullCloud | None]:
     """Endpoints + the fake cloud sink for --cloud null (None for --cloud real:
     those requests go through a real streaming call)."""
-    local, cloud = build_endpoints(args)
+    local, cloud = build_endpoints(args, needs_cloud)
     sink = None
     if needs_cloud and args.cloud == "null":
         sink = NullCloud(cloud)

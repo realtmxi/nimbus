@@ -75,7 +75,7 @@ class RecordingSender:
 def run(args, trace, policy, sink=None, sender=None, cloud_sender=None):
     sender = sender or RecordingSender()
     has_cloud = sink is not None or cloud_sender is not None
-    results, admission = asyncio.run(replay_queued(
+    results, admission, _ = asyncio.run(replay_queued(
         args, trace, policy, LOCAL, CLOUD if has_cloud else None,
         sink=sink, send_local=sender, send_cloud=cloud_sender))
     return results, admission, sender

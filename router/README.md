@@ -11,9 +11,10 @@ as a queue-level policy.
 
 | File | Role |
 |---|---|
-| `run.py` | **The entry point**: external FIFO + work-conserving dispatcher + CLI |
+| `run.py` | **The entry point**: external FIFO + work-conserving dispatcher + KV monitor + CLI |
 | `common.py` | Shared library: `one_request` / `load_trace` / `SCENARIOS` (line-for-line from `vllm/run.py` @ `dff1a81`), `Endpoint`, `Policy`, `NullCloud`, billing, `summarize` |
-| `test_run.py` / `test_common.py` | 31 unit tests; no network / aiohttp / GPU needed |
+| `nimbus.py` | The nimbus shedding policy: tokens-budget knapsack over the waiting queue, token·s displacement as kick priority (`--policy nimbus --kv-capacity-tokens N`) |
+| `test_run.py` / `test_common.py` / `test_nimbus.py` | 47 unit tests; no network / aiohttp / GPU needed |
 
 ## Architecture
 
@@ -85,6 +86,8 @@ All measured on the GPU host, Qwen3.6-35B-A3B, `burst_300`, n = 756:
 | 3 | Pacing under pressure: queueing stays client-side, engine never drowns, nothing leaks | ✅ queue_delay p50 = 83.8 s while engine service TTFT p50 = 90 ms (756/756 success); the mechanism is now a pure concurrency gate, same property covered by the `max_inflight=1` serialization unit test |
 | 4 | `random` end-to-end: fraction 29.4 % vs target 30 %, billing recomputes exactly, local bills $0 | ✅ |
 | 5 | Null cloud: `routed_only` excluded from SLO stats; `--max-tokens` mirrors the payload | ✅ unit tests |
+| 6 | **nimbus neutrality**: with free capacity, 0 kicks, ≡ all_local | ✅ p50 113 vs 112 ms, 0 ticks fired |
+| 7 | **nimbus under pressure** (slots=4, KV budget 3k): self-selected 29.0 % outsourcing, local SLO violations **0 %** vs **91.1 %** for all_local under the identical constraint (p50 435 ms vs 32.8 s) | ✅ real trace, real KV /metrics reads (0 failures over 803 ticks) |
 
 ## Non-goals (the boundary is the design)
 

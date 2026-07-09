@@ -55,6 +55,57 @@ except ImportError:  # pragma: no cover
     aiohttp = None
 
 
+def metrics_url_of(chat_url: str) -> str:
+    """http://host:port/v1/chat/completions -> http://host:port/metrics"""
+    base = chat_url.split("/v1/", 1)[0].rstrip("/")
+    return base + "/metrics"
+
+
+class KVMonitor:
+    """Real KV availability from the engine's /metrics (no client-side model).
+
+    Reads `vllm:kv_cache_usage_perc` (verified gauge name, vLLM v0.19) and
+    converts to available tokens against the engine's reported capacity
+    (--kv-capacity-tokens, from the startup log "GPU KV cache size: N tokens").
+    Responses are cached for ttl_s; on read failure the last value is reused
+    (and counted) so a transient scrape error cannot stall the tick loop.
+    """
+
+    GAUGE = "vllm:kv_cache_usage_perc"
+
+    def __init__(self, session, metrics_url: str, capacity_tokens: float,
+                 ttl_s: float = 0.25):
+        self.session = session
+        self.metrics_url = metrics_url
+        self.capacity = float(capacity_tokens)
+        self.ttl_s = ttl_s
+        self._avail = capacity_tokens   # optimistic until first read
+        self._at = float("-inf")
+        self.read_failures = 0
+
+    async def available_tokens(self) -> float:
+        now = time.monotonic()
+        if now - self._at < self.ttl_s:
+            return self._avail
+        try:
+            async with self.session.get(self.metrics_url) as resp:
+                text = await resp.text()
+            usage = None
+            for line in text.splitlines():
+                if line.startswith(self.GAUGE):
+                    usage = float(line.split()[-1])
+            if usage is None:
+                raise ValueError(f"{self.GAUGE} not found in /metrics")
+            self._avail = self.capacity * (1.0 - usage)
+            self._at = now
+        except Exception as exc:
+            self.read_failures += 1
+            if self.read_failures == 1:
+                print(f"[kv-monitor] WARNING: /metrics read failed ({exc}); "
+                      f"reusing last value")
+        return self._avail
+
+
 class LocalAdmission:
     """Concurrency gate for the local engine: admit while inflight < max_inflight."""
 
@@ -83,7 +134,8 @@ async def replay_queued(
     sink: 'NullCloud | None' = None,
     send_local: Callable[..., Awaitable[dict[str, Any]]] | None = None,
     send_cloud: Callable[..., Awaitable[dict[str, Any]]] | None = None,
-) -> tuple[list[dict[str, Any]], LocalAdmission]:
+    kv_monitor: "KVMonitor | None" = None,
+) -> tuple[list[dict[str, Any]], LocalAdmission, "KVMonitor | None"]:
     """Queued replay. `send_local`/`send_cloud` are injectable for tests
     (default to the verified streaming primitive one_request)."""
     out = resolve_output_path(args)
@@ -105,6 +157,17 @@ async def replay_queued(
                   if getattr(args, "cloud_max_concurrency", 0) > 0 else None)
 
     async with session_cm as session:
+        if (kv_monitor is None and hasattr(policy, "on_tick")
+                and session is not None and args.local_url):
+            kv_monitor = KVMonitor(session, metrics_url_of(args.local_url),
+                                   args.kv_capacity_tokens)
+            # fail fast: a dead KV signal would silently turn nimbus into
+            # all_local (never-succeeded reads return optimistic full capacity)
+            await kv_monitor.available_tokens()
+            if kv_monitor.read_failures:
+                raise RuntimeError(
+                    f"KV metrics unreadable at startup ({kv_monitor.metrics_url}, "
+                    f"gauge {KVMonitor.GAUGE}) — refusing to run nimbus blind")
         if send_local is None:
             async def send_local(endpoint, req, due):  # noqa: F811 - default sender
                 return await one_request(session, endpoint, req, due,
@@ -147,6 +210,7 @@ async def replay_queued(
                 res["e2e_ms"] = queue_delay_ms + res["e2e_ms"]
             record(res)
             maybe_dispatch()
+            await maybe_kick()
 
         def spawn_local(req: dict[str, Any], arrival_due: float) -> None:
             admission.reserve(req)
@@ -160,11 +224,22 @@ async def replay_queued(
                 req, due = queue.pop(0)
                 spawn_local(req, due)
 
-        def route_cloud(req: dict[str, Any], due: float) -> None:
+        def _finalize_cloud(res: dict[str, Any], queue_delay_ms: float) -> None:
+            # same from-arrival accounting as the local path: a kicked request
+            # carries the time it waited in our queue before being shed
+            service = res.get("ttft_ms")
+            res["queue_delay_ms"] = queue_delay_ms
+            res["service_ttft_ms"] = service
+            if service is not None:
+                res["ttft_ms"] = queue_delay_ms + service
+            if res.get("e2e_ms") is not None:
+                res["e2e_ms"] = queue_delay_ms + res["e2e_ms"]
+
+        def route_cloud(req: dict[str, Any], due: float,
+                        queue_delay_ms: float = 0.0) -> None:
             if sink is not None:
                 res = sink.serve(req, due, max_tokens_override=args.max_tokens)
-                res["queue_delay_ms"] = 0.0
-                res["service_ttft_ms"] = res.get("ttft_ms")
+                _finalize_cloud(res, queue_delay_ms)
                 record(res)
             else:
                 async def cloud_task():
@@ -173,12 +248,42 @@ async def replay_queued(
                             res = await send_cloud(req, due)
                     else:
                         res = await send_cloud(req, due)
-                    res["queue_delay_ms"] = 0.0
-                    res["service_ttft_ms"] = res.get("ttft_ms")
+                    _finalize_cloud(res, queue_delay_ms)
                     record(res)
                 task = asyncio.create_task(cloud_task())
                 pending.add(task)
                 task.add_done_callback(pending.discard)
+
+        # ---- queue-level policy hook (nimbus): kick overflow to the cloud ----
+        has_tick = hasattr(policy, "on_tick")
+        tick_busy = False
+
+        async def maybe_kick() -> None:
+            nonlocal tick_busy
+            if not has_tick or tick_busy or not queue:
+                return
+            tick_busy = True
+            try:
+                kv_avail = (await kv_monitor.available_tokens()
+                            if kv_monitor is not None else float("inf"))
+                snapshot = [r for r, _ in queue]
+                # heavy DP runs off-thread so a deep-queue solve cannot stall
+                # arrival pacing / completions / the KV scrape
+                victims = await asyncio.get_running_loop().run_in_executor(
+                    None, policy.on_tick, snapshot, kv_avail)
+                for v in victims:
+                    # tolerant lookup: the queue kept moving while we decided —
+                    # a victim may have been dispatched already; skip it
+                    idx = next((i for i, (r, _) in enumerate(queue)
+                                if r["request_id"] == v["request_id"]), None)
+                    if idx is None:
+                        continue
+                    req, due = queue.pop(idx)
+                    waited_ms = max(0.0, (time.perf_counter() - due) * 1000)
+                    policy.n_outsourced += 1
+                    route_cloud(req, due, queue_delay_ms=waited_ms)
+            finally:
+                tick_busy = False
 
         try:
             for req in trace:
@@ -192,6 +297,7 @@ async def replay_queued(
                 else:
                     queue.append((req, due))
                     maybe_dispatch()
+                    await maybe_kick()
 
             # drain: everything left in queue/in flight completes through the
             # same dispatcher (completions re-trigger maybe_dispatch)
@@ -204,7 +310,7 @@ async def replay_queued(
             f.close()
 
     print(f"raw: {out}")
-    return results, admission
+    return results, admission, kv_monitor
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -212,7 +318,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--scenario", choices=SCENARIOS, required=True)
-    parser.add_argument("--policy", choices=["all_local", "all_cloud", "random"], required=True)
+    parser.add_argument("--policy", choices=["all_local", "all_cloud", "random", "nimbus"], required=True)
     parser.add_argument("--fraction", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=0)
 
@@ -220,6 +326,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--local-model", default=None)
     parser.add_argument("--max-inflight", type=int, default=128,
                         help="local concurrency cap; match the server --max-num-seqs")
+
+    # nimbus policy (see router/nimbus.py)
+    parser.add_argument("--kv-capacity-tokens", type=float, default=None,
+                        help="engine KV capacity in tokens, from the vLLM startup "
+                             "log 'GPU KV cache size: N tokens' (required for --policy nimbus)")
+    parser.add_argument("--prefill-tput", type=float, default=20000.0,
+                        help="prefill throughput tokens/s for the displacement estimate "
+                             "(kick priority only — relative ordering is what matters)")
+    parser.add_argument("--tpot-ms", type=float, default=9.5,
+                        help="per-output-token time (ms) for the displacement estimate; "
+                             "9.5ms measured on the 35B-A3B+MTP setup")
 
     parser.add_argument("--cloud", choices=["null", "real"], default="null")
     parser.add_argument("--cloud-url", default=None)
@@ -244,8 +361,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.max_tokens is not None and args.max_tokens <= 0:
         parser.error("--max-tokens must be >= 1 (it replaces the trace decode count "
                      "in the payload; 0 breaks fake/real parity)")
-    needs_local = args.policy in ("all_local", "random")
-    needs_cloud = args.policy in ("all_cloud", "random")
+    needs_local = args.policy in ("all_local", "random", "nimbus")
+    needs_cloud = args.policy in ("all_cloud", "random", "nimbus")
+    if args.policy == "nimbus" and (args.kv_capacity_tokens is None
+                                    or args.kv_capacity_tokens <= 0):
+        parser.error("--policy nimbus requires --kv-capacity-tokens > 0 "
+                     "(read it from the vLLM startup log)")
     if needs_local and not (args.local_url and args.local_model):
         parser.error(f"--policy {args.policy} requires --local-url and --local-model")
     if needs_cloud and args.cloud == "real" and not args.cloud_url:
@@ -257,7 +378,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def queue_stats(results: list[dict[str, Any]], admission: LocalAdmission) -> dict[str, Any]:
+def queue_stats(results: list[dict[str, Any]], admission: LocalAdmission,
+                policy=None, kv_monitor=None) -> dict[str, Any]:
     delays = sorted(r["queue_delay_ms"] for r in results
                     if r.get("endpoint") == "local" and "queue_delay_ms" in r)
 
@@ -266,12 +388,19 @@ def queue_stats(results: list[dict[str, Any]], admission: LocalAdmission) -> dic
             return None
         return delays[min(len(delays) - 1, max(0, int(round(q / 100 * (len(delays) - 1)))))]
 
-    return {
+    stats = {
         "queue_delay_p50_ms": pct(50),
         "queue_delay_p99_ms": pct(99),
         "queue_delay_max_ms": delays[-1] if delays else None,
         "peak_inflight": admission.peak_inflight,
     }
+    if policy is not None and hasattr(policy, "on_tick"):
+        stats["nimbus_ticks"] = policy.ticks
+        stats["nimbus_kick_rounds"] = policy.kick_rounds
+        stats["nimbus_kicked"] = policy.n_outsourced
+    if kv_monitor is not None:
+        stats["kv_read_failures"] = kv_monitor.read_failures
+    return stats
 
 
 async def main() -> None:
@@ -280,13 +409,18 @@ async def main() -> None:
     print(f"loaded {len(trace)} requests  scenario={args.scenario} policy={args.policy} "
           f"max_inflight={args.max_inflight}")
 
-    policy = Policy(args.policy, args.fraction, args.seed)
-    needs_cloud = args.policy in ("all_cloud", "random")
+    if args.policy == "nimbus":
+        from router.nimbus import NimbusPolicy
+        policy = NimbusPolicy(args.in_price, args.out_price,
+                              args.prefill_tput, args.tpot_ms / 1000.0, seed=args.seed)
+    else:
+        policy = Policy(args.policy, args.fraction, args.seed)
+    needs_cloud = args.policy in ("all_cloud", "random", "nimbus")
     local, cloud, sink = build_cloud_sink(args, needs_cloud)
 
-    results, admission = await replay_queued(args, trace, policy, local, cloud, sink)
+    results, admission, kv_mon = await replay_queued(args, trace, policy, local, cloud, sink)
     summary = summarize(results, policy, args.slo_s)
-    summary["queue"] = queue_stats(results, admission)
+    summary["queue"] = queue_stats(results, admission, policy, kv_mon)
 
     out = resolve_output_path(args)
     summary_path = out.with_name(out.stem + ".summary.json")

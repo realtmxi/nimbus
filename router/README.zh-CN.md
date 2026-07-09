@@ -11,9 +11,10 @@ policy 插件进来。
 
 | 文件 | 作用 |
 |---|---|
-| `run.py` | **唯一入口**:外部 FIFO + work-conserving dispatcher + CLI |
+| `run.py` | **唯一入口**:外部 FIFO + work-conserving dispatcher + KV 读数器 + CLI |
 | `common.py` | 共享库:`one_request`/`load_trace`/`SCENARIOS`(逐行取自 `vllm/run.py` @ `dff1a81`)、`Endpoint`、`Policy`、`NullCloud`、计费、`summarize` |
-| `test_run.py` / `test_common.py` | 31 个单元测试,无需网络/aiohttp/GPU |
+| `nimbus.py` | nimbus 甩负载 policy:等待队列上的 tokens 预算背包,token·s displacement 做踢出优先级(`--policy nimbus --kv-capacity-tokens N`) |
+| `test_run.py` / `test_common.py` / `test_nimbus.py` | 47 个单元测试,无需网络/aiohttp/GPU |
 
 ## 架构
 
@@ -75,6 +76,8 @@ baseline = **Jialu 的 `vllm/run.py`**(团队已验证的 open-loop 压测)。�
 | 3 | 压力下 pacing:排队在 client 侧、引擎不淹没、无泄漏 | ✅ queue_delay p50=83.8s 而引擎 service TTFT p50=90ms(756/756 成功);机制现为纯并发闸门,同性质由 `max_inflight=1` 串行化单测覆盖 |
 | 4 | random 端到端:比例 29.4%/目标 30%、计费重算精确相等、local 侧 $0 | ✅ |
 | 5 | null cloud:`routed_only` 不进 SLO 统计、`--max-tokens` 与 payload 语义一致 | ✅ 单元测试 |
+| 6 | **nimbus 中立性**:容量充足时 0 踢出,≡ all_local | ✅ p50 113 vs 112ms,0 次触发 |
+| 7 | **nimbus 压力测试**(slots=4、KV 预算 3k):自选外包 29.0%,本地 SLO 违约 **0%**,同约束 all_local **91.1%**(p50 435ms vs 32.8s) | ✅ 真实 trace + 真实 KV /metrics 读数(803 ticks 零失败) |
 
 ## 有意不做的事(边界即设计)
 
