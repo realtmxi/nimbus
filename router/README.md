@@ -14,7 +14,7 @@ policy, recording latency, cost, and the split. Single entry point:
 | `run.py` | **The entry point**: external FIFO + work-conserving dispatcher + KV monitor + CLI |
 | `common.py` | Shared library: `one_request` / `load_trace` / `SCENARIOS` (line-for-line from `vllm/run.py` @ `dff1a81`), `Endpoint`, `Policy`, `NullCloud`, billing, `summarize` |
 | `nimbus.py` | The nimbus shedding policy: kick the largest cache-displacers when the waiting set exceeds real KV headroom (`--policy nimbus --kv-capacity-tokens N`); knapsack solver retained for the cost-aware ablations |
-| `test_run.py` / `test_common.py` / `test_nimbus.py` | 47 unit tests; no network / aiohttp / GPU needed |
+| `test_run.py` / `test_common.py` / `test_nimbus.py` | 52 unit tests; no network / aiohttp / GPU needed |
 
 ## Architecture
 
@@ -33,7 +33,7 @@ arrival ──Policy (decided at arrival)──cloud──> fake sink (default) 
 - No pressure ⇒ the queue is always empty ⇒ behavior degrades to open-loop
   (≡ how `vllm/run.py` runs)
 - Under pressure ⇒ overflow waits in **our** queue, with full identity — the
-  set a shedding policy (nimbus) will operate on. Why own the queue: engines
+  set the nimbus shedding policy operates on. Why own the queue: engines
   expose only queue *counts* (three `/metrics` gauges, verified against vLLM
   v0.19 source), never the identity of waiting requests; selective offloading
   needs names

@@ -84,6 +84,10 @@ class KVMonitor:
         self._at = float("-inf")
         self.read_failures = 0
 
+    def invalidate(self) -> None:
+        """Drop the TTL cache so the next read scrapes fresh state."""
+        self._at = float("-inf")
+
     async def available_tokens(self) -> float:
         now = time.monotonic()
         if now - self._at < self.ttl_s:
@@ -293,6 +297,7 @@ async def replay_queued(
                 return
             tick_busy = True
             try:
+                retries = 0
                 while True:
                     tick_rerun = False
                     kv_avail = (await kv_monitor.available_tokens()
@@ -302,6 +307,16 @@ async def replay_queued(
                     # stall arrival pacing / completions / the KV scrape
                     victims = await asyncio.get_running_loop().run_in_executor(
                         None, policy.on_tick, snapshot, kv_avail)
+                    # a decision computed on a stale window must not be applied:
+                    # a completion may have freed KV (stale kicks over-outsource)
+                    # or arrivals changed the set. Discard and re-decide on
+                    # fresh state — bounded, then apply the latest anyway so a
+                    # busy system cannot livelock the shed path.
+                    if tick_rerun and queue and retries < 3:
+                        retries += 1
+                        if kv_monitor is not None:
+                            kv_monitor.invalidate()
+                        continue
                     for v in victims:
                         idx = next((i for i, (r, _) in enumerate(queue)
                                     if r["request_id"] == v["request_id"]), None)
@@ -313,6 +328,7 @@ async def replay_queued(
                         route_cloud(req, due, queue_delay_ms=waited_ms)
                     if not tick_rerun or not queue:
                         break               # queue unchanged since snapshot
+                    retries = 0             # applied; handle the new events
             finally:
                 tick_busy = False
 

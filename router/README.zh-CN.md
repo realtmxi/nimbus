@@ -14,7 +14,7 @@
 | `run.py` | **唯一入口**:外部 FIFO + work-conserving dispatcher + KV 读数器 + CLI |
 | `common.py` | 共享库:`one_request`/`load_trace`/`SCENARIOS`(逐行取自 `vllm/run.py` @ `dff1a81`)、`Endpoint`、`Policy`、`NullCloud`、计费、`summarize` |
 | `nimbus.py` | nimbus 甩负载 policy:等待集合超出真实 KV 余量时,踢 displacement 最大的请求(`--policy nimbus --kv-capacity-tokens N`);背包 solver 为成本感知消融保留 |
-| `test_run.py` / `test_common.py` / `test_nimbus.py` | 47 个单元测试,无需网络/aiohttp/GPU |
+| `test_run.py` / `test_common.py` / `test_nimbus.py` | 52 个单元测试,无需网络/aiohttp/GPU |
 
 ## 架构
 
@@ -30,7 +30,7 @@
 - **dispatcher** 只要有空位就放行(绝不无谓扣请求):`inflight < max_inflight`,
   与 server 的 `--max-num-seqs` 对齐 ⇒ vLLM 内部队列≈空
 - 无压力 ⇒ 队列恒空 ⇒ 行为退化为 open-loop(≡ `vllm/run.py` 的跑法)
-- 有压力 ⇒ 溢出堆在**我们的**队列里(带完整身份)——未来 nimbus knapsack 的操作对象。
+- 有压力 ⇒ 溢出堆在**我们的**队列里(带完整身份)——nimbus 甩负载 policy 的操作对象。
   为什么队列必须自己维护:引擎只暴露排队**计数**(vLLM `/metrics` 三个 gauge,已对
   v0.19 源码验证),不暴露排队者身份;选择性外包需要名单
 - **KV 意识在 nimbus policy 里**,不在 dispatcher:kick 检查先于 dispatch,且甩负载决策计算期间 admission 冻结(正在完成的请求不可能把待踢者放进本地)

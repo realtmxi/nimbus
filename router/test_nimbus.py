@@ -300,6 +300,60 @@ class TestTickDispatchRace(unittest.TestCase):
         self.assertEqual(pol.n_outsourced, len(cloud_ids))
 
 
+class TestStaleDecisionDiscard(unittest.TestCase):
+    def test_kv_freed_during_tick_prevents_over_outsourcing(self):
+        """Regression (codex round-4 P2): a completion that frees KV during a
+        slow decision must invalidate that decision — r1 stays LOCAL because
+        the fresh KV read (10000) fits it, even though the stale read (0)
+        said kick."""
+        import time as _time
+        from router.nimbus import NimbusPolicy
+
+        class SleepyPolicy(NimbusPolicy):
+            def on_tick(self, waiting, kv):
+                _time.sleep(0.12)                  # slow decision window
+                return super().on_tick(waiting, kv)
+
+        kv_cell = [100.0]     # r0 (footprint 50) fits; r1 (150) does not — yet
+
+        class DynamicKV:
+            read_failures = 0
+            async def available_tokens(self):
+                return kv_cell[0]
+            def invalidate(self):
+                pass
+
+        class FreeingSender(RecordingSender):
+            async def __call__(self, endpoint, req, due):
+                res = await super().__call__(endpoint, req, due)
+                kv_cell[0] = 10000.0               # completion frees KV
+                return res
+
+        trace = [
+            {"request_id": 0, "arrived_at": 1477007, "relative_arrival_s": 0.0,
+             "prompt": "r0", "max_tokens": 10, "prompt_tokens": 40, "session_id": 0},
+            {"request_id": 1, "arrived_at": 1477007, "relative_arrival_s": 0.0,
+             "prompt": "r1", "max_tokens": 50, "prompt_tokens": 100, "session_id": 0},
+        ]
+        import tempfile
+        from pathlib import Path
+        from router.run import parse_args, replay_queued
+        out_dir = Path(tempfile.mkdtemp())
+        args = parse_args(["--data", "t", "--scenario", "normal", "--policy", "nimbus",
+                           "--local-url", "http://x", "--local-model", "m",
+                           "--kv-capacity-tokens", "1000000", "--max-inflight", "1",
+                           "--out-dir", str(out_dir)])
+        pol = SleepyPolicy(prefill_tput=20000, tpot_s=0.0095)
+        sender = FreeingSender(service_s=0.05)     # r0 completes inside the tick
+        results, _, _ = asyncio.run(replay_queued(
+            args, trace, pol, LOCAL, CLOUD, sink=NullCloud(CLOUD),
+            send_local=sender, kv_monitor=DynamicKV()))
+        cloud = [r for r in results if r["endpoint"] == "cloud"]
+        self.assertEqual(cloud, [])                       # nothing over-outsourced
+        self.assertEqual(sender.dispatch_order, [0, 1])   # r1 served locally
+        self.assertEqual(pol.n_outsourced, 0)
+
+
 class FakeKV:
     """Injectable monitor: fixed available tokens."""
     def __init__(self, avail):
