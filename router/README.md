@@ -13,8 +13,8 @@ policy, recording latency, cost, and the split. Single entry point:
 |---|---|
 | `run.py` | **The entry point**: external FIFO + work-conserving dispatcher + KV monitor + CLI |
 | `common.py` | Shared library: `one_request` / `load_trace` / `SCENARIOS` (line-for-line from `vllm/run.py` @ `dff1a81`), `Endpoint`, `Policy`, `NullCloud`, billing, `summarize` |
-| `nimbus.py` | The nimbus shedding policy: kick the largest cache-displacers when the waiting set exceeds real KV headroom (`--policy nimbus --kv-capacity-tokens N`); knapsack solver retained for the cost-aware ablations |
-| `test_run.py` / `test_common.py` / `test_nimbus.py` | 52 unit tests; no network / aiohttp / GPU needed |
+| `nimbus.py` | Nimbus v3: physical KV-gap trigger + cost/displacement density ordering (`--policy nimbus --kv-capacity-tokens N`) |
+| `test_run.py` / `test_common.py` / `test_nimbus.py` | 56 unit tests; no network / aiohttp / GPU needed |
 
 ## Architecture
 
@@ -88,7 +88,7 @@ All measured on the GPU host, Qwen3.6-35B-A3B, `burst_300`, n = 756:
 | 4 | `random` end-to-end: fraction 29.4 % vs target 30 %, billing recomputes exactly, local bills $0 | ✅ |
 | 5 | Null cloud: `routed_only` excluded from SLO stats; `--max-tokens` mirrors the payload | ✅ unit tests |
 | 6 | **nimbus neutrality**: with free capacity, 0 kicks, ≡ all_local | ✅ p50 113 vs 112 ms (measured pre-revert; at no pressure old and corrected policies are identical — 0 kicks either way; ticks now fire per arrival since kick-before-dispatch) |
-| 7 | **nimbus under pressure** (slots=4, KV budget 3k): self-selected 29.0 % outsourcing, local SLO violations **0 %** vs **91.1 %** for all_local under the identical constraint (p50 435 ms vs 32.8 s) | ⚠️ measured with the PRE-REVERT ($-knapsack) policy — mechanism demonstration only; re-measure with the corrected CacheDisp policy on the extreme_burst cell (queued, pending GPU reset) |
+| 7 | Historical pre-v3 max-displacement run on compute-bound `extreme_burst_1200`: nimbus 25.6 % outsourced, local p50 12.4 s vs random-at-25.3 % 108.7 s (all-local 325 s), but all policies still had very high local SLO violations | ⚠️ selection signal only, **not v3 validation**: the workload was compute/slot-bound, outside v3's explicitly KV-bound scope |
 
 ## Non-goals (the boundary is the design)
 
@@ -101,21 +101,34 @@ All measured on the GPU host, Qwen3.6-35B-A3B, `burst_300`, n = 756:
 implemented: the nimbus kick check runs BEFORE dispatch, so under
 `--policy nimbus` a saturated engine sheds new arrivals even with free slots.)
 
-## The nimbus policy (`--policy nimbus --kv-capacity-tokens N`)
+## The Nimbus v3 policy (`--policy nimbus --kv-capacity-tokens N`)
 
 Queue-level shedding, adjudicated BEFORE local dispatch on every
-arrival/completion. Semantics — the CacheDisp core (reaffirmed 2026-07-09
-after review caught an implementation drift):
+arrival/completion. The authoritative design is
+[`docs/notion_algorithm_design_v3.md`](../docs/notion_algorithm_design_v3.md).
+The online rule is:
 
 ```
-displacement(req) ≈ prompt_tokens × (prefill_time + decode_tokens × TPOT)   [token·s]
-while Σ token_footprint(waiting) > K_avail(/metrics):
-    kick the LARGEST displacer
+footprint(req)    = local_prompt_tokens + expected_decode                 [tokens]
+residence(req)    = local_prompt_tokens / prefill_tput + expected_decode × TPOT
+displacement(req) = footprint(req) × residence(req)                      [token·s]
+
+G = max(0, Σ footprint(waiting) + Σ remaining_decode(inflight) - K_headroom)
+release_target = G + 0.05 × K_headroom
+
+if G > 0:
+    kick by ascending cloud_cost(req) / displacement(req)
+    until Σ footprint(kicked) >= release_target
 ```
 
-Shed the requests that pin the most cache for the longest — API cost does not
-enter the shed rule (it belongs to the frontier comparison). Cost-aware
-knapsack variants (minimize cloud $ s.t. enough displacement released, or
-maximize released displacement s.t. a cloud budget) are planned ablations;
-`solve_knapsack`/`value_usd` are retained for them. Remaining open knob: the
-trigger (fits-in-KV vs SLO-bound head wait = Notion decision 2).
+Footprint and real `/metrics` headroom share the same unit and decide whether
+the queue fits. Displacement enters only the victim ordering; cloud price makes
+that ordering cost-aware. A 5 % release margin prevents immediate retriggering.
+For Nimbus local calls, the sender enables vLLM continuous usage stats and
+tracks exact cumulative generated tokens; it never treats MTP content chunks
+as individual tokens.
+
+This policy is deliberately **KV-bound**. Compute/slot-bound overload requires a
+separate trigger and is not silently treated as KV pressure. No online
+knapsack solver runs in v3; an exact cover-form DP is planned as an offline
+evaluation reference and is not yet implemented.

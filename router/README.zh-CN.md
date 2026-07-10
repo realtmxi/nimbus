@@ -13,8 +13,8 @@
 |---|---|
 | `run.py` | **唯一入口**:外部 FIFO + work-conserving dispatcher + KV 读数器 + CLI |
 | `common.py` | 共享库:`one_request`/`load_trace`/`SCENARIOS`(逐行取自 `vllm/run.py` @ `dff1a81`)、`Endpoint`、`Policy`、`NullCloud`、计费、`summarize` |
-| `nimbus.py` | nimbus 甩负载 policy:等待集合超出真实 KV 余量时,踢 displacement 最大的请求(`--policy nimbus --kv-capacity-tokens N`);背包 solver 为成本感知消融保留 |
-| `test_run.py` / `test_common.py` / `test_nimbus.py` | 52 个单元测试,无需网络/aiohttp/GPU |
+| `nimbus.py` | Nimbus v3:物理 KV 缺口触发 + cost/displacement 密度排序(`--policy nimbus --kv-capacity-tokens N`) |
+| `test_run.py` / `test_common.py` / `test_nimbus.py` | 56 个单元测试,无需网络/aiohttp/GPU |
 
 ## 架构
 
@@ -77,7 +77,7 @@ baseline = **Jialu 的 `vllm/run.py`**(团队已验证的 open-loop 压测)。�
 | 4 | random 端到端:比例 29.4%/目标 30%、计费重算精确相等、local 侧 $0 | ✅ |
 | 5 | null cloud:`routed_only` 不进 SLO 统计、`--max-tokens` 与 payload 语义一致 | ✅ 单元测试 |
 | 6 | **nimbus 中立性**:容量充足时 0 踢出,≡ all_local | ✅ p50 113 vs 112ms(旧策略下测得;无压力时新旧策略行为相同——都是 0 踢出;kick 先于 dispatch 后 tick 每次到达都会触发) |
-| 7 | **nimbus 压力测试**(slots=4、KV 预算 3k):自选外包 29.0%,本地 SLO 违约 **0%**,同约束 all_local **91.1%**(p50 435ms vs 32.8s) | ⚠️ **旧($-背包)策略下测得**——仅作机制演示;修正后的 CacheDisp 策略待 GPU 复位后在 extreme_burst 格上复测 |
+| 7 | 历史 pre-v3 max-displacement 在 compute-bound `extreme_burst_1200` 上:nimbus 外包 25.6%、本地 p50 12.4s,random@25.3% 为 108.7s(all-local 325s),但三者本地 SLO 违约仍很高 | ⚠️ 只能说明选择信号,**不是 v3 验证**:该 workload 是 compute/slot-bound,明确超出 v3 的 KV-bound 范围 |
 
 ## 有意不做的事(边界即设计)
 
@@ -90,18 +90,30 @@ baseline = **Jialu 的 `vllm/run.py`**(团队已验证的 open-loop 压测)。�
 nimbus 的 kick 检查在 dispatch **之前**跑,`--policy nimbus` 下引擎饱和时
 即使 slots 空闲,新到达也会被甩。)
 
-## nimbus policy(`--policy nimbus --kv-capacity-tokens N`)
+## Nimbus v3 policy(`--policy nimbus --kv-capacity-tokens N`)
 
-队列级甩负载,每次到达/完成时在本地 dispatch **之前**裁决。语义——CacheDisp
-核心(2026-07-09 review 抓到实现漂移后由 Murphy 重申):
+队列级甩负载,每次到达/完成时在本地 dispatch **之前**裁决。权威设计见
+[`docs/notion_algorithm_design_v3.zh-CN.md`](../docs/notion_algorithm_design_v3.zh-CN.md)。
+在线规则为:
 
 ```
-displacement(req) ≈ prompt_tokens × (prefill时间 + decode_tokens × TPOT)   [token·s]
-while Σ footprint(waiting) > K_avail(/metrics):
-    踢 displacement 最大的请求
+footprint(req)    = local_prompt_tokens + expected_decode                 [tokens]
+residence(req)    = local_prompt_tokens / prefill_tput + expected_decode × TPOT
+displacement(req) = footprint(req) × residence(req)                      [token·s]
+
+G = max(0, Σ footprint(waiting) + Σ remaining_decode(inflight) - K_headroom)
+release_target = G + 0.05 × K_headroom
+
+若 G > 0:
+    按 cloud_cost(req) / displacement(req) 升序踢
+    直到 Σ footprint(kicked) >= release_target
 ```
 
-踢的是"占最多缓存、占最久"的请求——API 成本**不进**踢出规则(它属于 frontier
-对比)。成本感知的背包变体(min 云成本 s.t. 释放足够 displacement / max 释放
-displacement s.t. 云预算)是计划中的消融,`solve_knapsack`/`value_usd` 为此保留。
-剩余开放旋钮:触发条件(装不下 vs 队头等待逼近 SLO,即决策 2)。
+footprint 与 `/metrics` 实读的 headroom 单位一致,共同决定"放不放得下";
+displacement 只进入踢出排序,cloud price 让排序具备成本意识。额外释放 5% headroom
+避免紧接着再次触发。Nimbus 本地请求会启用 vLLM continuous usage stats,按精确累计
+生成 token 数跟踪进度,不再把 MTP content chunk 当作单个 token。
+
+本 policy 明确是 **KV-bound**。compute/slot-bound 过载需要另一套触发信号,不会
+被静默当成 KV 压力。v3 在线不运行背包 solver;精确 cover-form DP 计划作为离线
+评估参考,当前尚未实现。

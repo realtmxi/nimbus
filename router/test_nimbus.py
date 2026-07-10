@@ -5,63 +5,19 @@ Run from the repo root:  python3 -m unittest router.test_nimbus -v
 from __future__ import annotations
 
 import asyncio
-import itertools
 import random
 import unittest
 
-from router.common import Endpoint, NullCloud
+from router.common import DEFAULT_KV_HYSTERESIS_FRACTION, Endpoint, NullCloud
 from router.nimbus import (
     NimbusPolicy,
+    cloud_cost_usd,
     displacement_token_s,
-    solve_knapsack,
+    shedding_score,
     token_footprint,
-    value_usd,
 )
-from router.run import KVMonitor, replay_queued
+from router.run import KVMonitor, _InflightKVTracker, replay_queued
 from router.test_run import LOCAL, CLOUD, RecordingSender, mk_trace
-
-
-def brute_force_keep(items, budget):
-    """Exact reference: max Σvalue s.t. Σweight <= budget (n <= ~12)."""
-    best_v, best_set = 0.0, set()
-    for r in range(len(items) + 1):
-        for combo in itertools.combinations(items, r):
-            w = sum(c[1] for c in combo)
-            v = sum(c[2] for c in combo)
-            if w <= budget and v > best_v:
-                best_v, best_set = v, {c[0] for c in combo}
-    return best_v, best_set
-
-
-class TestKnapsack(unittest.TestCase):
-    def test_matches_brute_force_on_random_instances(self):
-        rng = random.Random(7)
-        for trial in range(30):
-            n = rng.randint(1, 10)
-            items = [(f"r{i}", rng.randint(1, 400), rng.uniform(0.001, 1.0))
-                     for i in range(n)]
-            budget = rng.randint(1, 1200)   # <= scale_to=2048 -> DP is exact
-            keep = solve_knapsack(items, budget)
-            got_v = sum(v for (i, w, v) in items if i in keep)
-            got_w = sum(w for (i, w, v) in items if i in keep)
-            best_v, _ = brute_force_keep(items, budget)
-            self.assertLessEqual(got_w, budget)                    # feasible
-            self.assertAlmostEqual(got_v, best_v, places=9)        # optimal
-
-    def test_scaled_never_exceeds_budget(self):
-        rng = random.Random(11)
-        for trial in range(20):
-            items = [(f"r{i}", rng.randint(100, 60000), rng.uniform(0.001, 1.0))
-                     for i in range(rng.randint(5, 60))]
-            budget = rng.randint(10_000, 300_000)                  # forces scaling
-            keep = solve_knapsack(items, budget)
-            self.assertLessEqual(sum(w for (i, w, v) in items if i in keep), budget)
-
-    def test_edge_cases(self):
-        self.assertEqual(solve_knapsack([], 100), set())
-        self.assertEqual(solve_knapsack([("a", 10, 1.0)], 0), set())
-        self.assertEqual(solve_knapsack([("a", 200, 1.0)], 100), set())  # oversized
-        self.assertEqual(solve_knapsack([("a", 10, 1.0)], 100), {"a"})
 
 
 class TestFormulas(unittest.TestCase):
@@ -69,12 +25,51 @@ class TestFormulas(unittest.TestCase):
 
     def test_hand_computed(self):
         self.assertEqual(token_footprint(self.REQ), 1200)
-        # displacement = prompt * (prompt/tput + decode*tpot) = 1000*(1000/10000 + 200*0.01)
+        # displacement = footprint * residence = 1200*(1000/10000 + 200*0.01)
         self.assertAlmostEqual(
             displacement_token_s(self.REQ, prefill_tput=10000, tpot_s=0.01),
-            1000 * (0.1 + 2.0))
-        self.assertAlmostEqual(value_usd(self.REQ, 0.15, 1.20),
+            1200 * (0.1 + 2.0))
+        self.assertAlmostEqual(cloud_cost_usd(self.REQ, 0.15, 1.20),
                                (1000 * 0.15 + 200 * 1.20) / 1e6)
+
+    def test_prefix_aware_footprint_is_local_but_cloud_cost_uses_full_prompt(self):
+        req = dict(self.REQ, uncached_prompt_tokens=100)
+        self.assertEqual(token_footprint(req), 300)
+        self.assertAlmostEqual(
+            displacement_token_s(req, prefill_tput=10000, tpot_s=0.01),
+            300 * (0.01 + 2.0))
+        self.assertAlmostEqual(cloud_cost_usd(req, 0.15, 1.20),
+                               (1000 * 0.15 + 200 * 1.20) / 1e6)
+
+
+class TestInflightKVTracker(unittest.TestCase):
+    def test_exact_mtp_progress_preserves_peak_commitment(self):
+        tracker = _InflightKVTracker(max_tokens_override=None)
+        req = {
+            "request_id": "mtp",
+            "prompt_tokens": 100,
+            "uncached_prompt_tokens": 20,
+            "max_tokens": 50,
+        }
+        tracker.add(req)
+        self.assertEqual(tracker.predicted_current_tokens, 20)
+        self.assertEqual(tracker.remaining_decode_tokens, 50)
+
+        # One content delta may contain seven MTP-accepted tokens. The exact
+        # cumulative usage, not the one chunk, advances current KV by seven.
+        tracker.update_generated("mtp", 7)
+        self.assertEqual(tracker.predicted_current_tokens, 27)
+        self.assertEqual(tracker.remaining_decode_tokens, 43)
+        self.assertEqual(
+            tracker.predicted_current_tokens + tracker.remaining_decode_tokens,
+            70,
+        )
+
+        tracker.update_generated("mtp", 5)  # out-of-order progress cannot regress
+        self.assertEqual(tracker.remaining_decode_tokens, 43)
+        tracker.remove("mtp")
+        self.assertEqual(tracker.predicted_current_tokens, 0)
+        self.assertEqual(tracker.remaining_decode_tokens, 0)
 
 
 def mk_policy(**kw):
@@ -88,27 +83,50 @@ class TestOnTick(unittest.TestCase):
     def test_no_pressure_no_kicks(self):
         pol = mk_policy()
         waiting = [self.req(i, 500, 100) for i in range(5)]   # footprint 3000
-        self.assertEqual(pol.on_tick(waiting, kv_available_tokens=10_000), [])
+        self.assertEqual(pol.on_tick(waiting, kv_headroom_tokens=10_000), [])
         self.assertEqual(pol.n_outsourced, 0)
 
     def test_kicks_until_fit_and_terminates(self):
         pol = mk_policy()
         waiting = [self.req(i, 1000, 200) for i in range(10)]  # 10 x 1200 = 12000
-        kicked = pol.on_tick(waiting, kv_available_tokens=5000)
+        kicked = pol.on_tick(waiting, kv_headroom_tokens=5000)
         remaining = [r for r in waiting if r not in kicked]
         self.assertLessEqual(sum(token_footprint(r) for r in remaining), 5000)
         self.assertGreater(len(kicked), 0)
 
-    def test_kicks_largest_displacement_first(self):
-        """The CacheDisp core (Murphy 2026-07-09): shed the request that pins
-        the most cache-time, regardless of its API price."""
-        pol = mk_policy()
-        a = self.req("A", 2900, 100)    # displacement ~3,176 token·s
-        b = self.req("B", 1000, 2000)   # displacement ~19,050 token·s -> kicked
-        kicked = pol.on_tick([a, b], kv_available_tokens=3000)   # only one fits
-        self.assertEqual([r["request_id"] for r in kicked], ["B"])
-        kicked2 = pol.on_tick([a, b], kv_available_tokens=100)   # neither fits
-        self.assertEqual([r["request_id"] for r in kicked2], ["B", "A"])
+    def test_kicks_lowest_cost_per_displacement_first(self):
+        """v3 is cost-aware, so max displacement alone does not choose."""
+        pol = mk_policy(hysteresis_fraction=0)
+        cheap_relief = self.req("A", 100, 500)       # lower displacement, lower score
+        max_disp = self.req("B", 10_000, 10)         # larger displacement, higher score
+        self.assertLess(
+            shedding_score(cheap_relief, 20_000, 0.0095, 0.15, 1.20),
+            shedding_score(max_disp, 20_000, 0.0095, 0.15, 1.20),
+        )
+        self.assertGreater(
+            displacement_token_s(max_disp, 20_000, 0.0095),
+            displacement_token_s(cheap_relief, 20_000, 0.0095),
+        )
+        kicked = pol.on_tick(
+            [cheap_relief, max_disp], kv_headroom_tokens=10_010
+        )
+        self.assertEqual([r["request_id"] for r in kicked], ["A"])
+
+    def test_inflight_growth_is_part_of_gap(self):
+        pol = mk_policy(hysteresis_fraction=0)
+        waiting = [self.req("waiting", 80, 20)]       # footprint 100
+        self.assertEqual(pol.on_tick(waiting, 150, inflight_remaining_tokens=0), [])
+        kicked = pol.on_tick(waiting, 150, inflight_remaining_tokens=60)
+        self.assertEqual([r["request_id"] for r in kicked], ["waiting"])
+        self.assertEqual(pol.last_gap_tokens, 10)
+
+    def test_hysteresis_adds_headroom_margin(self):
+        pol = mk_policy(hysteresis_fraction=0.05)
+        waiting = [self.req(i, 80, 20) for i in range(3)]  # total footprint 300
+        kicked = pol.on_tick(waiting, kv_headroom_tokens=250)
+        self.assertEqual(pol.last_gap_tokens, 50)
+        self.assertEqual(pol.last_release_target_tokens, 62.5)
+        self.assertEqual(len(kicked), 1)                    # one 100-token item covers it
 
     def test_arrival_hook_never_outsources(self):
         pol = mk_policy()
@@ -117,29 +135,26 @@ class TestOnTick(unittest.TestCase):
 
 
 class TestReviewRegressions(unittest.TestCase):
-    def test_scaling_boundary_item_stays_candidate(self):
-        """Regression (review): an item that fits alone must never be dropped
-        by ceil-scaling vs floor cap (budget=4097 -> scale=3, cap=1365,
-        ceil(4097/3)=1366 used to be filtered out)."""
-        a = ("A", 4097, 600e-6)
-        b = ("B", 100, 75e-6)
-        keep = solve_knapsack([a, b], budget=4097)
-        self.assertEqual(keep, {"A"})            # optimal: keep the big one
-
-    def test_matches_literal_kick_one_recheck(self):
-        """Batched shedding == literal kick-max-displacement-then-recheck."""
+    def test_matches_literal_v3_density_cover(self):
+        """Policy output equals v3 score ordering until release_target is met."""
         pol = mk_policy()
         rng = random.Random(3)
         waiting = [{"request_id": i, "prompt_tokens": rng.randint(50, 3000),
                     "max_tokens": rng.randint(10, 800)} for i in range(40)]
-        budget = 20_000
-        kicked = [r["request_id"] for r in pol.on_tick(list(waiting), budget)]
-        remaining = list(waiting)
+        headroom = 20_000
+        kicked = [r["request_id"] for r in pol.on_tick(list(waiting), headroom)]
+        total = sum(token_footprint(r) for r in waiting)
+        target = max(0, total - headroom) + 0.05 * headroom
+        ordered = sorted(
+            waiting,
+            key=lambda r: shedding_score(r, 20_000, 0.0095, 0.15, 1.20),
+        )
         ref = []
-        while remaining and sum(token_footprint(r) for r in remaining) > budget:
-            victim = max(remaining,
-                         key=lambda r: displacement_token_s(r, 20000, 0.0095))
-            remaining.remove(victim)
+        released = 0
+        for victim in ordered:
+            if released >= target:
+                break
+            released += token_footprint(victim)
             ref.append(victim["request_id"])
         self.assertEqual(kicked, ref)
 
@@ -195,22 +210,22 @@ class TestCodexRegressions(unittest.TestCase):
         self.assertGreater(pol.ticks, 0)
 
     def test_max_tokens_override_changes_policy_arithmetic(self):
-        """Regression (codex P2): footprint/value/displacement must use the
+        """Regression (codex P2): footprint/cost/displacement must use the
         effective decode (--max-tokens replaces trace), like payload & billing."""
-        from router.nimbus import token_footprint, value_usd, displacement_token_s
+        from router.nimbus import cloud_cost_usd, token_footprint, displacement_token_s
         req = {"request_id": 1, "prompt_tokens": 100, "max_tokens": 1000}
         self.assertEqual(token_footprint(req), 1100)
         self.assertEqual(token_footprint(req, max_tokens_override=1), 101)
-        self.assertAlmostEqual(value_usd(req, 0.15, 1.20, max_tokens_override=1),
+        self.assertAlmostEqual(cloud_cost_usd(req, 0.15, 1.20, max_tokens_override=1),
                                (100 * 0.15 + 1 * 1.20) / 1e6)
         self.assertLess(displacement_token_s(req, 20000, 0.0095, max_tokens_override=1),
                         displacement_token_s(req, 20000, 0.0095))
         # policy-level: with override=1 the 20-req queue fits into 3000 tokens
         pol = mk_policy(max_tokens_override=1)                 # footprint 101 each
         waiting = [dict(req, request_id=i) for i in range(20)]
-        self.assertEqual(pol.on_tick(waiting, kv_available_tokens=3000), [])
+        self.assertEqual(pol.on_tick(waiting, kv_headroom_tokens=3000), [])
         pol2 = mk_policy()                                     # footprint 1100 each
-        self.assertGreater(len(pol2.on_tick(waiting, kv_available_tokens=3000)), 0)
+        self.assertGreater(len(pol2.on_tick(waiting, kv_headroom_tokens=3000)), 0)
 
     def test_kicked_real_cloud_sender_exception_records_failure(self):
         """Regression (codex P2): a raising cloud sender must still produce a
@@ -248,9 +263,17 @@ class TestCodexRegressions(unittest.TestCase):
         base = ["--data", "t", "--scenario", "normal", "--policy", "nimbus",
                 "--local-url", "http://x", "--local-model", "m",
                 "--kv-capacity-tokens", "1000"]
+        self.assertEqual(
+            parse_args(base).kv_hysteresis_fraction,
+            DEFAULT_KV_HYSTERESIS_FRACTION,
+        )
+        self.assertEqual(
+            mk_policy().hysteresis_fraction,
+            DEFAULT_KV_HYSTERESIS_FRACTION,
+        )
         for bad in (["--prefill-tput", "0"], ["--tpot-ms", "-1"],
                     ["--in-price", "-0.1"], ["--cloud-max-concurrency", "-1"],
-                    ["--slo-s", "0"]):
+                    ["--slo-s", "0"], ["--kv-hysteresis-fraction", "1"]):
             with self.assertRaises(SystemExit, msg=bad):
                 parse_args(base + bad)
 
@@ -265,10 +288,10 @@ class TestTickDispatchRace(unittest.TestCase):
         from router.nimbus import NimbusPolicy
 
         class SleepyPolicy(NimbusPolicy):
-            def on_tick(self, waiting, kv):
+            def on_tick(self, waiting, kv, inflight_remaining=0):
                 if len(waiting) >= 2:
                     _time.sleep(0.12)          # slow decision window
-                return super().on_tick(waiting, kv)
+                return super().on_tick(waiting, kv, inflight_remaining)
 
         # r0 small (dispatches first, completes during the slow tick),
         # r1 HUGE displacer at the queue head (the victim),
@@ -310,9 +333,9 @@ class TestStaleDecisionDiscard(unittest.TestCase):
         from router.nimbus import NimbusPolicy
 
         class SleepyPolicy(NimbusPolicy):
-            def on_tick(self, waiting, kv):
+            def on_tick(self, waiting, kv, inflight_remaining=0):
                 _time.sleep(0.12)                  # slow decision window
-                return super().on_tick(waiting, kv)
+                return super().on_tick(waiting, kv, inflight_remaining)
 
         kv_cell = [100.0]     # r0 (footprint 50) fits; r1 (150) does not — yet
 
@@ -361,6 +384,8 @@ class FakeKV:
         self.read_failures = 0
     async def available_tokens(self):
         return self.avail
+    def invalidate(self):
+        pass
 
 
 def run_nimbus2(trace, kv_avail, max_inflight=2, sender=None):
@@ -423,6 +448,57 @@ class TestIntegration(unittest.TestCase):
         # the survivors' footprint respects the budget at each decision point;
         # at least verify SOME requests stayed local under a 600-token budget
         self.assertGreater(len(local), 0)
+
+    def test_runtime_passes_inflight_remaining_decode_to_policy(self):
+        class CapturingPolicy(NimbusPolicy):
+            def __init__(self):
+                super().__init__(prefill_tput=20_000, tpot_s=0.0095)
+                self.seen_remaining = []
+            def on_tick(self, waiting, kv, inflight_remaining=0):
+                self.seen_remaining.append(inflight_remaining)
+                return super().on_tick(waiting, kv, inflight_remaining)
+
+        policy = CapturingPolicy()
+        trace = mk_trace(3)
+        import tempfile
+        from pathlib import Path
+        from router.run import parse_args, replay_queued
+        args = parse_args([
+            "--data", "t", "--scenario", "normal", "--policy", "nimbus",
+            "--local-url", "http://x", "--local-model", "m",
+            "--kv-capacity-tokens", "1000000", "--max-inflight", "1",
+            "--out-dir", str(Path(tempfile.mkdtemp())),
+        ])
+        asyncio.run(replay_queued(
+            args, trace, policy, LOCAL, CLOUD, sink=NullCloud(CLOUD),
+            send_local=RecordingSender(service_s=0.05), kv_monitor=FakeKV(1e9),
+        ))
+        self.assertIn(50, policy.seen_remaining)
+
+    def test_stale_metrics_are_clamped_by_known_local_commitments(self):
+        """A cached full-headroom scrape must not admit beyond capacity."""
+        import tempfile
+        from pathlib import Path
+        from router.run import parse_args, replay_queued
+
+        trace = mk_trace(2)  # each commits 100 prompt + 50 decode = 150 tokens
+        args = parse_args([
+            "--data", "t", "--scenario", "normal", "--policy", "nimbus",
+            "--local-url", "http://x", "--local-model", "m",
+            "--kv-capacity-tokens", "200", "--max-inflight", "1",
+            "--out-dir", str(Path(tempfile.mkdtemp())),
+        ])
+        policy = mk_policy()
+        sender = RecordingSender(service_s=0.05)
+        results, _, _ = asyncio.run(replay_queued(
+            args, trace, policy, LOCAL, CLOUD, sink=NullCloud(CLOUD),
+            send_local=sender, kv_monitor=FakeKV(200),  # stale "all free"
+        ))
+        self.assertEqual(sender.dispatch_order, [0])
+        self.assertEqual(
+            [r["request_id"] for r in results if r["endpoint"] == "cloud"],
+            [1],
+        )
 
 
 class TestKVMonitor(unittest.TestCase):

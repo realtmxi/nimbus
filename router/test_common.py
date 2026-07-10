@@ -136,6 +136,10 @@ class TestOneRequest(unittest.TestCase):
         self.assertEqual(res["endpoint"], "local")
         self.assertEqual(res["cost_usd"], 0.0)        # local is not billed
         self.assertEqual(session.calls[0]["json"]["max_tokens"], 64)
+        self.assertEqual(
+            session.calls[0]["json"]["stream_options"],
+            {"include_usage": True},
+        )
 
     def test_cloud_success_is_billed_from_usage(self):
         res, _ = self.run_req(CLOUD, FakeResp(200, sse_ok()))
@@ -162,6 +166,44 @@ class TestOneRequest(unittest.TestCase):
         asyncio.run(one_request(session, LOCAL, REQ, time.perf_counter(),
                                 max_tokens_override=512))
         self.assertEqual(session.calls[0]["json"]["max_tokens"], 512)
+
+    def test_output_progress_uses_exact_continuous_usage_not_chunk_count(self):
+        mtp_stream = [
+            'data: {"usage":{"prompt_tokens":10,"completion_tokens":3},'
+            '"choices":[{"delta":{"content":"Hello"}}]}\n',
+            'data: {"usage":{"prompt_tokens":10,"completion_tokens":6},'
+            '"choices":[{"delta":{"content":" world"}}]}\n',
+            'data: {"usage":{"prompt_tokens":10,"completion_tokens":6},'
+            '"choices":[]}\n',
+            "data: [DONE]\n",
+        ]
+        session = FakeSession(FakeResp(200, mtp_stream))
+        progress = []
+        result = asyncio.run(one_request(
+            session,
+            LOCAL,
+            REQ,
+            time.perf_counter(),
+            on_output_progress=progress.append,
+        ))
+        self.assertEqual(result["chunks"], 2)
+        self.assertEqual(progress, [3, 6, 6])
+        self.assertGreater(progress[1], result["chunks"])  # MTP: tokens != chunks
+        self.assertTrue(
+            session.calls[0]["json"]["stream_options"]["continuous_usage_stats"]
+        )
+
+    def test_output_progress_fails_if_endpoint_omits_continuous_usage(self):
+        session = FakeSession(FakeResp(200, sse_ok()))
+        result = asyncio.run(one_request(
+            session,
+            LOCAL,
+            REQ,
+            time.perf_counter(),
+            on_output_progress=lambda _generated: None,
+        ))
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_type"], "ProgressUnavailable")
 
     def test_payload_shape_matches_baseline(self):
         payload = make_payload(LOCAL, REQ, None)

@@ -10,10 +10,20 @@ intelligently selects which requests to outsource to cloud APIs based on their
 p50** than FLOP-based outsourcing on the ShareGPT+BurstGPT trace
 (Qwen2.5-7B on RTX PRO 6000 Blackwell).
 
+The current online implementation is `router/`, following
+[`docs/notion_algorithm_design_v3.md`](docs/notion_algorithm_design_v3.md).
+The top-level `nimbus/` package is the legacy FLOP/online-knapsack prototype;
+it is retained only for historical analysis and is not imported by the router.
+
 ## Repository Structure
 
 ```
-nimbus/                          Core algorithm (Python module)
+router/                          Current Nimbus v3 runtime
+  run.py                         External queue, dispatcher, live KV monitor
+  nimbus.py                      KV-gap + cost/displacement shedding policy
+  common.py                      Trace replay, endpoint, billing, summaries
+
+nimbus/                          Legacy v0 online-knapsack prototype
   decision.py                    OutsourcingEngine: iterative knapsack loop
   knapsack.py                    KnapsackSolver: dp_scaled, fractional, dp, random
   violation_detection.py         TTFT SLO violation detector
@@ -32,13 +42,14 @@ experiments/                     End-to-end trace replay against live SGLang
   run_cachedisp_knee.sh          Knee sweep across outsource fractions
   run_cachedisp_repeats.sh       Multi-seed repeats for error bars
 
-scripts/analysis/                Offline analysis (no GPU required)
-  exp_knapsack_vs_sorting.py     Knapsack vs greedy comparison
+scripts/analysis/                Offline/historical analysis (no GPU required)
+  exp_knapsack_vs_sorting.py     Legacy knapsack vs greedy comparison
   exp_oracle_analysis.py         Why size-based oracle is suboptimal
   exp_motivation_figure.py       Memory-bottleneck motivation figure
   plot_cachedisp_knee.py         Knee sweep plot
 
 docs/
+  notion_algorithm_design_v3.md Current online algorithm specification
   nimbus_v2_pitch.md             Paper pitch (Cache Displacement story)
   tcpo_oracle_design.md          Trace-Clairvoyant Pressure Oracle design
   exp_knapsack_vs_sorting_design.md

@@ -25,7 +25,7 @@ import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 try:  # aiohttp is only needed to actually send requests; unit tests stub the session
     import aiohttp
@@ -43,6 +43,40 @@ SCENARIOS = {
 }
 
 DEFAULT_TIMEOUT_S: float = float(os.environ.get("TIMEOUT_S", "600"))
+DEFAULT_KV_HYSTERESIS_FRACTION: float = 0.05
+
+
+def effective_decode(
+    req: dict[str, Any],
+    max_tokens_override: int | None = None,
+) -> int:
+    """Decode length requested by both real and fake endpoints."""
+    return (
+        int(max_tokens_override)
+        if max_tokens_override is not None
+        else int(req["max_tokens"])
+    )
+
+
+def local_prompt_tokens(req: dict[str, Any]) -> int:
+    """Marginal prompt KV added locally, falling back to the full prompt."""
+    uncached = req.get("uncached_prompt_tokens")
+    if uncached is not None:
+        return int(uncached)
+    return int(req.get("prompt_tokens") or 0)
+
+
+def token_cost_usd(
+    prompt_tokens: int,
+    completion_tokens: int,
+    input_price_per_mtok: float,
+    output_price_per_mtok: float,
+) -> float:
+    """Shared token-price kernel for estimated and measured cloud cost."""
+    return (
+        int(prompt_tokens) * input_price_per_mtok
+        + int(completion_tokens) * output_price_per_mtok
+    ) / 1e6
 
 
 @dataclass(frozen=True)
@@ -132,14 +166,25 @@ def load_trace(path: Path, scenario: str) -> list[dict[str, Any]]:
     return rows
 
 
-def make_payload(endpoint: Endpoint, req: dict[str, Any], max_tokens_override: int | None) -> dict[str, Any]:
-    return {
+def make_payload(
+    endpoint: Endpoint,
+    req: dict[str, Any],
+    max_tokens_override: int | None,
+    *,
+    continuous_usage: bool = False,
+) -> dict[str, Any]:
+    payload = {
         "model": endpoint.model,
         "stream": True,
-        "max_tokens": max_tokens_override if max_tokens_override is not None else req["max_tokens"],
+        "max_tokens": effective_decode(req, max_tokens_override),
         "messages": [{"role": "user", "content": req["prompt"]}],
         "stream_options": {"include_usage": True},
     }
+    if continuous_usage:
+        # vLLM reports exact cumulative accepted-token counts on every stream
+        # chunk, including when MTP emits several tokens in one content delta.
+        payload["stream_options"]["continuous_usage_stats"] = True
+    return payload
 
 
 class NullCloud:
@@ -159,8 +204,7 @@ class NullCloud:
         # exact mirror of make_payload: --max-tokens REPLACES the trace value,
         # and completion_tokens == the payload's max_tokens (an upper bound on
         # what a real call would bill; the fake sink has no model to EOS early).
-        effective = (int(max_tokens_override) if max_tokens_override is not None
-                     else int(req["max_tokens"]))
+        effective = effective_decode(req, max_tokens_override)
         result = {
             "request_id": req["request_id"],
             "arrived_at": req["arrived_at"],
@@ -188,8 +232,12 @@ def compute_cost_usd(endpoint: Endpoint, result: dict[str, Any]) -> float:
         return 0.0
     prompt_tokens = result["prompt_tokens"] or 0
     completion_tokens = result["completion_tokens"] or 0
-    return (prompt_tokens * endpoint.input_price_per_mtok
-            + completion_tokens * endpoint.output_price_per_mtok) / 1e6
+    return token_cost_usd(
+        prompt_tokens,
+        completion_tokens,
+        endpoint.input_price_per_mtok,
+        endpoint.output_price_per_mtok,
+    )
 
 
 async def one_request(
@@ -200,11 +248,15 @@ async def one_request(
     *,
     max_tokens_override: int | None = None,
     timeout_s: float = DEFAULT_TIMEOUT_S,
+    on_output_progress: Callable[[int], None] | None = None,
 ) -> dict[str, Any]:
     """Send one streaming chat-completion and measure TTFT/TPOT/e2e.
 
     SSE parsing, timing and error handling are line-for-line from vllm/run.py
-    one_request; only the endpoint parameterization and billing are new.
+    one_request; endpoint parameterization, billing, and the optional
+    exact cumulative output-progress hook are additive. When the hook is
+    present, the request enables vLLM's continuous usage stats; content chunks
+    are never treated as tokens because MTP may place several tokens in one.
     """
     start = time.perf_counter()
     first_token_time: float | None = None
@@ -249,7 +301,12 @@ async def one_request(
         async with session.post(
             endpoint.url,
             headers=endpoint.headers(),
-            json=make_payload(endpoint, req, max_tokens_override),
+            json=make_payload(
+                endpoint,
+                req,
+                max_tokens_override,
+                continuous_usage=on_output_progress is not None,
+            ),
             timeout=timeout,
         ) as resp:
             result["http_status"] = resp.status
@@ -287,18 +344,36 @@ async def one_request(
                         record_error("StreamError", message)
                         return result
 
+                    completion_progress = None
                     if obj.get("usage"):
                         usage = obj["usage"]
+                        completion_progress = usage.get("completion_tokens")
 
                     choices = obj.get("choices") or []
                     delta = choices[0].get("delta") if choices else {}
                     token = delta.get("content") if isinstance(delta, dict) else ""
 
+                    if (
+                        on_output_progress is not None
+                        and choices
+                        and completion_progress is None
+                    ):
+                        record_error(
+                            "ProgressUnavailable",
+                            "endpoint did not return continuous completion-token "
+                            "usage requested by Nimbus",
+                        )
+                        return result
                     if token:
                         now = time.perf_counter()
                         first_token_time = first_token_time or now
                         chunks += 1
                         output_chars += len(token)
+                    if (
+                        on_output_progress is not None
+                        and completion_progress is not None
+                    ):
+                        on_output_progress(int(completion_progress))
 
                 if done:
                     break
@@ -315,7 +390,6 @@ async def one_request(
         result["prompt_tokens"] = usage.get("prompt_tokens")
         result["completion_tokens"] = usage.get("completion_tokens")
         result["output_chars"] = output_chars
-
         gen_count = result["completion_tokens"] or chunks
         if gen_count and gen_count > 1 and result["ttft_ms"] is not None:
             result["tpot_ms"] = (result["e2e_ms"] - result["ttft_ms"]) / (gen_count - 1)
