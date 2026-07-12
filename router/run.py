@@ -418,7 +418,7 @@ async def replay_queued(
 
         try:
             for req in trace:
-                due = run_start + req["relative_arrival_s"]
+                due = run_start + req["relative_arrival_s"] * args.time_scale
                 wait = due - time.perf_counter()
                 if wait > 0:
                     await asyncio.sleep(wait)
@@ -451,7 +451,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
 
     parser.add_argument("--data", type=Path, required=True)
-    parser.add_argument("--scenario", choices=SCENARIOS, required=True)
+    parser.add_argument("--scenario", choices=[*SCENARIOS, "full"], required=True,
+                        help="BurstGPT window, or 'full' = replay the whole file")
     parser.add_argument("--policy", choices=["all_local", "all_cloud", "random", "nimbus"], required=True)
     parser.add_argument("--fraction", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=0)
@@ -486,6 +487,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--in-price", type=float, default=0.15)
     parser.add_argument("--out-price", type=float, default=1.20)
 
+    parser.add_argument("--time-scale", type=float, default=1.0,
+                        help="multiply arrival offsets (<1 compresses the trace; "
+                             "1.0 = replay at recorded speed)")
     parser.add_argument("--slo-s", type=float, default=5.0)
     parser.add_argument("--max-tokens", type=int, default=None)
     parser.add_argument("--timeout-s", type=float, default=DEFAULT_TIMEOUT_S)
@@ -511,6 +515,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--cloud-max-concurrency must be >= 0 (0 = unlimited)")
     if args.slo_s <= 0 or args.timeout_s <= 0:
         parser.error("--slo-s and --timeout-s must be > 0")
+    if args.time_scale <= 0:
+        parser.error("--time-scale must be > 0")
     needs_local = args.policy in ("all_local", "random", "nimbus")
     needs_cloud = args.policy in ("all_cloud", "random", "nimbus")
     if args.policy == "nimbus" and (args.kv_capacity_tokens is None

@@ -135,8 +135,16 @@ class Policy:
 
 
 def load_trace(path: Path, scenario: str) -> list[dict[str, Any]]:
-    """Load the BurstGPT JSONL slice for a scenario; identical to vllm/run.py."""
-    start, end = SCENARIOS[scenario]
+    """Load the BurstGPT JSONL slice for a scenario; identical to vllm/run.py.
+
+    scenario="full" disables window filtering: the whole file replays with
+    arrivals relative to its first timestamp (for non-BurstGPT traces, e.g.
+    the rednote long-prompt slices, whose arrived_at starts at 0).
+    """
+    if scenario == "full":
+        start, end = float("-inf"), float("inf")
+    else:
+        start, end = SCENARIOS[scenario]
     rows = []
 
     with path.open("r", encoding="utf-8") as f:
@@ -159,6 +167,11 @@ def load_trace(path: Path, scenario: str) -> list[dict[str, Any]]:
                 })
 
     rows.sort(key=lambda x: (x["arrived_at"], x["request_id"]))
+
+    if rows and scenario == "full":
+        first = rows[0]["arrived_at"]
+        for row in rows:
+            row["relative_arrival_s"] = row["arrived_at"] - first
 
     for i, row in enumerate(rows):
         row["request_id"] = i
