@@ -209,6 +209,73 @@ latency — that baseline arm is queue item 3.
 
 ---
 
+## 5a. ADDENDUM 2026-07-13 — dense-model campaign (Option B executed) and the binding-resource principle
+
+Murphy's decision: validate on a pure full-attention model (Qwen3-32B dense)
+using the SAME team workload (ShareGPT + BurstGPT timestamps); the rednote
+slice is dropped from the near-term plan. Executed same day; all results under
+`$MSCRATCH/router_v32b/`, scripts `v32b_accept.sh` / `v32b_eb.sh` /
+`v32b_rand.sh` in `$MSCRATCH`.
+
+**Server**: Qwen3-32B on physical GPU2, FLASH_ATTN, `--max-num-seqs 128`,
+`gpu-memory-utilization 0.95` → `GPU KV cache size: 112,064 tokens`,
+`Maximum concurrency for 40,960 tokens per request: 2.74x` (= 112,064/40,960 —
+self-consistent, unlike the hybrid's 3.07×). Note: GPU0 wedged a THIRD time
+(box renumbers live CUDA devices; vLLM v0.19 rejects UUIDs in
+`CUDA_VISIBLE_DEVICES`) — the launch script now resolves physical GPU2's
+ordinal by UUID via torch at startup, and an NVML `sitecustomize` shim
+(`$MSCRATCH/nvml_shim/`) lets vLLM import past the dead NVML handle.
+
+**Gauge probe on dense (perfect inversion of the hybrid)**: usage == token
+fraction (8-way small → 1.50%, 32-way → 5.95%, 64-way → 11.89% with all 64
+running; 2×8k prompts → 8.14% ≈ one resident 8k prompt's share). The gauge is
+an honest token meter here; no per-sequence slot ceiling (all 64 ran vs the
+hybrid's hard 41).
+
+**Cell results (current-harness semantics: `max_tokens` = trace value)**:
+
+- `burst_1200` (n=2,725): does NOT saturate — all_local TTFT p50 227 ms, 0%
+  violations, peak_inflight 78/128. The teammate's historical 2,262.9 s p50 on
+  this cell came from her FIRST-generation harness which did not cap output
+  length (`eval_count` 221 vs trace 131; reasoning-mode free-run, TPOT
+  degraded to 304 ms). Under capped semantics the cell is calm. v3 neutrality
+  re-confirmed: 2,734 ticks, 0 kicks, numbers identical to all_local.
+- `extreme_burst_1200` (n=11,605) four arms:
+
+| arm | outsourced | local TTFT p50 / p95 | local SLO viol (5 s) | both-sides viol* | cost |
+|---|---|---|---|---|---|
+| all_local | 0% | **620.3 s** / 1,255.7 s | 98.2% | 98.2% | $0 |
+| random @ matched (38%) | 38.0% | 163.7 s / 358.3 s | 96.1% | 97.6% | $1.82 |
+| **v3 nimbus** | 38.6% (self) | **6.40 s** / 11.2 s | **64.1%** | 78.0% | $2.70 |
+
+*both-sides = kicked counted as violations (Section 6 pessimistic bound).
+Engine was slot-bound throughout: peak_inflight 128 pinned, KV peaked ≈69%
+(never the binding resource). TPOT stayed ~101–105 ms in all arms.
+
+**Reading.** v3 beats matched-fraction random by 25× on local p50 — queue-time
+shedding + displacement selection carry enormous value on this cell too. But
+local violations stall at 64%: the trigger "fit the waiting set into free KV"
+stabilizes the queue at exactly free-KV depth (~35k tokens ≈ 59 requests ≈ 6 s
+of wait at this service rate) and stops shedding, while the actual binding
+resource (compute slots) needs a near-empty queue to meet a 5 s TTFT SLO.
+Honest units, wrong resource → systematic under-shed. Cost note: at matched
+fraction v3's victims cost more per head than random's ($2.70 vs $1.82) —
+displacement ordering deliberately exports the biggest requests.
+
+**The two campaigns compose into one principle.** Hybrid 35B: the gauge
+accidentally measured the binding resource (GDN state slots) → trigger landed
+on the true knee → 0.32 s / 0%. Dense 32B: the gauge honestly measures tokens,
+but slots bind → trigger lands on the wrong bar → 6.4 s / 64%. **v3.1 must set
+the admission bar on the binding resource at the operating point** — per-
+resource headroom meters (KV tokens, sequence slots, compute/batch slots) with
+gap taken on the tightest one; the cost/displacement selection layer is
+unchanged and already proven (×25 vs random at matched fraction, twice).
+Option A above is subsumed: resource-generic units are necessary but not
+sufficient — resource *identification* is the missing half. Design note for
+Murphy's sign-off before implementing.
+
+---
+
 ## 6. Cloud-side accounting (headline-metric decision)
 
 The default cloud is a zero-latency fake sink (`--cloud null`): kicked rows are
@@ -220,31 +287,36 @@ A real-cloud leg (`--cloud real …`) is only needed once, pre-submission.
 
 ---
 
-## 7. Experiment queue (in order, each with acceptance criteria)
+## 7. Experiment queue (REVISED 2026-07-13 after the dense campaign)
 
-1. **Calibrate `(a, b)`** for Qwen3.6-35B-A3B: sweep concurrency at fixed token
-   volume and token volume at fixed concurrency; fit `usage ≈ a·seqs + b·tokens`.
-   Extend `tools/kv_gauge_probe.py`. *Accept:* R² > 0.99; `a ≈ 0.024` reproduced;
-   ceiling `⌊1/a⌋ ≈ 41` matches observed max running.
-2. **Resource-generic patch (Option A)**: `router/nimbus.py` quantities → pool
-   fractions; `router/run.py` KVMonitor returns `(1−u)` directly; CLI grows
-   `--resource-a/--resource-b` (token mode = `a 0 --resource-b 1/capacity`
-   preserving today's flags). *Accept:* all unit tests green; token-mode
-   configuration reproduces current behavior on the existing regression tests.
-3. **Re-run leg 1 + baseline arms**: v3(A-units) vs **naive-spill** (usage ≥ τ →
-   kick newest, no selection) vs random@matched-fraction. *Accept:* v3 ≥
-   naive-spill on cost at equal local SLO, or the honest negative is recorded.
-4. **Paper-grade KV/slot-bound cell**: larger rednote slice (500–1,000 requests,
-   natural timestamps, 2–3 load levels via `--time-scale`), 4 arms
-   (all_local / v3 / random@matched / all_cloud), ≥3 seeds, frontier data
-   (violation-vs-cost as shed aggressiveness varies).
-5. **Adopt the Section-6 headline metric** and recompute all cells under it
-   (e.g. rednote probe becomes 66.3% vs 67.5% — the wash is the motivation for
-   frontier tuning, not an embarrassment).
-6. **Ablations**: oracle vs estimated decode length; cost-aware ordering vs pure
-   displacement; offline exact-cover DP bound vs greedy; hysteresis `h` sweep.
+1. **v3.1 design note — binding-resource trigger** (gates everything below):
+   per-resource headroom meters (KV tokens from the gauge; sequence/state slots
+   from `num_requests_running` vs the engine's true ceiling; compute pressure)
+   with the gap computed on the tightest resource; selection layer unchanged.
+   Write the doc revision, get Murphy's sign-off, then implement in
+   `router/nimbus.py` + `router/run.py`. *Accept:* unit tests green; on a
+   token-KV-bound synthetic the behavior reduces to current v3.
+2. **Naive-spill baseline** (still owed): "binding resource full → kick newest,
+   no selection". The 25× random gap twice over suggests selection is the
+   value; naive-spill isolates trigger-vs-selection. *Accept:* three-way
+   (v3.1 / naive-spill / random@matched) on dense extreme_burst_1200.
+3. **Re-run hybrid-35B extreme_burst with v3.1** (slot meter now explicit
+   instead of accidental). *Accept:* ≥ leg-1 numbers (0.32 s / 0% was the
+   accidental optimum) with the trigger firing on the declared resource.
+4. **Load scaling on the team workload** for the frontier: `--time-scale`
+   sweep (e.g. 1.0 / 0.8 / 0.6) × shed-aggressiveness knob, ≥3 seeds →
+   violation-vs-cost frontier per model. (Replaces the rednote plan — Murphy
+   2026-07-13: stay on the team workload.)
+5. **Adopt the Section-6 headline metric** everywhere (both-sides pessimistic
+   bound already applied to the dense table in Section 5a).
+6. **Ablations**: oracle vs estimated decode length; cost-aware ordering vs
+   pure displacement; offline exact-cover DP bound vs greedy; hysteresis `h`
+   sweep.
 7. Deferred review minors: #6 zero-footprint kick guard, #8 `on_tick` recompute
    cleanup, #9 gauge-parse early-exit.
+8. **Tell the teammate about the capped-vs-uncapped discrepancy** (her
+   dense-32B saturation numbers reflect uncapped reasoning output, not the
+   workload) and about the hybrid model's true ~41-sequence ceiling.
 
 ---
 
