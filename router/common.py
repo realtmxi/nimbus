@@ -154,7 +154,7 @@ def load_trace(path: Path, scenario: str) -> list[dict[str, Any]]:
             prompt = obj.get("prompt_text", "")
 
             if start <= arrived_at <= end and prompt:
-                rows.append({
+                row = {
                     "request_id": len(rows),
                     "arrived_at": arrived_at,
                     "relative_arrival_s": arrived_at - start,
@@ -164,7 +164,23 @@ def load_trace(path: Path, scenario: str) -> list[dict[str, Any]]:
                     # used by cloud-sink billing and the queued dispatcher's KV math
                     "prompt_tokens": int(obj.get("num_prefill_tokens") or 0),
                     "session_id": obj.get("session_id"),
-                })
+                }
+                # Optional fields emitted by token-aligned/cache-aware trace
+                # materializers.  Keeping them separate prevents a cumulative
+                # full prompt from being confused with the suffix actually
+                # prefetched on this deployment.
+                for source_key, target_key in (
+                    ("uncached_prompt_tokens", "uncached_prompt_tokens"),
+                    ("num_cached_tokens", "num_cached_tokens"),
+                    ("trace_num_prefill_tokens", "trace_prompt_tokens"),
+                    ("trace_num_decode_tokens", "trace_decode_tokens"),
+                    ("payload_mode", "payload_mode"),
+                    ("cache_mode", "cache_mode"),
+                    ("source_request_index", "source_request_index"),
+                ):
+                    if obj.get(source_key) is not None:
+                        row[target_key] = obj[source_key]
+                rows.append(row)
 
     rows.sort(key=lambda x: (x["arrived_at"], x["request_id"]))
 
@@ -185,6 +201,8 @@ def make_payload(
     max_tokens_override: int | None,
     *,
     continuous_usage: bool = False,
+    temperature: float | None = None,
+    ignore_eos: bool = False,
 ) -> dict[str, Any]:
     payload = {
         "model": endpoint.model,
@@ -197,6 +215,10 @@ def make_payload(
         # vLLM reports exact cumulative accepted-token counts on every stream
         # chunk, including when MTP emits several tokens in one content delta.
         payload["stream_options"]["continuous_usage_stats"] = True
+    if temperature is not None:
+        payload["temperature"] = float(temperature)
+    if ignore_eos:
+        payload["ignore_eos"] = True
     return payload
 
 
@@ -262,6 +284,8 @@ async def one_request(
     max_tokens_override: int | None = None,
     timeout_s: float = DEFAULT_TIMEOUT_S,
     on_output_progress: Callable[[int], None] | None = None,
+    temperature: float | None = None,
+    ignore_eos: bool = False,
 ) -> dict[str, Any]:
     """Send one streaming chat-completion and measure TTFT/TPOT/e2e.
 
@@ -319,6 +343,8 @@ async def one_request(
                 req,
                 max_tokens_override,
                 continuous_usage=on_output_progress is not None,
+                temperature=temperature,
+                ignore_eos=ignore_eos,
             ),
             timeout=timeout,
         ) as resp:

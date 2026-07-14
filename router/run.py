@@ -282,12 +282,16 @@ async def replay_queued(
                 return await one_request(session, endpoint, req, due,
                                          max_tokens_override=args.max_tokens,
                                          timeout_s=args.timeout_s,
-                                         on_output_progress=progress)
+                                         on_output_progress=progress,
+                                         temperature=args.temperature,
+                                         ignore_eos=args.ignore_eos)
         if send_cloud is None:
             async def send_cloud(req, due):  # noqa: F811 - default sender
                 return await one_request(session, cloud, req, due,
                                          max_tokens_override=args.max_tokens,
-                                         timeout_s=args.timeout_s)
+                                         timeout_s=args.timeout_s,
+                                         temperature=args.temperature,
+                                         ignore_eos=args.ignore_eos)
 
         run_start = time.perf_counter()
         f = out.open("w", encoding="utf-8")
@@ -306,6 +310,38 @@ async def replay_queued(
         def record_decision(row: dict[str, Any]) -> None:
             if decision_f is not None:
                 decision_f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+        def prediction_telemetry() -> dict[str, Any]:
+            if getattr(policy, "trigger", None) != "ttft_pred":
+                return {}
+            return {
+                "prediction_scope": "waiting_only",
+                "waiting_predicted_max_ttft_s": getattr(
+                    policy, "last_predicted_max_ttft_s", None
+                ),
+                "waiting_post_kick_max_ttft_s": getattr(
+                    policy, "last_post_kick_max_ttft_s", None
+                ),
+            }
+
+        def annotate_scheduler_estimates(
+            res: dict[str, Any], req: dict[str, Any]
+        ) -> None:
+            """Keep the controller's token view beside endpoint-reported usage.
+
+            A trace/payload mismatch otherwise silently invalidates both the
+            TTFT predictor and displacement ranking while the request itself
+            still succeeds.
+            """
+            res["scheduler_prompt_tokens"] = int(req.get("prompt_tokens") or 0)
+            res["scheduler_uncached_prompt_tokens"] = local_prompt_tokens(req)
+            res["scheduler_decode_tokens"] = effective_decode(req, args.max_tokens)
+            for key in (
+                "trace_prompt_tokens", "trace_decode_tokens",
+                "payload_mode", "cache_mode", "source_request_index",
+            ):
+                if req.get(key) is not None:
+                    res[key] = req[key]
 
         async def serve_local(req: dict[str, Any], arrival_due: float) -> None:
             dispatch_t = time.perf_counter()
@@ -329,6 +365,7 @@ async def replay_queued(
                 invalidate = getattr(kv_monitor, "invalidate", None)
                 if invalidate is not None:
                     invalidate()
+            annotate_scheduler_estimates(res, req)
             queue_delay_ms = max(0.0, (dispatch_t - arrival_due) * 1000)
             service_ttft = res.get("ttft_ms")
             res["queue_delay_ms"] = queue_delay_ms
@@ -374,6 +411,7 @@ async def replay_queued(
                         queue_delay_ms: float = 0.0) -> None:
             if sink is not None:
                 res = sink.serve(req, due, max_tokens_override=args.max_tokens)
+                annotate_scheduler_estimates(res, req)
                 _finalize_cloud(res, queue_delay_ms)
                 record(res)
             else:
@@ -402,6 +440,7 @@ async def replay_queued(
                     cloud_gate_wait_ms = max(
                         0.0, (send_started_at - cloud_queued_at) * 1000
                     )
+                    annotate_scheduler_estimates(res, req)
                     _finalize_cloud(res, queue_delay_ms + cloud_gate_wait_ms)
                     record(res)
                 task = asyncio.create_task(cloud_task())
@@ -417,16 +456,29 @@ async def replay_queued(
         tick_rerun = False
         decision_seq = 0
 
-        async def maybe_kick() -> None:
+        async def maybe_kick(
+            apply_before_s: float | None = None,
+        ) -> bool:
+            """Adjudicate the current queue without crossing a future arrival.
+
+            The arrival producer and policy call share one coroutine.  A
+            policy call that starts before the next cohort but finishes after
+            it must not apply an irreversible cloud route to the old snapshot;
+            return ``False`` so the caller can enqueue every now-due cohort and
+            re-adjudicate the combined candidate set first.
+            """
             nonlocal tick_busy, tick_rerun, decision_seq
             if not has_tick:
-                return
+                return True
             assert inflight_kv is not None
             if tick_busy:
                 tick_rerun = True       # missed wakeup: re-adjudicate after
-                return
+                return True
             if not queue:
-                return
+                return True
+            if (apply_before_s is not None
+                    and time.perf_counter() >= apply_before_s):
+                return False
             tick_busy = True
             try:
                 retries = 0
@@ -491,6 +543,34 @@ async def replay_queued(
                         policy.decision_calls += 1
                         policy.decision_total_ms += decision_ms
                         policy.decision_max_ms = max(policy.decision_max_ms, decision_ms)
+                    # The producer could not enqueue a future cohort while it
+                    # awaited this executor call.  If that cohort is due now,
+                    # discard even a non-empty victim set before it becomes an
+                    # irreversible cloud route.  The producer immediately
+                    # absorbs due cohorts and calls us again on the fresh set.
+                    if (apply_before_s is not None
+                            and time.perf_counter() >= apply_before_s):
+                        if hasattr(policy, "stale_decisions"):
+                            policy.stale_decisions += 1
+                        record_decision({
+                            "decision_id": this_decision,
+                            "at_s": time.perf_counter() - run_start,
+                            "status": "stale_future_arrival",
+                            "trigger": getattr(policy, "trigger", None),
+                            "selector": getattr(policy, "selector", None),
+                            "snapshot_n": len(snapshot),
+                            "snapshot_hash": snapshot_hash,
+                            "inflight_n": (
+                                len(context.inflight_remaining_s)
+                                if context else admission.inflight
+                            ),
+                            **prediction_telemetry(),
+                            "proposed_victim_ids": [
+                                v["request_id"] for v in victims
+                            ],
+                            "decision_ms": decision_ms,
+                        })
+                        return False
                     if (progress_version is not None
                             and inflight_kv.version != progress_version):
                         tick_rerun = True
@@ -511,8 +591,7 @@ async def replay_queued(
                             "snapshot_n": len(snapshot),
                             "snapshot_hash": snapshot_hash,
                             "inflight_n": len(context.inflight_remaining_s) if context else admission.inflight,
-                            "predicted_max_ttft_s": getattr(policy, "last_predicted_max_ttft_s", None),
-                            "post_kick_max_ttft_s": getattr(policy, "last_post_kick_max_ttft_s", None),
+                            **prediction_telemetry(),
                             "proposed_victim_ids": [v["request_id"] for v in victims],
                             "decision_ms": decision_ms,
                         })
@@ -545,8 +624,7 @@ async def replay_queued(
                         "snapshot_n": len(snapshot),
                         "snapshot_hash": snapshot_hash,
                         "inflight_n": len(context.inflight_remaining_s) if context else admission.inflight,
-                        "predicted_max_ttft_s": getattr(policy, "last_predicted_max_ttft_s", None),
-                        "post_kick_max_ttft_s": getattr(policy, "last_post_kick_max_ttft_s", None),
+                        **prediction_telemetry(),
                         "proposed_victim_ids": [v["request_id"] for v in victims],
                         "applied_victim_ids": applied_ids,
                         "decision_ms": decision_ms,
@@ -556,6 +634,7 @@ async def replay_queued(
                     retries = 0             # applied; handle the new events
             finally:
                 tick_busy = False
+            return True
 
         periodic_tick_s = (
             args.nimbus_tick_ms / 1000.0
@@ -574,24 +653,64 @@ async def replay_queued(
                     return
                 await asyncio.sleep(min(wait, periodic_tick_s))
                 if queue:
-                    await maybe_kick()
+                    if not await maybe_kick(due):
+                        return
                     maybe_dispatch()
 
         try:
-            for req in trace:
-                due = run_start + req["relative_arrival_s"] * args.time_scale
+            # BurstGPT timestamps are integer seconds, so several requests can
+            # be genuinely simultaneous.  Form the whole arrival cohort before
+            # adjudication: deciding and dispatching one row at a time makes the
+            # first rows irrevocably in-flight and leaves selectors with a
+            # one-item "choice" (an invalid selector experiment).
+            cohort_start = 0
+            while cohort_start < len(trace):
+                due = run_start + (
+                    trace[cohort_start]["relative_arrival_s"] * args.time_scale
+                )
                 await wait_for_arrival(due)
 
-                if policy.outsource(req):
-                    route_cloud(req, due)
-                else:
-                    queue.append((req, due))
-                    admission.peak_waiting = max(admission.peak_waiting, len(queue))
-                    # policy adjudicates BEFORE local admission: with a real KV
-                    # signal this is KV-aware admission — a saturated engine
-                    # (avail ~ 0) sheds new arrivals even while slots are free
-                    await maybe_kick()
-                    maybe_dispatch()
+                # Absorb every cohort due as of one clock sample. If policy
+                # computation crosses the following arrival, maybe_kick()
+                # returns False without applying victims and this loop expands
+                # the candidate set before trying again.
+                while True:
+                    now = time.perf_counter()
+                    while cohort_start < len(trace):
+                        relative_arrival_s = trace[cohort_start][
+                            "relative_arrival_s"
+                        ]
+                        cohort_due = run_start + (
+                            relative_arrival_s * args.time_scale
+                        )
+                        if cohort_due > now:
+                            break
+                        cohort_end = cohort_start + 1
+                        while (cohort_end < len(trace)
+                               and trace[cohort_end]["relative_arrival_s"]
+                               == relative_arrival_s):
+                            cohort_end += 1
+                        for req in trace[cohort_start:cohort_end]:
+                            if policy.outsource(req):
+                                route_cloud(req, cohort_due)
+                            else:
+                                queue.append((req, cohort_due))
+                        admission.peak_waiting = max(
+                            admission.peak_waiting, len(queue)
+                        )
+                        cohort_start = cohort_end
+
+                    next_due = (
+                        run_start
+                        + trace[cohort_start]["relative_arrival_s"] * args.time_scale
+                        if cohort_start < len(trace) else None
+                    )
+                    if await maybe_kick(next_due):
+                        break
+
+                # Only a decision that completed before the next arrival may
+                # make the retained cohort irrevocably in-flight.
+                maybe_dispatch()
 
             # drain: everything left in queue/in flight completes through the
             # same dispatcher (completions re-trigger maybe_dispatch)
@@ -690,6 +809,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "1.0 = replay at recorded speed)")
     parser.add_argument("--slo-s", type=float, default=5.0)
     parser.add_argument("--max-tokens", type=int, default=None)
+    parser.add_argument("--temperature", type=float, default=None,
+                        help="optional sampling override sent to real endpoints")
+    parser.add_argument("--ignore-eos", action="store_true",
+                        help="force generation to the requested cap (controlled "
+                             "residence experiment; requires endpoint support)")
     parser.add_argument("--timeout-s", type=float, default=DEFAULT_TIMEOUT_S)
     parser.add_argument("--out-dir", type=Path, default=Path("results"))
     parser.add_argument("--output", type=Path, default=None)
@@ -726,6 +850,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--prefill-tput must be > 0")
     if args.tpot_ms < 0:
         parser.error("--tpot-ms must be >= 0")
+    if args.temperature is not None and args.temperature < 0:
+        parser.error("--temperature must be >= 0")
     if not 0.0 <= args.kv_hysteresis_fraction < 1.0:
         parser.error("--kv-hysteresis-fraction must be in [0,1)")
     if args.ttft_guard_ms < 0 or args.ttft_guard_ms >= args.slo_s * 1000.0:
@@ -790,15 +916,93 @@ def queue_stats(results: list[dict[str, Any]], admission: LocalAdmission,
             if decision_calls else 0.0
         )
         stats["nimbus_decision_max_ms"] = getattr(policy, "decision_max_ms", 0.0)
-        stats["nimbus_max_predicted_ttft_s"] = getattr(
-            policy, "max_predicted_ttft_s_seen", None
-        )
-        stats["nimbus_max_post_kick_ttft_s"] = getattr(
-            policy, "max_post_kick_ttft_s_seen", None
-        )
+        if getattr(policy, "trigger", None) == "ttft_pred":
+            stats["nimbus_prediction_scope"] = "waiting_only"
+            stats["nimbus_max_waiting_predicted_ttft_s"] = getattr(
+                policy, "max_predicted_ttft_s_seen", None
+            )
+            stats["nimbus_max_waiting_post_kick_ttft_s"] = getattr(
+                policy, "max_post_kick_ttft_s_seen", None
+            )
     if kv_monitor is not None:
         stats["kv_read_failures"] = kv_monitor.read_failures
     return stats
+
+
+def token_alignment_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compare controller token metadata with endpoint-reported usage."""
+    local_success = [
+        r for r in results
+        if r.get("success") and r.get("endpoint") == "local"
+        and not r.get("routed_only")
+    ]
+    prompt_pairs = [
+        (int(r["scheduler_prompt_tokens"]), int(r["prompt_tokens"]))
+        for r in local_success
+        if r.get("scheduler_prompt_tokens") is not None
+        and r.get("prompt_tokens") is not None
+    ]
+    decode_pairs = [
+        (int(r["scheduler_decode_tokens"]), int(r["completion_tokens"]))
+        for r in local_success
+        if r.get("scheduler_decode_tokens") is not None
+        and r.get("completion_tokens") is not None
+    ]
+    if not prompt_pairs and not decode_pairs:
+        return {"measured_n": 0}
+
+    absolute_errors = sorted(
+        abs(actual - expected) for expected, actual in prompt_pairs
+    )
+    relative_errors = sorted(
+        abs(actual - expected) / expected
+        for expected, actual in prompt_pairs
+        if expected > 0
+    )
+    ratios = sorted(
+        actual / expected for expected, actual in prompt_pairs if expected > 0
+    )
+    decode_ratios = sorted(
+        actual / expected for expected, actual in decode_pairs if expected > 0
+    )
+
+    def pct(values: list[float], q: float) -> float | None:
+        if not values:
+            return None
+        return values[min(len(values) - 1, max(0, int(round(q * (len(values) - 1)))))]
+
+    return {
+        "local_success_n": len(local_success),
+        "measured_n": len(prompt_pairs),
+        "missing_prompt_usage_n": len(local_success) - len(prompt_pairs),
+        "prompt_exact_n": sum(
+            expected == actual for expected, actual in prompt_pairs
+        ),
+        "prompt_exact_fraction": (
+            sum(expected == actual for expected, actual in prompt_pairs)
+            / len(prompt_pairs) if prompt_pairs else None
+        ),
+        "absolute_error_p50_tokens": pct(absolute_errors, 0.50),
+        "absolute_error_p95_tokens": pct(absolute_errors, 0.95),
+        "absolute_error_max_tokens": (
+            absolute_errors[-1] if absolute_errors else None
+        ),
+        "relative_error_p50": pct(relative_errors, 0.50),
+        "relative_error_p95": pct(relative_errors, 0.95),
+        "actual_over_scheduler_p50": pct(ratios, 0.50),
+        "actual_over_scheduler_p95": pct(ratios, 0.95),
+        "decode_measured_n": len(decode_pairs),
+        "missing_completion_usage_n": len(local_success) - len(decode_pairs),
+        "decode_cap_hit_n": sum(
+            expected == actual for expected, actual in decode_pairs
+        ),
+        "decode_cap_hit_fraction": (
+            sum(expected == actual for expected, actual in decode_pairs)
+            / len(decode_pairs) if decode_pairs else None
+        ),
+        "completion_over_scheduler_p50": pct(decode_ratios, 0.50),
+        "completion_over_scheduler_p05": pct(decode_ratios, 0.05),
+    }
 
 
 async def main() -> None:
@@ -826,12 +1030,15 @@ async def main() -> None:
     results, admission, kv_mon = await replay_queued(args, trace, policy, local, cloud, sink)
     summary = summarize(results, policy, args.slo_s)
     summary["queue"] = queue_stats(results, admission, policy, kv_mon)
+    summary["token_alignment"] = token_alignment_stats(results)
     summary["config"] = {
         "scenario": args.scenario,
         "seed": args.seed,
         "time_scale": args.time_scale,
         "max_inflight": args.max_inflight,
         "max_tokens_override": args.max_tokens,
+        "temperature": args.temperature,
+        "ignore_eos": args.ignore_eos,
         "nimbus_trigger": args.nimbus_trigger,
         "nimbus_selector": args.nimbus_selector,
         "prefill_tput": args.prefill_tput,
@@ -843,6 +1050,10 @@ async def main() -> None:
         "kv_hysteresis_fraction": args.kv_hysteresis_fraction,
         "cloud": args.cloud,
         "cloud_max_concurrency": args.cloud_max_concurrency,
+        "local_url": args.local_url,
+        "local_model": args.local_model,
+        "in_price": args.in_price,
+        "out_price": args.out_price,
     }
 
     out = resolve_output_path(args)

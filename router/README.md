@@ -14,7 +14,7 @@ policy, recording latency, cost, and the split. Single entry point:
 | `run.py` | **The entry point**: external FIFO + work-conserving dispatcher + KV monitor + CLI |
 | `common.py` | Shared library: `one_request` / `load_trace` / `SCENARIOS` (line-for-line from `vllm/run.py` @ `dff1a81`), `Endpoint`, `Policy`, `NullCloud`, billing, `summarize` |
 | `nimbus.py` | Nimbus v3 baseline plus orthogonal KV-gap / predicted-TTFT triggers and victim-selector ablations |
-| `test_run.py` / `test_common.py` / `test_nimbus.py` | 63 unit tests; no network / aiohttp / GPU needed |
+| `test_run.py` / `test_common.py` / `test_nimbus.py` | 70 unit tests; no network / aiohttp / GPU needed |
 
 ## Architecture
 
@@ -40,6 +40,9 @@ arrival ──Policy (decided at arrival)──cloud──> fake sink (default) 
 - **KV awareness lives in the nimbus policy**, not the dispatcher: the kick
   check runs BEFORE dispatch, and admission is frozen while a shed decision
   is computing (so a completing request can never admit a victim mid-decision)
+- Requests with the same trace timestamp form one arrival cohort. The policy
+  sees the complete cohort before any member is dispatched, so a selector is
+  never benchmarked on a sequence of artificial one-item queues.
 
 ## Cloud sinks
 
@@ -71,7 +74,10 @@ reports `slo_measured_n` — the explicit SLO denominator after `routed_only`
 rows are excluded. `pessimistic_combined` also counts every cloud route as an
 SLO violation, so NullCloud cannot reward over-shedding. Billing: failed
 requests cost $0; the local side always $0. `--decision-log FILE` optionally
-records each applied/stale Nimbus decision and its victim ordering.
+records each applied/stale Nimbus decision and its victim ordering. Raw rows
+also retain `scheduler_prompt_tokens` next to endpoint-reported
+`prompt_tokens`; the summary's `token_alignment` section makes a trace/payload
+unit mismatch visible instead of silently accepting it.
 
 Local tests (no network/GPU): `python3 -m unittest router.test_common router.test_run router.test_nimbus`
 
@@ -154,8 +160,46 @@ Selectors are `newest`, `waiting_random`, `max_cachedisp_old`,
 `cost_cachedisp_old`, and `cost_disp_current`. The two `*_cachedisp_old`
 variants reuse the original v2 weight formula but are heuristic orderings, not
 the historical exact 0/1-knapsack implementation. The current TTFT stop rule
-is diagnostic: it makes all retained local requests predicted-safe, then the
-reported pessimistic-combined metric reveals whether that shedding was
-actually worthwhile. Decode length is still the trace cap (oracle); estimator
-and combined-objective ablations remain follow-up work. The reproducible driver
-is `experiments/run_ttft_selector_matrix.sh`.
+is diagnostic: it makes the retained **waiting-queue survivors** predicted-safe;
+already in-flight requests are outside that post-kick claim, which is why the
+decision log and summary label the scope `waiting_only`. The reported
+pessimistic-combined metric then reveals whether that shedding was actually
+worthwhile. Decode length is still the trace cap (oracle); estimator and
+combined-objective ablations remain follow-up work. The reproducible driver is
+`experiments/run_ttft_selector_matrix.sh`.
+
+### Token-aligned no-cache experiment prerequisite
+
+The primary ShareGPT/BurstGPT file stores cumulative conversation lengths in
+`num_prefill_tokens`, while `prompt_text` is only the current user turn. Direct
+replay can therefore predict 500 tokens and send fewer than 20. Do not use that
+payload for a displacement-selector claim. Materialize a self-consistent
+no-cache trace with the deployment tokenizer, run vLLM with prefix caching
+disabled, and profile the same deployment before selecting parameters:
+
+```bash
+python tools/materialize_token_aligned_trace.py \
+  --input <sharegpt-burstgpt.jsonl> --output <aligned.jsonl> \
+  --scenario extreme_burst_1200 --tokenizer <model-path> \
+  --salt dense32b-nocache-v1 \
+  --max-prompt-tokens 32768 --max-decode-tokens 1024 \
+  --max-context-tokens 40960 --overflow-policy error
+
+python tools/profile_ttft_batch.py \
+  --base-url http://127.0.0.1:8010 --model qwen3-32b \
+  --tokenizer <model-path> --server-log <active-vllm.log> \
+  --server-pid <recorded-pid> \
+  --kv-capacity-tokens <startup-log-token-capacity> \
+  --output <profile.json>
+
+DATA=<aligned.jsonl> BASE_URL=http://127.0.0.1:8010 MODEL=qwen3-32b \
+  PROFILE=<profile.json> SERVER_LOG=<active-vllm.log> SERVER_PID=<recorded-pid> \
+  OUT_DIR=<new-results-dir> experiments/run_ttft_selector_matrix.sh
+```
+
+This leg has `cached_tokens = 0` by construction. A cache-aware workload is a
+separate experiment; these results must not be presented as validating the
+cached-token term of the original formula. The prompt/decode/context caps make
+this a transformed synthetic workload; report the manifest's affected-row
+counts with every result. On a quota-constrained GPU host, point `TMPDIR`,
+`HF_HOME`, and `XDG_CACHE_HOME` at scratch before either command.

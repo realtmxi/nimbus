@@ -21,6 +21,7 @@ from router.common import (
     one_request,
     summarize,
 )
+from tools.materialize_token_aligned_trace import sized_unique_prompt
 
 LOCAL = Endpoint(name="local", url="http://x/v1/chat/completions", model="m")
 CLOUD = Endpoint(name="cloud", url="http://c/v1/chat/completions", model="m",
@@ -105,7 +106,10 @@ class TestLoadTrace(unittest.TestCase):
         rows = [
             {"arrived_at": start + 5, "prompt_text": "b", "num_decode_tokens": 7},
             {"arrived_at": start - 1, "prompt_text": "out-of-window", "num_decode_tokens": 1},
-            {"arrived_at": start + 1, "prompt_text": "a", "num_decode_tokens": 3},
+            {"arrived_at": start + 1, "prompt_text": "a", "num_decode_tokens": 3,
+             "num_prefill_tokens": 20, "uncached_prompt_tokens": 12,
+             "num_cached_tokens": 8, "payload_mode": "token_aligned_unique",
+             "cache_mode": "none", "trace_num_prefill_tokens": 19},
             {"arrived_at": start + 2, "prompt_text": "", "num_decode_tokens": 9},  # empty prompt dropped
             {"arrived_at": end + 1, "prompt_text": "late", "num_decode_tokens": 1},
         ]
@@ -117,6 +121,30 @@ class TestLoadTrace(unittest.TestCase):
         self.assertEqual([r["request_id"] for r in trace], [0, 1])       # reindexed
         self.assertEqual(trace[0]["relative_arrival_s"], 1)
         self.assertEqual(trace[1]["max_tokens"], 7)
+        self.assertEqual(trace[0]["prompt_tokens"], 20)
+        self.assertEqual(trace[0]["uncached_prompt_tokens"], 12)
+        self.assertEqual(trace[0]["num_cached_tokens"], 8)
+        self.assertEqual(trace[0]["trace_prompt_tokens"], 19)
+        self.assertEqual(trace[0]["payload_mode"], "token_aligned_unique")
+
+
+class TestTokenAlignedMaterializer(unittest.TestCase):
+    class WordTokenizer:
+        def apply_chat_template(self, messages, tokenize, add_generation_prompt):
+            self.assertion = (tokenize, add_generation_prompt)
+            return [0] * (8 + len(messages[0]["content"].split()))
+
+    def test_sizes_to_chat_template_and_keeps_requests_unique(self):
+        tokenizer = self.WordTokenizer()
+        a, a_count = sized_unique_prompt(
+            tokenizer, 50, salt="test", source_index=1
+        )
+        b, b_count = sized_unique_prompt(
+            tokenizer, 50, salt="test", source_index=2
+        )
+        self.assertEqual((a_count, b_count), (50, 50))
+        self.assertNotEqual(a, b)
+        self.assertEqual(tokenizer.assertion, (True, True))
 
 
 class TestOneRequest(unittest.TestCase):
@@ -166,6 +194,16 @@ class TestOneRequest(unittest.TestCase):
         asyncio.run(one_request(session, LOCAL, REQ, time.perf_counter(),
                                 max_tokens_override=512))
         self.assertEqual(session.calls[0]["json"]["max_tokens"], 512)
+
+    def test_controlled_residence_sampling_overrides(self):
+        session = FakeSession(FakeResp(200, sse_ok()))
+        asyncio.run(one_request(
+            session, LOCAL, REQ, time.perf_counter(),
+            temperature=0.0, ignore_eos=True,
+        ))
+        payload = session.calls[0]["json"]
+        self.assertEqual(payload["temperature"], 0.0)
+        self.assertIs(payload["ignore_eos"], True)
 
     def test_output_progress_uses_exact_continuous_usage_not_chunk_count(self):
         mtp_stream = [

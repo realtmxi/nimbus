@@ -14,7 +14,7 @@
 | `run.py` | **唯一入口**:外部 FIFO + work-conserving dispatcher + KV 读数器 + CLI |
 | `common.py` | 共享库:`one_request`/`load_trace`/`SCENARIOS`(逐行取自 `vllm/run.py` @ `dff1a81`)、`Endpoint`、`Policy`、`NullCloud`、计费、`summarize` |
 | `nimbus.py` | Nimbus v3 baseline + 正交的 KV-gap / 预测 TTFT 触发器与 victim-selector 消融 |
-| `test_run.py` / `test_common.py` / `test_nimbus.py` | 63 个单元测试,无需网络/aiohttp/GPU |
+| `test_run.py` / `test_common.py` / `test_nimbus.py` | 70 个单元测试,无需网络/aiohttp/GPU |
 
 ## 架构
 
@@ -34,6 +34,8 @@
   为什么队列必须自己维护:引擎只暴露排队**计数**(vLLM `/metrics` 三个 gauge,已对
   v0.19 源码验证),不暴露排队者身份;选择性外包需要名单
 - **KV 意识在 nimbus policy 里**,不在 dispatcher:kick 检查先于 dispatch,且甩负载决策计算期间 admission 冻结(正在完成的请求不可能把待踢者放进本地)
+- 同一 trace 时间戳的请求先组成一个完整 arrival cohort,policy 看完整批后才 dispatch;
+  selector 不会再被拿去比较一串人为制造的单候选队列。
 
 ## 云 sink 两档
 
@@ -60,7 +62,9 @@ python -m router.run --data <trace.jsonl> --scenario burst_300 \
 每段都带 `slo_measured_n`——排除 `routed_only` 后的 SLO 显式分母。
 `pessimistic_combined` 另把每条 cloud route 都算作违约,避免 NullCloud 奖励
 过度外包。计费:失败请求 $0;local 侧恒 $0。可用 `--decision-log FILE` 记录
-每次应用/作废的 Nimbus 决策及 victim 顺序。
+每次应用/作废的 Nimbus 决策及 victim 顺序。逐请求结果还会并排记录
+`scheduler_prompt_tokens` 与 endpoint 实报 `prompt_tokens`;summary 的
+`token_alignment` 会把 trace/payload 单位错位显式暴露出来。
 
 本地测试(无需网络/GPU):`python3 -m unittest router.test_common router.test_run router.test_nimbus`
 
@@ -136,6 +140,42 @@ python -m router.run ... --policy nimbus \
 selector 有 `newest`、`waiting_random`、`max_cachedisp_old`、
 `cost_cachedisp_old`、`cost_disp_current`。两个 `*_cachedisp_old` 只复用原 v2
 weight 公式做启发式排序,**不是**历史完整 0/1-knapsack 实现。当前 TTFT stop rule
-是诊断口径:把留下的本地请求压到预测不违约,再由悲观 combined 指标判断这次外包
-是否值得。decode 长度仍取 trace 上限(oracle);估计器与 combined-objective 消融是
-后续项。可复现 driver 为 `experiments/run_ttft_selector_matrix.sh`。
+是诊断口径:只把留下的**等待队列 survivors**压到预测不违约;已经 in-flight 的
+请求不在这个 post-kick 声明里,因此 decision log/summary 明确标作
+`prediction_scope=waiting_only`。再由悲观 combined 指标判断这次外包是否值得。
+decode 长度仍取 trace 上限(oracle);估计器与 combined-objective 消融是后续项。
+可复现 driver 为 `experiments/run_ttft_selector_matrix.sh`。
+
+### token 对齐的 no-cache 实验前置条件
+
+主 ShareGPT/BurstGPT 文件的 `num_prefill_tokens` 是累计会话长度,但
+`prompt_text` 只有当前 user turn。直接重放可能出现“调度器按 500 tokens 计算、
+HTTP 实际不到 20 tokens”,不能拿来证明 displacement selector。应先用部署的
+tokenizer 物化一份自洽 no-cache trace,以关闭 prefix cache 的 vLLM 运行,并在同一
+部署上标定参数:
+
+```bash
+python tools/materialize_token_aligned_trace.py \
+  --input <sharegpt-burstgpt.jsonl> --output <aligned.jsonl> \
+  --scenario extreme_burst_1200 --tokenizer <model-path> \
+  --salt dense32b-nocache-v1 \
+  --max-prompt-tokens 32768 --max-decode-tokens 1024 \
+  --max-context-tokens 40960 --overflow-policy error
+
+python tools/profile_ttft_batch.py \
+  --base-url http://127.0.0.1:8010 --model qwen3-32b \
+  --tokenizer <model-path> --server-log <active-vllm.log> \
+  --server-pid <recorded-pid> \
+  --kv-capacity-tokens <startup-log-token-capacity> \
+  --output <profile.json>
+
+DATA=<aligned.jsonl> BASE_URL=http://127.0.0.1:8010 MODEL=qwen3-32b \
+  PROFILE=<profile.json> SERVER_LOG=<active-vllm.log> SERVER_PID=<recorded-pid> \
+  OUT_DIR=<new-results-dir> experiments/run_ttft_selector_matrix.sh
+```
+
+这条腿按构造满足 `cached_tokens = 0`。cache-aware workload 必须另跑;不能把
+这条腿的结果写成“已经验证旧公式里的 cached-token 项”。prompt/decode/context
+cap 使它成为变换后的 synthetic workload,每次汇报都必须带 manifest 中受影响
+行数。GPU 箱若 home quota 紧张,两个命令前都要把 `TMPDIR`、`HF_HOME`、
+`XDG_CACHE_HOME` 指向 scratch。

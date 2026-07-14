@@ -16,6 +16,7 @@ from router.run import (
     parse_args,
     queue_stats,
     replay_queued,
+    token_alignment_stats,
 )
 
 LOCAL = Endpoint(name="local", url="http://x", model="m")
@@ -137,6 +138,37 @@ class TestWorkConserving(unittest.TestCase):
 
 
 class TestCloudPath(unittest.TestCase):
+    def test_token_alignment_exposes_scheduler_payload_mismatch(self):
+        stats = token_alignment_stats([
+            {"success": True, "routed_only": False, "endpoint": "local",
+             "scheduler_prompt_tokens": 554, "prompt_tokens": 18,
+             "scheduler_decode_tokens": 7, "completion_tokens": 7},
+            {"success": True, "routed_only": False, "endpoint": "local",
+             "scheduler_prompt_tokens": 13, "prompt_tokens": 21,
+             "scheduler_decode_tokens": 9, "completion_tokens": 8},
+            {"success": True, "routed_only": True,
+             "scheduler_prompt_tokens": 99, "prompt_tokens": 1},
+            {"success": True, "routed_only": False, "endpoint": "cloud",
+             "scheduler_prompt_tokens": 1000, "prompt_tokens": 1},
+        ])
+        self.assertEqual(stats["measured_n"], 2)
+        self.assertEqual(stats["absolute_error_max_tokens"], 536)
+        self.assertGreater(stats["relative_error_p50"], 0)
+        self.assertEqual(stats["decode_measured_n"], 2)
+        self.assertEqual(stats["decode_cap_hit_n"], 1)
+
+    def test_token_alignment_handles_completion_usage_without_prompt_usage(self):
+        stats = token_alignment_stats([
+            {"success": True, "routed_only": False, "endpoint": "local",
+             "scheduler_prompt_tokens": 20, "prompt_tokens": None,
+             "scheduler_decode_tokens": 8, "completion_tokens": 8},
+        ])
+        self.assertEqual(stats["measured_n"], 0)
+        self.assertEqual(stats["missing_prompt_usage_n"], 1)
+        self.assertIsNone(stats["absolute_error_max_tokens"])
+        self.assertEqual(stats["decode_measured_n"], 1)
+        self.assertEqual(stats["decode_cap_hit_n"], 1)
+
     def test_random_split_with_null_cloud(self):
         from router.common import NullCloud
         args = mk_args(policy="random", fraction=0.4)
@@ -163,6 +195,10 @@ class TestCloudPath(unittest.TestCase):
         out = resolve_output_path(args)
         lines = [json.loads(l) for l in out.read_text().splitlines()]
         self.assertEqual(len(lines), 3)
+        for row in lines:
+            self.assertEqual(row["scheduler_prompt_tokens"], 100)
+            self.assertEqual(row["scheduler_uncached_prompt_tokens"], 100)
+            self.assertEqual(row["scheduler_decode_tokens"], 50)
         stats = queue_stats(results, admission)
         self.assertIn("queue_delay_p50_ms", stats)
         self.assertGreaterEqual(stats["peak_inflight"], 1)

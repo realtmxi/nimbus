@@ -16,23 +16,27 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
 ## 1. TL;DR
 
 1. The `router/` framework (external FIFO + work-conserving dispatcher + policies)
-   is validated layer-by-layer against the team's trusted open-loop harness
-   (parity ratio 1.003; queue neutrality 110 vs 111 ms). 63/63 unit tests, no GPU needed.
-2. v3 nimbus on the team's hardest cell (`extreme_burst_1200`, n=11,605) produced
-   a spectacular headline: **34% self-selected outsourcing, local TTFT p50
-   325 s → 0.32 s, SLO violations 97.9% → 0.0%**, cost $1.79.
-3. **But a post-hoc audit found the trigger fired for a different reason than
-   designed** (Section 4): on Qwen3.6-35B-A3B — a hybrid GDN/linear-attention
-   model — vLLM's `kv_cache_usage_perc` gauge tracks a **per-sequence state-slot
-   pool (~2.4%/seq, saturating at ~41 concurrent)**, not tokens. v3 accidentally
-   became an adaptive concurrency governor. The numbers are real; the mechanism
-   is not the token-KV story in the design doc.
-4. Direct corollary the team should know: on this model the engine's true
-   concurrency ceiling is **~41, not `max_num_seqs=128`** — all prior saturation
-   experiments on it are state-slot-bound, not compute-bound as we assumed.
-5. Pending decision (Murphy): generalize the algorithm's units to "fraction of
-   the binding resource" (recommended, small change) vs. moving the KV-bound
-   story to a pure full-attention model. See Section 5.
+   remains validated against the trusted open-loop harness (parity 1.003; queue
+   neutrality 110 vs 111 ms). **70/70** unit tests pass without network/GPU.
+2. The current experiment keeps **TTFT violation as the trigger**. KV is not the
+   objective and did not replace the original algorithm. The original v2 weight
+   `prompt × (uncached_prompt/prefill_tput + decode×TPOT)` is preserved exactly
+   as selector `cost_cachedisp_old`; trigger and selector are independently
+   switchable.
+3. The July 12–13 headline runs are now **exploratory only, not selector proof**.
+   A July 14 audit found that the scheduler used cumulative trace-token metadata
+   while HTTP often sent only a tiny current-turn prompt; simultaneous arrivals
+   were also decided row-by-row, often leaving the selector one candidate. The
+   recorded latencies are real for those payloads, but claims that displacement
+   caused the win are not identified.
+4. The independent gauge finding remains valid: hybrid Qwen3.6-35B-A3B exposes
+   a per-sequence state pool (~41 concurrent), while dense Qwen3-32B exposes
+   token KV. That explains why a KV-gauge trigger is architecture-dependent; it
+   does **not** imply Nimbus should replace its SLO trigger with KV.
+5. The active evidence path is a token-aligned, synthetic, capped, no-prefix-
+   cache dense-32B rerun: same payload semantics for profiling and matrix;
+   held-out TTFT calibration; then `newest` vs original-v2 displacement vs the
+   current displacement selector under one TTFT stop rule. See Section 5b/7.
 
 ---
 
@@ -43,9 +47,11 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
 | `router/run.py` | Single entry point: external FIFO, work-conserving dispatcher, KV monitor, inflight-KV tracker, CLI |
 | `router/common.py` | Trace loading (BurstGPT windows byte-identical to the trusted `vllm/run.py`; `--scenario full` for arbitrary traces), payloads, SSE client, NullCloud sink, billing, summaries |
 | `router/nimbus.py` | v3 policy: gap trigger + ascending cost/displacement shedding |
-| `router/test_*.py` | 63 unit tests, no network/GPU (`python3 -m unittest router.test_common router.test_run router.test_nimbus`) |
+| `router/test_*.py` | 70 unit tests, no network/GPU (`python3 -m unittest router.test_common router.test_run router.test_nimbus`) |
 | `tools/kv_gauge_probe.py` | Live probe that established the Section-4 finding (stdlib only) |
 | `tools/analyze_eb1200.py` | Timeline reconstruction that flagged the anomaly from a result JSONL |
+| `tools/materialize_token_aligned_trace.py` | Atomic, tokenizer-fingerprinted no-cache trace materializer |
+| `tools/profile_ttft_batch.py` | Same-payload warmup/profile with a held-out scalar calibration artifact |
 
 Validation ladder (all on the GPU box, Qwen3.6-35B-A3B + MTP(5), details in
 [`../router/README.md`](../router/README.md)):
@@ -66,6 +72,12 @@ Server recipe (launch script `start_vllm_qwen36.sh` in `$MSCRATCH`): vLLM v0.19.
 ---
 
 ## 3. Experiment record
+
+> **Evidence-status warning (2026-07-14).** Sections 3.1–3.3 and 5a preserve
+> historical numbers for diagnosis, but direct ShareGPT replay did not align
+> scheduler tokens with endpoint tokens and did not batch simultaneous arrivals.
+> Do not cite them as proof that one displacement selector beats another. Only
+> a token-aligned rerun passing the per-arm usage audit can restore that claim.
 
 ### 3.1 Pre-v3 selection signal (old max-displacement policy, `extreme_burst_1200`)
 
@@ -130,8 +142,10 @@ raw results: `$MSCRATCH/router_v3/v3_nimbus_eb1200.jsonl`):
 - At kick moments: inflight p50 43 (max 55); **KV commitment upper bound p50 =
   20,841 tokens, max = 45,840 — never above 21% of the 216,512-token capacity.**
   Token-KV pressure did not exist at any kick.
-- Selection worked as designed: kicked prompt p50 = 644 vs kept p50 = 28
-  (footprint p50 920 vs 289) — big requests went to the cloud.
+- Scheduler metadata *appeared* selective: kicked prompt p50 = 644 vs kept p50
+  = 28 (footprint p50 920 vs 289). The July-14 payload audit showed these were
+  controller-side cumulative counts, not necessarily the tokens sent to the
+  engine, so this line is not valid selector evidence.
 - Queue essentially empty throughout (p50 6 ms) ⇒ the gap must have come from a
   collapsed `kv_avail`, not from waiting-queue footprint.
 
@@ -252,9 +266,12 @@ hybrid's hard 41).
 Engine was slot-bound throughout: peak_inflight 128 pinned, KV peaked ≈69%
 (never the binding resource). TPOT stayed ~101–105 ms in all arms.
 
-**Reading.** v3 beats matched-fraction random by 25× on local p50 — queue-time
-shedding + displacement selection carry enormous value on this cell too. But
-local violations stall at 64%: the trigger "fit the waiting set into free KV"
+**Historical reading (superseded by the July-14 audit).** v3 beat matched-
+fraction random by 25× on local p50. The runs behaved differently, but the gap
+cannot be attributed to displacement because payload tokens differed from the
+controller metadata and same-second candidates were not adjudicated together.
+Separately, local violations stalled at 64%: the trigger "fit the waiting set
+into free KV"
 stabilizes the queue at exactly free-KV depth (~35k tokens ≈ 59 requests ≈ 6 s
 of wait at this service rate) and stops shedding, while the actual binding
 resource (compute slots) needs a near-empty queue to meet a 5 s TTFT SLO.
@@ -268,11 +285,43 @@ on the true knee → 0.32 s / 0%. Dense 32B: the gauge honestly measures tokens,
 but slots bind → trigger lands on the wrong bar → 6.4 s / 64%. **v3.1 must set
 the admission bar on the binding resource at the operating point** — per-
 resource headroom meters (KV tokens, sequence slots, compute/batch slots) with
-gap taken on the tightest one; the cost/displacement selection layer is
-unchanged and already proven (×25 vs random at matched fraction, twice).
+gap taken on the tightest one. The cost/displacement layer is still a hypothesis
+to re-test on aligned payloads; the old ×25 comparison is not proof.
 Option A above is subsumed: resource-generic units are necessary but not
 sufficient — resource *identification* is the missing half. Design note for
 Murphy's sign-off before implementing.
+
+### 5b. ADDENDUM 2026-07-14 — TTFT-trigger rerun and audit contract
+
+The design decision for the next leg is explicit:
+
+- **Trigger:** predict from-arrival TTFT for the waiting queue and shed only
+  while a retained request is predicted to exceed the 5 s SLO (minus a
+  held-out calibration/tick guard). This is the requested invariant.
+- **Selector under that fixed trigger:** compare `newest` (naive spill),
+  `cost_cachedisp_old` (the original formula exactly), and
+  `cost_disp_current` (current footprint/residence proxy). `waiting_random`
+  seeds are a later variance baseline. The `*_cachedisp_old` ordering is a
+  greedy online selector, not the historical full 0/1 DP; an offline DP oracle
+  remains an ablation.
+- **No-cache scope:** `cached_tokens=0`, vLLM launched with
+  `--no-enable-prefix-caching`. This leg tests TTFT triggering and residence
+  ranking, not the cached-token term. A cache-aware trace is a separate leg.
+- **Workload contract:** prompts are deterministic and tokenizer-sized;
+  prompt target is capped at 32,768, decode at 1,024, and context at 40,960.
+  `temperature=0, ignore_eos=true` makes actual decode residence equal the
+  scheduler cap. The manifest reports how many original rows changed; this is
+  a transformed workload, not verbatim ShareGPT.
+- **Fairness/audit contract:** complete same-timestamp cohorts before choosing;
+  discard a policy decision if it crosses the next arrival; warm twice with
+  independent prompts; bind the matrix to the active server PID/log, endpoint,
+  trace hash, tokenizer fingerprint, KV capacity, max sequences, and held-out
+  profile. Every completed arm requires exact local prompt/decode usage and an
+  atomic completion marker.
+
+The first framework checkpoint is local commit `b930ab2`. The audit-hardening
+checkpoint and GPU results are recorded after they complete; do not substitute
+the historical dense numbers above for them.
 
 ---
 
@@ -287,36 +336,36 @@ A real-cloud leg (`--cloud real …`) is only needed once, pre-submission.
 
 ---
 
-## 7. Experiment queue (REVISED 2026-07-13 after the dense campaign)
+## 7. Experiment queue (REVISED 2026-07-14 after the payload/cohort audit)
 
-1. **v3.1 design note — binding-resource trigger** (gates everything below):
-   per-resource headroom meters (KV tokens from the gauge; sequence/state slots
-   from `num_requests_running` vs the engine's true ceiling; compute pressure)
-   with the gap computed on the tightest resource; selection layer unchanged.
-   Write the doc revision, get Murphy's sign-off, then implement in
-   `router/nimbus.py` + `router/run.py`. *Accept:* unit tests green; on a
-   token-KV-bound synthetic the behavior reduces to current v3.
-2. **Naive-spill baseline** (still owed): "binding resource full → kick newest,
-   no selection". The 25× random gap twice over suggests selection is the
-   value; naive-spill isolates trigger-vs-selection. *Accept:* three-way
-   (v3.1 / naive-spill / random@matched) on dense extreme_burst_1200.
-3. **Re-run hybrid-35B extreme_burst with v3.1** (slot meter now explicit
-   instead of accidental). *Accept:* ≥ leg-1 numbers (0.32 s / 0% was the
-   accidental optimum) with the trigger firing on the declared resource.
-4. **Load scaling on the team workload** for the frontier: `--time-scale`
-   sweep (e.g. 1.0 / 0.8 / 0.6) × shed-aggressiveness knob, ≥3 seeds →
-   violation-vs-cost frontier per model. (Replaces the rednote plan — Murphy
-   2026-07-13: stay on the team workload.)
-5. **Adopt the Section-6 headline metric** everywhere (both-sides pessimistic
-   bound already applied to the dense table in Section 5a).
-6. **Ablations**: oracle vs estimated decode length; cost-aware ordering vs
-   pure displacement; offline exact-cover DP bound vs greedy; hysteresis `h`
-   sweep.
-7. Deferred review minors: #6 zero-footprint kick guard, #8 `on_tick` recompute
-   cleanup, #9 gauge-parse early-exit.
-8. **Tell the teammate about the capped-vs-uncapped discrepancy** (her
-   dense-32B saturation numbers reflect uncapped reasoning output, not the
-   workload) and about the hybrid model's true ~41-sequence ceiling.
+1. **Finish and commit the audit contract.** Atomic token-aligned materializer,
+   complete-cohort/stale-arrival protection, local usage telemetry, no-cache
+   server/profile binding, and completion markers. *Accept:* 70/70 tests,
+   `py_compile`, `bash -n`, and `git diff --check` green.
+2. **Start one dense Qwen3-32B no-cache server and keep one lifecycle.** Record
+   the exact parent PID; verify `enable_prefix_caching=False`, KV capacity, and
+   `max_num_seqs=128`. Warm once/discard and warm independently again. *Accept:*
+   second warm batch below the configured cold-path ceiling; kill only this PID
+   after all arms and verify its children are gone.
+3. **Materialize/profile the transformed extreme trace.** Use the caps and
+   sampling contract in Section 5b, with scratch-backed `TMPDIR`, `HF_HOME`, and
+   `XDG_CACHE_HOME`. *Accept:* trace/manifest hash and line count agree; profile
+   produces positive parameters and a held-out error/tick guard.
+4. **Queue-level held-out smoke before the full matrix.** Run all-local on an
+   independent multi-cohort slice, then one TTFT arm. *Accept:* 100% success,
+   exact prompt/decode usage, no cold-path recurrence, and decision snapshots
+   contain real multi-item choices.
+5. **High-information exploratory comparison:** under the identical TTFT
+   trigger run `newest`, `cost_cachedisp_old`, and `cost_disp_current`, with
+   pessimistic-combined violation and cost as the primary Pareto readout.
+   *Accept:* every arm completion marker valid; no config/trace/profile drift.
+6. **Only if item 5 has separation:** run `waiting_random` with ≥3 seeds and
+   repeat full matrices with randomized arm order. Single-pass deterministic
+   arms are exploratory, not paper error bars.
+7. **Then restore missing semantics:** cache-aware trace for the cached-token
+   term; estimated-vs-oracle decode; historical exact 0/1-DP/offline oracle;
+   load/guard sweeps; real-cloud latency leg. The hybrid binding-resource result
+   remains a separate architecture study, not the TTFT trigger definition.
 
 ---
 
@@ -329,7 +378,7 @@ A real-cloud leg (`--cloud real …`) is only needed once, pre-submission.
   only after reboot; a wedged device poisons CUDA init box-wide).
 - The owner's home dir is **over disk quota**: every launch must redirect
   `TMPDIR`, `TRITON_CACHE_DIR`, `VLLM_CACHE_ROOT`, `TORCHINDUCTOR_CACHE_DIR`,
-  `XDG_CACHE_HOME` to the scratch volume or vLLM dies at startup with a
+  `XDG_CACHE_HOME`, `HF_HOME` to the scratch volume or vLLM dies at startup with a
   misleading "Engine core initialization failed" (real error: `Errno 122`).
   The launch script in `$MSCRATCH` already does all of this — use it.
 - Python for the runner needs `aiohttp`: use the teammate's vllm conda env

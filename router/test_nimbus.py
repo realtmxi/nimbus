@@ -410,6 +410,7 @@ class TestCodexRegressions(unittest.TestCase):
         ]
         self.assertIsNone(parse_args(no_kv).kv_capacity_tokens)
         for bad in (["--prefill-tput", "0"], ["--tpot-ms", "-1"],
+                    ["--temperature", "-0.1"],
                     ["--in-price", "-0.1"], ["--cloud-max-concurrency", "-1"],
                     ["--slo-s", "0"], ["--kv-hysteresis-fraction", "1"],
                     ["--ttft-guard-ms", "5000"], ["--nimbus-tick-ms", "0"]):
@@ -418,6 +419,138 @@ class TestCodexRegressions(unittest.TestCase):
 
 
 class TestTickDispatchRace(unittest.TestCase):
+    def test_simultaneous_arrivals_form_one_selector_cohort(self):
+        """All requests with the same trace timestamp must be visible to one
+        queue decision before any of them becomes irrevocably in-flight."""
+        from router.run import parse_args
+        import tempfile
+        from pathlib import Path
+
+        class RecordingPolicy(NimbusPolicy):
+            def __init__(self):
+                super().__init__(prefill_tput=20_000, tpot_s=0.0095)
+                self.snapshots = []
+
+            def on_tick(self, waiting, kv, inflight_remaining=0, context=None):
+                self.snapshots.append([r["request_id"] for r in waiting])
+                return super().on_tick(waiting, kv, inflight_remaining, context)
+
+        trace = [
+            {"request_id": i, "arrived_at": 1477007, "relative_arrival_s": 0.0,
+             "prompt": f"r{i}", "max_tokens": 10, "prompt_tokens": 40,
+             "session_id": i}
+            for i in range(3)
+        ]
+        out_dir = Path(tempfile.mkdtemp())
+        args = parse_args([
+            "--data", "t", "--scenario", "normal", "--policy", "nimbus",
+            "--local-url", "http://x", "--local-model", "m",
+            "--kv-capacity-tokens", "1000000", "--max-inflight", "3",
+            "--out-dir", str(out_dir),
+        ])
+        pol = RecordingPolicy()
+        asyncio.run(replay_queued(
+            args, trace, pol, LOCAL, CLOUD, sink=NullCloud(CLOUD),
+            send_local=RecordingSender(service_s=0.001), kv_monitor=FakeKV(1e9),
+        ))
+        self.assertEqual(pol.snapshots[0], [0, 1, 2])
+
+    def test_arrivals_overdue_during_decision_are_readjudicated_before_dispatch(self):
+        """A slow policy call must not hide a cohort whose due time passes
+        while the arrival coroutine is awaiting that call."""
+        import time as _time
+        import tempfile
+        from pathlib import Path
+        from router.run import parse_args
+
+        class SlowRecordingPolicy(NimbusPolicy):
+            def __init__(self):
+                super().__init__(prefill_tput=20_000, tpot_s=0.0095)
+                self.snapshots = []
+
+            def on_tick(self, waiting, kv, inflight_remaining=0, context=None):
+                self.snapshots.append([r["request_id"] for r in waiting])
+                if len(self.snapshots) == 1:
+                    _time.sleep(0.05)
+                return super().on_tick(waiting, kv, inflight_remaining, context)
+
+        trace = [
+            {"request_id": 0, "arrived_at": 0, "relative_arrival_s": 0.0,
+             "prompt": "r0", "max_tokens": 10, "prompt_tokens": 40,
+             "session_id": 0},
+            {"request_id": 1, "arrived_at": 0, "relative_arrival_s": 0.01,
+             "prompt": "r1", "max_tokens": 10, "prompt_tokens": 40,
+             "session_id": 1},
+        ]
+        args = parse_args([
+            "--data", "t", "--scenario", "normal", "--policy", "nimbus",
+            "--local-url", "http://x", "--local-model", "m",
+            "--kv-capacity-tokens", "1000000", "--max-inflight", "2",
+            "--out-dir", str(Path(tempfile.mkdtemp())),
+        ])
+        pol = SlowRecordingPolicy()
+        asyncio.run(replay_queued(
+            args, trace, pol, LOCAL, CLOUD, sink=NullCloud(CLOUD),
+            send_local=RecordingSender(service_s=0.001), kv_monitor=FakeKV(1e9),
+        ))
+        self.assertEqual(pol.snapshots[:2], [[0], [0, 1]])
+
+    def test_slow_old_snapshot_cannot_kick_before_future_cohort_is_visible(self):
+        """Crossing the next arrival invalidates even a non-empty victim set.
+
+        A survivor-only assertion misses this bug: the old one-item snapshot
+        could already have been irreversibly routed to cloud before the runner
+        noticed that a second candidate was overdue.
+        """
+        import time as _time
+        import tempfile
+        from pathlib import Path
+        from router.run import parse_args
+
+        class FlipVictimPolicy(NimbusPolicy):
+            def __init__(self):
+                super().__init__(prefill_tput=20_000, tpot_s=0.0095)
+                self.snapshots = []
+
+            def on_tick(self, waiting, kv, inflight_remaining=0, context=None):
+                ids = [req["request_id"] for req in waiting]
+                self.snapshots.append(ids)
+                if ids == [0]:
+                    _time.sleep(0.05)
+                    return [waiting[0]]
+                # The fresh two-item decision intentionally chooses the other
+                # request so a premature application is externally visible.
+                return [waiting[-1]] if len(waiting) > 1 else []
+
+        trace = [
+            {"request_id": 0, "arrived_at": 0, "relative_arrival_s": 0.0,
+             "prompt": "r0", "max_tokens": 10, "prompt_tokens": 40,
+             "session_id": 0},
+            {"request_id": 1, "arrived_at": 0, "relative_arrival_s": 0.01,
+             "prompt": "r1", "max_tokens": 10, "prompt_tokens": 40,
+             "session_id": 1},
+        ]
+        args = parse_args([
+            "--data", "t", "--scenario", "normal", "--policy", "nimbus",
+            "--local-url", "http://x", "--local-model", "m",
+            "--kv-capacity-tokens", "1000000", "--max-inflight", "2",
+            "--out-dir", str(Path(tempfile.mkdtemp())),
+        ])
+        pol = FlipVictimPolicy()
+        results, _, _ = asyncio.run(replay_queued(
+            args, trace, pol, LOCAL, CLOUD, sink=NullCloud(CLOUD),
+            send_local=RecordingSender(service_s=0.001), kv_monitor=FakeKV(1e9),
+        ))
+        cloud_ids = [
+            row["request_id"] for row in results if row["endpoint"] == "cloud"
+        ]
+        local_ids = [
+            row["request_id"] for row in results if row["endpoint"] == "local"
+        ]
+        self.assertEqual(pol.snapshots[:2], [[0], [0, 1]])
+        self.assertEqual(cloud_ids, [1])
+        self.assertEqual(local_ids, [0])
+
     def test_completion_during_slow_tick_cannot_dispatch_the_victim(self):
         """Regression (codex round-3 P1): while a shed decision computes
         off-thread, a completing request must NOT admit the victim locally.
@@ -443,6 +576,8 @@ class TestTickDispatchRace(unittest.TestCase):
             {"request_id": 2, "arrived_at": 1477007, "relative_arrival_s": 0.0,
              "prompt": "r2", "max_tokens": 10, "prompt_tokens": 40, "session_id": 0},
         ]
+        trace[1]["relative_arrival_s"] = 0.01
+        trace[2]["relative_arrival_s"] = 0.01
         import tempfile
         from pathlib import Path
         from router.run import parse_args, replay_queued
@@ -473,7 +608,12 @@ class TestStaleDecisionDiscard(unittest.TestCase):
 
         class SleepyPolicy(NimbusPolicy):
             def on_tick(self, waiting, kv, inflight_remaining=0, context=None):
-                _time.sleep(0.12)                  # slow decision window
+                # Let r0's first admission decision finish, then make the r1
+                # decision slow enough for r0 to complete while it is running.
+                # Sleeping on the first call would freeze admission before r0
+                # was ever in flight and would not exercise stale invalidation.
+                if any(req["request_id"] == 1 for req in waiting):
+                    _time.sleep(0.12)              # slow decision window
                 return super().on_tick(waiting, kv, inflight_remaining, context)
 
         kv_cell = [100.0]     # r0 (footprint 50) fits; r1 (150) does not — yet
@@ -494,7 +634,9 @@ class TestStaleDecisionDiscard(unittest.TestCase):
         trace = [
             {"request_id": 0, "arrived_at": 1477007, "relative_arrival_s": 0.0,
              "prompt": "r0", "max_tokens": 10, "prompt_tokens": 40, "session_id": 0},
-            {"request_id": 1, "arrived_at": 1477007, "relative_arrival_s": 0.0,
+            # A later cohort lets r0 become in-flight; it then completes while
+            # the deliberately slow decision for r1 is running.
+            {"request_id": 1, "arrived_at": 1477007, "relative_arrival_s": 0.01,
              "prompt": "r1", "max_tokens": 50, "prompt_tokens": 100, "session_id": 0},
         ]
         import tempfile
@@ -601,7 +743,7 @@ class TestIntegration(unittest.TestCase):
                 return super().on_tick(waiting, kv, inflight_remaining, context)
 
         policy = CapturingPolicy()
-        trace = mk_trace(3)
+        trace = mk_trace(3, gap_s=0.05)
         import tempfile
         from pathlib import Path
         from router.run import parse_args, replay_queued
@@ -613,7 +755,7 @@ class TestIntegration(unittest.TestCase):
         ])
         asyncio.run(replay_queued(
             args, trace, policy, LOCAL, CLOUD, sink=NullCloud(CLOUD),
-            send_local=RecordingSender(service_s=0.05), kv_monitor=FakeKV(1e9),
+            send_local=RecordingSender(service_s=0.20), kv_monitor=FakeKV(1e9),
         ))
         self.assertIn(50, policy.seen_remaining)
         self.assertTrue(any(c and c.max_inflight == 1 for c in policy.seen_contexts))
@@ -674,7 +816,9 @@ class TestIntegration(unittest.TestCase):
         from pathlib import Path
         from router.run import parse_args, replay_queued
 
-        trace = mk_trace(2)  # each commits 100 prompt + 50 decode = 150 tokens
+        # r0 is already in flight when r1 arrives, so the locally known
+        # commitment must clamp the stale "all free" metrics sample.
+        trace = mk_trace(2, gap_s=0.05)
         args = parse_args([
             "--data", "t", "--scenario", "normal", "--policy", "nimbus",
             "--local-url", "http://x", "--local-model", "m",
@@ -682,7 +826,7 @@ class TestIntegration(unittest.TestCase):
             "--out-dir", str(Path(tempfile.mkdtemp())),
         ])
         policy = mk_policy()
-        sender = RecordingSender(service_s=0.05)
+        sender = RecordingSender(service_s=0.20)
         results, _, _ = asyncio.run(replay_queued(
             args, trace, policy, LOCAL, CLOUD, sink=NullCloud(CLOUD),
             send_local=sender, kv_monitor=FakeKV(200),  # stale "all free"
