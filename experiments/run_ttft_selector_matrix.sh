@@ -166,6 +166,24 @@ models = json.loads(models_raw)
 model_ids = [row.get("id") for row in models.get("data", [])]
 if model not in model_ids:
     raise SystemExit(f"MODEL {model!r} not served by active endpoint: {model_ids}")
+# vLLM generates a fresh ``created`` timestamp and model-permission id for
+# every /v1/models response.  Hash only the stable serving identity; hashing
+# the raw body makes an otherwise identical completed matrix impossible to
+# validate or resume.
+model_identity = [
+    {
+        "id": row.get("id"),
+        "owned_by": row.get("owned_by"),
+        "root": row.get("root"),
+        "parent": row.get("parent"),
+        "max_model_len": row.get("max_model_len"),
+    }
+    for row in models.get("data", [])
+]
+model_identity.sort(key=lambda row: json.dumps(row, sort_keys=True))
+models_identity_raw = json.dumps(
+    model_identity, sort_keys=True, separators=(",", ":")
+).encode()
 
 cal = profile.get("predictor_calibration", {})
 prefill = float(cal.get("recommended_prefill_tput_tokens_per_s", 0))
@@ -194,7 +212,7 @@ fields = [
     profile.get("server_log_sha256_at_start"),
     hashlib.sha256(log).hexdigest(),
     hashlib.sha256(version_raw).hexdigest(),
-    hashlib.sha256(models_raw).hexdigest(),
+    hashlib.sha256(models_identity_raw).hexdigest(),
 ]
 print("\t".join(fields))
 PY
@@ -202,7 +220,7 @@ PY
 IFS=$'\t' read -r TRACE_SHA TRACE_MANIFEST_SHA TRACE_N TRACE_SCENARIO PROFILE_SHA KV_CAP \
   PREFILL_TPUT TPOT_MS FIRST_TOKEN_OVERHEAD_MS TTFT_GUARD_MS \
   SERVER_LOG_PREFIX_SHA SERVER_LOG_SHA \
-  ENDPOINT_VERSION_SHA ENDPOINT_MODELS_SHA <<< "$PREFLIGHT"
+  ENDPOINT_VERSION_SHA ENDPOINT_MODELS_IDENTITY_SHA <<< "$PREFLIGHT"
 SCENARIO=${SCENARIO:-$TRACE_SCENARIO}
 if [[ "$SCENARIO" != "$TRACE_SCENARIO" ]]; then
   printf 'SCENARIO %s does not match trace manifest scenario %s\n' \
@@ -253,7 +271,7 @@ fi
 COMMIT=$(git rev-parse HEAD)
 RUN_FINGERPRINT="$($PYBIN - "$TRACE_SHA" "$TRACE_MANIFEST_SHA" "$PROFILE_SHA" \
   "$SERVER_LOG_PREFIX_SHA" "$SERVER_PID" "$ENDPOINT_VERSION_SHA" \
-  "$ENDPOINT_MODELS_SHA" "$BASE_URL" "$CHAT_URL" "$COMMIT" "$SCENARIO" \
+  "$ENDPOINT_MODELS_IDENTITY_SHA" "$BASE_URL" "$CHAT_URL" "$COMMIT" "$SCENARIO" \
   "$MAX_INFLIGHT" "$KV_CAP" \
   "$PREFILL_TPUT" "$TPOT_MS" "$FIRST_TOKEN_OVERHEAD_MS" \
   "$SLO_S" "$TTFT_GUARD_MS" \
@@ -286,8 +304,8 @@ else
     printf 'cache_mode=none server_pid=%s server_log=%s server_log_prefix_sha256=%s\n' \
       "$SERVER_PID" "$SERVER_LOG" "$SERVER_LOG_PREFIX_SHA"
     printf 'server_log_sha256_at_manifest=%s\n' "$SERVER_LOG_SHA"
-    printf 'endpoint_version_sha256=%s endpoint_models_sha256=%s\n' \
-      "$ENDPOINT_VERSION_SHA" "$ENDPOINT_MODELS_SHA"
+    printf 'endpoint_version_sha256=%s endpoint_models_identity_sha256=%s\n' \
+      "$ENDPOINT_VERSION_SHA" "$ENDPOINT_MODELS_IDENTITY_SHA"
     printf 'base_url=%s chat_url=%s model=%s\n' \
       "$BASE_URL" "$CHAT_URL" "$MODEL"
     printf 'python=%s\n' "$($PYBIN --version 2>&1)"
