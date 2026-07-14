@@ -2,6 +2,15 @@
 
 # Nimbus 算法设计（v3，KV 受限）
 
+> **状态（2026-07-14）：这是已发布的 baseline，不是当前实验的触发器。**
+> 仓库默认仍是本文描述的 `kv_gap`。7 月 14 日 dense-32B 实验显式选择了
+> 与 selector 正交的 `ttft_pred`：只有在标定模型预测等待请求将违反 TTFT
+> SLO 时才外发，再在同一停止条件下比较不同的 victim ordering。该路径目前
+> 仍是实验选项，并未改成默认算法。详见
+> [`v3_experiments_2026-07.md`](v3_experiments_2026-07.md) 第 5b–5d 节。
+> 该腿关闭了 prefix cache，`cached_tokens=0`，因此不能验证旧 v2 公式中的
+> cached-token 项。
+
 **范围假设（开宗明义）：** 本地绑定资源是 KV 缓存。实验使用 KV 先饱和的负载（例如长 prompt 的生产切片）。算力/slot 受限的过载不在本设计范围内，在 limitations 中讨论。
 
 ---
@@ -42,7 +51,14 @@ residence(r) = prompt processing time + generation time
 displacement(r) = footprint × residence = 2300 × 3 ≈ 6,900 token·seconds
 ```
 
-直觉：请求对缓存的「伤害」不只是占多少，还有占多久。占 2,300 tokens 达 3 秒，与占 230 tokens 达 30 秒，伤害相当。**这就是 V2 公式——论文的核心想法。** 它**不**用来判断是否放得下（那是 footprint 的事）；它只用于**排序：先踢谁**。
+直觉：请求对缓存的「伤害」不只是占多少，还有占多久。占 2,300 tokens 达 3 秒，与占 230 tokens 达 30 秒，伤害相当。**这里保留的是 V2 的 token·seconds / displacement 思想，但代数上并不是 exact V2 公式。** 令 `P` 为完整 prompt、`U` 为剩余 uncached prompt、`D` 为 decode，两条信号分别是：
+
+```
+exact old V2 = P × (U / prefill_tput + D × TPOT)
+current v3   = (U + D) × (U / prefill_tput + D × TPOT)
+```
+
+仓库保留了两者供 selector 对照（`cost_cachedisp_old` 与默认的 `cost_disp_current`）。它们都**不**用来判断是否放得下；只用于**排序：先踢谁**。
 
 （严格来说，真量是积分 `∫ KV_tokens(t) dt`；我们用峰值预留 × residence 作为其保守的在线代理。）
 
@@ -149,4 +165,4 @@ B 外发贵 4×，但对缓存时间的伤害大 10×——踢它更划算。**�
 | gap 只计等待队列 | gap 主公式计入飞行中请求的剩余输出增长 | 运行中请求持续消耗 KV；忽略会低估压力 |
 | （隐含）只计本地侧违约 | 两侧都计违约（被踢请求也算） | 测得的云延迟本身就超过 SLO；外发保护的是队列*其余*请求，不是被踢的那个 |
 
-V2 的开放问题——「若 weight 是 token·秒，budget 是什么？」——通过消解解决：weight 与 budget 现在都活在 tokens 里；token·秒公式（V2）作为排序信号完整保留，而这正是论文的核心主张。
+V2 的开放问题——「若 weight 是 token·秒，budget 是什么？」——通过消解解决：weight 与 budget 现在都活在 tokens 里；保留下来的是 token·秒的**排序思想**。Exact old-V2 公式单独保存在 `classic_cachedisp_token_s`，已发布默认值使用另一条 `(uncached_prompt + decode) × residence` proxy；两者优劣要靠实验比较，不能视为同一公式。

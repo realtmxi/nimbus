@@ -2,9 +2,11 @@
 
 Self-contained status document: what was built, what was measured, what broke our
 assumptions, and the exact queue of next experiments. Written so a person or agent
-(e.g. Codex) can continue without access to prior conversations. Authoritative
-design spec: [`notion_algorithm_design_v3.md`](notion_algorithm_design_v3.md);
-framework usage: [`../router/README.md`](../router/README.md).
+(e.g. Codex) can continue without access to prior conversations. Historical
+shipped-v3 (`kv_gap`) design baseline:
+[`notion_algorithm_design_v3.md`](notion_algorithm_design_v3.md); the current
+July-14 TTFT experiment contract and results are authoritative in Sections
+5b–5d below. Framework usage: [`../router/README.md`](../router/README.md).
 
 **Path convention** (per [`../AGENTS.md`](../AGENTS.md), machine names / usernames /
 absolute scratch paths are never committed): `$MSCRATCH` = the project owner's
@@ -18,11 +20,14 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
 1. The `router/` framework (external FIFO + work-conserving dispatcher + policies)
    remains validated against the trusted open-loop harness (parity 1.003; queue
    neutrality 110 vs 111 ms). **75/75** unit tests pass without network/GPU.
-2. The current experiment keeps **TTFT violation as the trigger**. KV is not the
-   objective and did not replace the original algorithm. The original v2 weight
+2. The July-14 rerun explicitly uses **predicted TTFT violation as the trigger**;
+   KV is neither its objective nor its trigger. The repository default remains
+   the shipped `kv_gap + cost_disp_current` baseline until a separate design
+   decision changes it. The original v2 weight
    `prompt × (uncached_prompt/prefill_tput + decode×TPOT)` is preserved exactly
-   as selector `cost_cachedisp_old`; trigger and selector are independently
-   switchable.
+   in `classic_cachedisp_token_s`; experimental selector
+   `cost_cachedisp_old` greedily orders victims by `cloud_cost / old_weight`.
+   This is not the historical 0/1 DP.
 3. The July 12–13 headline runs are now **exploratory only, not selector proof**.
    A July 14 audit found that the scheduler used cumulative trace-token metadata
    while HTTP often sent only a tiny current-turn prompt; simultaneous arrivals
@@ -32,11 +37,15 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
 4. The independent gauge finding remains valid: hybrid Qwen3.6-35B-A3B exposes
    a per-sequence state pool (~41 concurrent), while dense Qwen3-32B exposes
    token KV. That explains why a KV-gauge trigger is architecture-dependent; it
-   does **not** imply Nimbus should replace its SLO trigger with KV.
-5. The active evidence path is a token-aligned, synthetic, capped, no-prefix-
-   cache dense-32B rerun: same payload semantics for profiling and matrix;
-   held-out TTFT calibration; then `newest` vs original-v2 displacement vs the
-   current displacement selector under one TTFT stop rule. See Section 5b/7.
+   is evidence against treating KV as a universal overload trigger and says
+   nothing against the original v2 weight as a victim-ordering signal.
+5. That dense-32B evidence path is now complete through one exploratory
+   512-request matrix. All three selectors had **0 measured local violations**;
+   old-v2 ordering outsourced 257/512 (50.20% pessimistic combined), current
+   displacement 266/512 (51.95%), and `newest` 326/512 (63.67%). This is a
+   strong signal that selection matters, but one ordered pass is not a paper
+   result. The leg has `cached_tokens=0`, so it does not validate the cached
+   term, provider cache pricing, or prefix-cache displacement.
 
 ---
 
@@ -46,12 +55,13 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
 |---|---|
 | `router/run.py` | Single entry point: external FIFO, work-conserving dispatcher, KV monitor, inflight-KV tracker, CLI |
 | `router/common.py` | Trace loading (BurstGPT windows byte-identical to the trusted `vllm/run.py`; `--scenario full` for arbitrary traces), payloads, SSE client, NullCloud sink, billing, summaries |
-| `router/nimbus.py` | v3 policy: gap trigger + ascending cost/displacement shedding |
+| `router/nimbus.py` | Shipped KV-gap baseline plus orthogonal `kv_gap` / `ttft_pred` triggers and selector ablations |
 | `router/test_*.py` | 75 unit tests, no network/GPU (`python3 -m unittest router.test_common router.test_run router.test_nimbus`) |
 | `tools/kv_gauge_probe.py` | Live probe that established the Section-4 finding (stdlib only) |
 | `tools/analyze_eb1200.py` | Timeline reconstruction that flagged the anomaly from a result JSONL |
 | `tools/materialize_token_aligned_trace.py` | Atomic, tokenizer-fingerprinted no-cache trace materializer |
 | `tools/profile_ttft_batch.py` | Same-payload warmup/profile with a held-out shared-prefill-lane calibration artifact |
+| `experiments/run_ttft_selector_matrix.sh` | Server/profile/trace-bound multi-arm runner with per-arm completion markers |
 
 Validation ladder (all on the GPU box, Qwen3.6-35B-A3B + MTP(5), details in
 [`../router/README.md`](../router/README.md)):
@@ -200,9 +210,14 @@ Per-token attention KV contributes comparatively little (~1% per 8k tokens;
 
 ---
 
-## 5. Design fork (decision pending — Murphy)
+## 5. Historical design fork (Option B chosen on 2026-07-13)
 
-- **Option A (recommended): resource-generic units.** The policy works in
+The bullets below preserve the July-12 fork for provenance; they are not the
+current TTFT-trigger design. Option B was executed in Section 5a. The later
+failure of a token-KV trigger on a slot/compute-bound cell motivated the
+explicit TTFT model in Sections 5b–5d rather than another unit conversion.
+
+- **Option A (historical proposal): resource-generic units.** The policy works in
   *fractions of the binding pool*: `footprint_frac(req) = a + b·(local_prompt +
   expected_decode)`, `displacement = footprint_frac × residence_s`,
   `gap_frac = Σ waiting_frac + inflight_remaining_frac − (1−u)`. Constants
@@ -213,13 +228,13 @@ Per-token attention KV contributes comparatively little (~1% per 8k tokens;
 - **Option B: keep token semantics**, run the KV-bound story on a pure
   full-attention model, declare hybrid architectures out of scope.
 
-A and B are not exclusive: A is the algorithm fix; a full-attention cell is
-still wanted as a sanity anchor where the token math is exact.
+A and B were not exclusive: the dense full-attention cell supplied the sanity
+anchor where token-KV gauge semantics are exact.
 
-Also still owed (either option): the leg-1 win has **not** yet been shown to beat
-a *naive* concurrency spill ("pool full → shed the newest arrival, no
-selection"). v3's selection should win on cost and on which requests keep local
-latency — that baseline arm is queue item 3.
+The historical leg-1 win was not a valid comparison against a naive
+concurrency spill. Section 5d now supplies an audit-valid exploratory
+`newest` comparison under a common TTFT trigger; repeated/full matrices are
+still owed before a paper claim.
 
 ---
 
@@ -279,7 +294,8 @@ Honest units, wrong resource → systematic under-shed. Cost note: at matched
 fraction v3's victims cost more per head than random's ($2.70 vs $1.82) —
 displacement ordering deliberately exports the biggest requests.
 
-**The two campaigns compose into one principle.** Hybrid 35B: the gauge
+**Historical July-13 proposal (superseded as the active path by Section 5b).**
+The two campaigns compose into one principle. Hybrid 35B: the gauge
 accidentally measured the binding resource (GDN state slots) → trigger landed
 on the true knee → 0.32 s / 0%. Dense 32B: the gauge honestly measures tokens,
 but slots bind → trigger lands on the wrong bar → 6.4 s / 64%. **v3.1 must set
@@ -299,7 +315,8 @@ The design decision for the next leg is explicit:
   while a retained request is predicted to exceed the 5 s SLO (minus a
   held-out calibration/tick guard). This is the requested invariant.
 - **Selector under that fixed trigger:** compare `newest` (naive spill),
-  `cost_cachedisp_old` (the original formula exactly), and
+  `cost_cachedisp_old` (cost density whose denominator is the exact original
+  v2 weight), and
   `cost_disp_current` (current footprint/residence proxy). `waiting_random`
   seeds are a later variance baseline. The `*_cachedisp_old` ordering is a
   greedy online selector, not the historical full 0/1 DP; an offline DP oracle
@@ -319,9 +336,26 @@ The design decision for the next leg is explicit:
   profile. Every completed arm requires exact local prompt/decode usage and an
   atomic completion marker.
 
-The first framework checkpoint is local commit `b930ab2`. The audit-hardening
-checkpoint and GPU results are recorded after they complete; do not substitute
-the historical dense numbers above for them.
+The separation of responsibilities is therefore:
+
+| Question | July-14 answer | Unit |
+|---|---|---|
+| When must Nimbus shed? | `ttft_pred`: a waiting survivor would cross `SLO − guard` | seconds |
+| Whom should it shed first? | selector ordering, including `cloud_cost / old_v2_weight` | relative score |
+| How many should it shed? | minimum prefix of that ordering that makes every waiting survivor safe | request count determined by prediction |
+
+In-flight requests affect future slot/prefill availability, but cannot be
+recalled after dispatch; the guarantee is consequently scoped to waiting
+survivors, not every already-local request.
+
+Implementation checkpoints are `b930ab2` (first TTFT path), `78846da`
+(token/cohort/server audit hardening), and `bcda9d0` (shared-prefill predictor
+and schema-v2 profile). Post-run commit `93bf9f1` replaces the volatile raw
+`/v1/models` hash with a stable endpoint-identity hash for **future matrices**.
+The completed `bcda9d0` arms remain valid because their markers/hashes were
+independently audited, but that existing OUTDIR cannot be resumed in place:
+the old volatile fingerprint changes on every endpoint query and the new commit
+also intentionally changes the run fingerprint.
 
 ### 5c. CALIBRATION AUDIT 2026-07-14 — 128 slots are not 128 prefill lanes
 
@@ -344,17 +378,92 @@ queue-level all-local anchor: 512/512 success, exact usage, TTFT p50/p95 =
 56.007/152.686 s, 88.09% local 5 s violations, queue-delay p50 = 51.091 s.
 This is a real pressure slice, not a no-op smoke.
 
-The predictor is therefore being revised without changing the original v2
-selector formula: sequence-slot releases plus a shared FIFO prefill lane;
+The revised predictor does not change the original v2 selector formula. It
+models sequence-slot releases plus one aggregate shared FIFO prefill-work lane;
 unfinished in-flight prompts conservatively retain their full work until exact
-stream usage proves first-token completion. Profile schema v2 separately fits
-shared prefill throughput and fixed first-token overhead, keeps TPOT for decode
-residence/the old weight, and compares TTFT order statistics inside each
-homogeneous-prompt cell instead of pretending request ids reveal engine service
-order. It derives the error guard only from calibration repeats and accepts the
-final repeat only if the 5 s classifier has zero false negatives. The new
-profile and queue-level TTFT arm remain required before any selector result is
-reported.
+stream usage proves first-token completion. This is an effective online model,
+not a claim that vLLM literally executes only one prompt at a time. Profile
+schema v2 separately fits shared prefill throughput and fixed first-token
+overhead, keeps TPOT for decode residence/the old weight, and compares TTFT
+order statistics inside each homogeneous-prompt cell instead of pretending
+request ids reveal engine service order.
+
+Schema-v2 profile result (same server lifecycle):
+
+| Check | Result |
+|---|---|
+| Structural/token audit | 60/60 blocks; 1,420/1,420 success and exact usage |
+| Effective shared prefill | 3,264.2498 tokens/s |
+| Decode TPOT / first-token overhead | 151.8412 ms / 455.1077 ms |
+| Fit | weighted R² = 0.957835 |
+| Guard | calibration p99 residual 1,433 ms + one 250 ms tick = **1,683 ms** |
+| Final held-out classifier | TP 192, FN 0, FP 22, TN 70 |
+
+One held-out 32k-prompt point underpredicted by more than the full guard, but it
+was still classified as a violation, so the acceptance-critical false-negative
+count remained zero. Profile SHA256 is
+`549dd0bf6e54587bb1188fd420431de6062c39526e186d4593a7e7208536e23f`.
+
+The queue-level `newest` smoke also passed: 512/512 success; 314 routed, 198
+local; local TTFT p50/p95/p99 = 1.947/2.449/2.663 s; 0/198 local violations;
+pessimistic combined = 314/512 = 61.33%; cost = $0.142655. Decision audit found
+210/226 snapshots with more than one candidate, maximum snapshot 17, and 46
+multi-request applied rounds (up to 13 victims). All 314 applied victim ids
+were unique and exactly matched routed rows; post-kick prediction never
+exceeded `5 − 1.683 = 3.317 s`.
+
+Token accuracy means exact agreement with the **materialized** workload. The
+manifest records 52/512 rows whose requested materialization target could not
+be hit because of chat-template minimum overhead. Relative to the original
+trace, 53/512 prompts changed: those 52 plus one prompt capped at 32,768. This
+does not break internal alignment, but the slice must not be described as
+verbatim ShareGPT.
+
+### 5d. EXPLORATORY SELECTOR COMPARISON 2026-07-14 — old weight wins this pass
+
+One fixed-order pass used the same 512 requests, server, profile, TTFT trigger,
+5 s SLO, 1.683 s guard, and 250 ms tick for all arms. Order was generated from
+seed 78846 before launch: old-v2 ordering → `newest` → current displacement,
+with a 20 s cooldown after each arm. Every arm completed 512/512 with exact
+materialized prompt/decode usage.
+
+| selector | routed / local | local TTFT p50 / p95 / p99 | local viol | pessimistic combined* | cost |
+|---|---:|---:|---:|---:|---:|
+| **`cost_cachedisp_old`** | **257 / 255** | **1.865 / 2.561 / 2.573 s** | **0/255** | **50.20%** | **$0.137257** |
+| `cost_disp_current` | 266 / 246 | 1.894 / 2.641 / 2.839 s | 0/246 | 51.95% | $0.147803 |
+| `newest` | 326 / 186 | 1.957 / 2.606 / 2.714 s | 0/186 | 63.67% | $0.149767 |
+
+*The NullCloud pessimistic bound treats every routed request as a violation; it
+is not measured cloud TTFT.
+
+This pass supports two narrow conclusions. First, TTFT is a workable trigger:
+all retained requests met the SLO while all-local violated 88.09%. Second,
+selection matters even under the same stop rule: the old-v2 signal retained 69
+more requests than `newest` and paid less. It does **not** prove the cached-token
+term: no-cache reduces the old weight to
+`P × (P/prefill_tput + D×TPOT)`. It also does not yet distinguish old-v2 from
+current displacement conclusively (only 9 routed requests / 1.76 points apart)
+or provide error bars. Repeat randomized-order matrices and random baselines
+before any paper claim. A separate same-config `newest` smoke routed 314 rather
+than this pass's 326, directly showing 12-request run-to-run variability; the
+old-v2 gap to `newest` is much larger, while old-v2 vs current is not yet above
+that observed noise floor.
+
+The mechanism is consistent with the calibrated bottleneck. Old-v2 ordering
+routed 291,981 prompt tokens with 257 requests (routed prompt p50 958), current
+displacement routed 288,272 with 266 (p50 940), and `newest` only 270,277 with
+326 (p50 554). The old no-cache formula's outer `P` and prefill `P/tput` term
+strongly favor removing long prompts, buying more shared-prefill relief per
+victim. This is a plausible explanation to test, not causal proof from one
+ordered pass.
+
+Evidence audit: all three completion markers share fingerprint
+`a0e9b1484441bfae478850230305ce2c501d653b1a26031d545032e6cbce23a1`;
+their raw/summary/decision hashes and line counts match; decision snapshots
+reached 20/18/15 candidates (old/current/newest). Multi-request decisions were
+44/55, 47/62, and 51/58 applied rounds respectively. Applied victim ids were
+unique and exactly equal to each arm's routed rows. The matrix is explicitly
+labeled `single-pass exploratory`.
 
 ---
 
@@ -365,37 +474,40 @@ The default cloud is a zero-latency fake sink (`--cloud null`): kicked rows are
 denominator). For paper headlines, the recommended primary metric is the
 **pessimistic bound: every kicked request counts as an SLO violation** (real
 cloud p50 ≈ 10 s > 5 s SLO), with local-only violation as the secondary metric.
-A real-cloud leg (`--cloud real …`) is only needed once, pre-submission.
+Concretely,
+`pessimistic_combined = (local_slo_violations + routed_only) / N`. This is an
+upper bound under NullCloud, not observed cloud latency. A real-cloud leg
+(`--cloud real …`) is only needed once, pre-submission.
 
 ---
 
 ## 7. Experiment queue (REVISED 2026-07-14 after the payload/cohort audit)
 
-1. **Finish and commit the audit contract.** Atomic token-aligned materializer,
+1. **COMPLETED — audit contract.** Atomic token-aligned materializer,
    complete-cohort/stale-arrival protection, local usage telemetry, no-cache
-   server/profile binding, and completion markers. *Accept:* 75/75 tests,
-   `py_compile`, `bash -n`, and `git diff --check` green.
-2. **Start one dense Qwen3-32B no-cache server and keep one lifecycle.** Record
-   the exact parent PID; verify `enable_prefix_caching=False`, KV capacity, and
-   `max_num_seqs=128`. Warm once/discard and warm independently again. *Accept:*
-   second warm batch below the configured cold-path ceiling; kill only this PID
-   after all arms and verify its children are gone.
-3. **Materialize/profile the transformed extreme trace.** Use the caps and
-   sampling contract in Section 5b, with scratch-backed `TMPDIR`, `HF_HOME`, and
-   `XDG_CACHE_HOME`. *Accept:* trace/manifest hash and line count agree; profile
-   produces positive parameters and a held-out error/tick guard.
-4. **Queue-level held-out smoke before the full matrix.** Run all-local on an
-   independent multi-cohort slice, then one TTFT arm. *Accept:* 100% success,
-   exact prompt/decode usage, no cold-path recurrence, and decision snapshots
-   contain real multi-item choices.
-5. **High-information exploratory comparison:** under the identical TTFT
-   trigger run `newest`, `cost_cachedisp_old`, and `cost_disp_current`, with
-   pessimistic-combined violation and cost as the primary Pareto readout.
-   *Accept:* every arm completion marker valid; no config/trace/profile drift.
-6. **Only if item 5 has separation:** run `waiting_random` with ≥3 seeds and
-   repeat full matrices with randomized arm order. Single-pass deterministic
-   arms are exploratory, not paper error bars.
-7. **Then restore missing semantics:** cache-aware trace for the cached-token
+   server/profile binding, and completion markers; 75/75 tests, `py_compile`,
+   `bash -n`, and `git diff --check` passed.
+2. **COMPLETED — one bound Qwen3-32B no-cache lifecycle.** PID, log prefix,
+   endpoint, KV 112,656, and `max_num_seqs=128` were bound to every artifact.
+   After all audits, only recorded parent PID `904943` was terminated; child
+   `905088` and port 8010 were verified gone.
+3. **COMPLETED — materialization and schema-v2 profile.** Trace/manifest hashes,
+   line counts, tokenizer, exact usage, held-out guard, and zero-FN classifier
+   all passed; see Section 5c.
+4. **COMPLETED — queue-level all-local anchor and TTFT smoke.** Both had 512/512
+   success; the policy smoke had real multi-item choices and 0/198 retained
+   violations.
+5. **COMPLETED (exploratory) — three-selector comparison.** All markers and
+   configuration bindings passed. Old-v2 ordering beat `newest` clearly in one
+   pass. Its 9-request lead over current is smaller than the observed
+   12-request same-selector difference, so that comparison remains unresolved.
+6. **NEXT — establish repeatability before changing the default.** Run at least
+   three complete 512-request matrices in balanced cyclic order
+   (old→newest→current, newest→current→old, current→old→newest), plus
+   `waiting_random` with ≥3 seeds. Use the stable endpoint fingerprint from
+   `93bf9f1`; report paired distributions, not only one aggregate table. If the
+   old-v2 selector remains Pareto-better, repeat the full 11,605-request cell.
+7. **THEN restore missing semantics:** cache-aware trace for the cached-token
    term; estimated-vs-oracle decode; historical exact 0/1-DP/offline oracle;
    load/guard sweeps; real-cloud latency leg. The hybrid binding-resource result
    remains a separate architecture study, not the TTFT trigger definition.
@@ -432,6 +544,12 @@ A real-cloud leg (`--cloud real …`) is only needed once, pre-submission.
 | `$MSCRATCH/start_vllm_qwen36.sh` | canonical server launch (all workarounds baked in) |
 | `$MSCRATCH/kv_gauge_probe.py` | box copy of the probe (repo `tools/` is authoritative) |
 | `$MSCRATCH/nimbus/data/rednote_slice.jsonl` | 80-request long-prompt slice |
+| `$MSCRATCH/router_ttft_nocache_78846da/heldout512_token_aligned.jsonl{,.manifest.json}` | Independent 512-request materialized trace and provenance |
+| `$MSCRATCH/router_ttft_nocache_78846da/ttft_profile_v2_bcda9d0.json` | Accepted schema-v2 profile (SHA256 `549dd0bf…e23f`) |
+| `$MSCRATCH/router_ttft_nocache_78846da/heldout512_all_local/` | Queue-pressure all-local anchor |
+| `$MSCRATCH/router_ttft_nocache_78846da/heldout512_ttft_smoke_bcda9d0/` | Audited `newest` smoke and completion marker |
+| `$MSCRATCH/router_ttft_nocache_78846da/heldout512_selector_compare_bcda9d0/` | Three-arm exploratory matrix, decisions, summaries, markers, manifest |
+| `$MSCRATCH/router_ttft_nocache_78846da/vllm_qwen32b_nocache.log` | Server configuration/lifecycle log for this matrix (KV 112,656; distinct from the July-13 server) |
 | `$JSCRATCH/workloads/…` | ShareGPT+BurstGPT trace (leg-1 `$DATA`) |
 | `$JSCRATCH/initial_result/` | 14,537-row real OpenRouter measurements (cloud-latency calibration) |
 | `$JSCRATCH/vllmresult/` | teammate's open-loop sweep on the same model (parity reference) |

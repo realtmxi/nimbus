@@ -2,6 +2,16 @@
 
 # Nimbus Algorithm Design (v3, KV-bound)
 
+> **Status (2026-07-14): shipped baseline, not the current experiment
+> trigger.** The repository still defaults to the `kv_gap` algorithm described
+> here. The July-14 dense-32B experiment explicitly selects the orthogonal
+> `ttft_pred` trigger, which sheds only when calibrated waiting-request TTFT is
+> predicted to violate the SLO; it then compares the same victim-ordering
+> signals under one stop rule. That path is experimental, not yet the default.
+> See [`v3_experiments_2026-07.md`](v3_experiments_2026-07.md), Sections 5b–5d.
+> Its no-cache leg has `cached_tokens=0`, so it does not validate the cached
+> term of the original v2 formula.
+
 **Scope assumption (stated up front):** the binding local resource is the KV
 cache. Experiments use workloads where KV saturates first (e.g. long-prompt
 production slices). Compute/slot-bound overload is out of scope for this
@@ -61,9 +71,19 @@ displacement(r) = footprint × residence = 2300 × 3 ≈ 6,900 token·seconds
 
 Intuition: a request's "damage" to the cache is not just how much it occupies
 but for how long. Occupying 2,300 tokens for 3 seconds and occupying 230
-tokens for 30 seconds do comparable damage. **This is the V2 formula — the
-core idea of the paper.** It is NOT used to decide whether things fit (that is
-footprint's job); it is used only for **ordering: whom to kick first**.
+tokens for 30 seconds do comparable damage. **This preserves V2's
+token·seconds/displacement idea, but it is not the exact V2 algebraic
+formula.** With `P` = full prompt, `U` = remaining uncached prompt, and `D` =
+decode, the two signals are:
+
+```
+exact old V2 = P × (U / prefill_tput + D × TPOT)
+current v3   = (U + D) × (U / prefill_tput + D × TPOT)
+```
+
+The repository keeps both for selector experiments (`cost_cachedisp_old` and
+default `cost_disp_current`). Neither signal decides whether things fit; each
+is used only for **ordering: whom to kick first**.
 
 (Strictly, the true quantity is the integral `∫ KV_tokens(t) dt`; we use
 peak-reservation × residence as a conservative online proxy for it.)
@@ -223,5 +243,7 @@ current repository.
 
 The V2 open question — "if weight is token·seconds, what is the budget?" — is
 resolved by dissolution: weight and budget both live in tokens now; the
-token·seconds formula (V2) is intact as the ordering signal, which is the
-paper's core claim.
+token·seconds **concept** remains an ordering signal. The exact old-V2 formula
+is preserved separately in `classic_cachedisp_token_s`; the shipped default
+uses the distinct `(uncached_prompt + decode) × residence` proxy. Their relative
+quality is an experimental question, not an identity.
