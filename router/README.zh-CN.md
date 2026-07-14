@@ -13,8 +13,8 @@
 |---|---|
 | `run.py` | **唯一入口**:外部 FIFO + work-conserving dispatcher + KV 读数器 + CLI |
 | `common.py` | 共享库:`one_request`/`load_trace`/`SCENARIOS`(逐行取自 `vllm/run.py` @ `dff1a81`)、`Endpoint`、`Policy`、`NullCloud`、计费、`summarize` |
-| `nimbus.py` | Nimbus v3:物理 KV 缺口触发 + cost/displacement 密度排序(`--policy nimbus --kv-capacity-tokens N`) |
-| `test_run.py` / `test_common.py` / `test_nimbus.py` | 56 个单元测试,无需网络/aiohttp/GPU |
+| `nimbus.py` | Nimbus v3 baseline + 正交的 KV-gap / 预测 TTFT 触发器与 victim-selector 消融 |
+| `test_run.py` / `test_common.py` / `test_nimbus.py` | 63 个单元测试,无需网络/aiohttp/GPU |
 
 ## 架构
 
@@ -58,7 +58,9 @@ python -m router.run --data <trace.jsonl> --scenario burst_300 \
 输出:逐请求 JSONL(`ttft_ms = queue_delay_ms + service_ttft_ms`,从 trace 到达时刻算,
 与 open-loop 口径可比)+ `.summary.json`(overall/local/cloud 三段 + queue 遥测)。
 每段都带 `slo_measured_n`——排除 `routed_only` 后的 SLO 显式分母。
-计费:失败请求 $0;local 侧恒 $0。
+`pessimistic_combined` 另把每条 cloud route 都算作违约,避免 NullCloud 奖励
+过度外包。计费:失败请求 $0;local 侧恒 $0。可用 `--decision-log FILE` 记录
+每次应用/作废的 Nimbus 决策及 victim 顺序。
 
 本地测试(无需网络/GPU):`python3 -m unittest router.test_common router.test_run router.test_nimbus`
 
@@ -117,3 +119,23 @@ displacement 只进入踢出排序,cloud price 让排序具备成本意识。额
 本 policy 明确是 **KV-bound**。compute/slot-bound 过载需要另一套触发信号,不会
 被静默当成 KV 压力。v3 在线不运行背包 solver;精确 cover-form DP 计划作为离线
 评估参考,当前尚未实现。
+
+## 实验性预测 TTFT 触发器
+
+`--nimbus-trigger ttft_pred` 用已等待时间、每条在途请求的进度、本请求 prefill
+和首个 decode step,在本地 slots 上模拟 FCFS admission;它不读取 KV gauge。
+绝对时间参数必须按该部署的工作 batch 显式标定:
+
+```bash
+python -m router.run ... --policy nimbus \
+  --nimbus-trigger ttft_pred --nimbus-selector cost_cachedisp_old \
+  --prefill-tput 2000 --tpot-ms 103 --slo-s 5 \
+  --ttft-guard-ms 300 --nimbus-tick-ms 250
+```
+
+selector 有 `newest`、`waiting_random`、`max_cachedisp_old`、
+`cost_cachedisp_old`、`cost_disp_current`。两个 `*_cachedisp_old` 只复用原 v2
+weight 公式做启发式排序,**不是**历史完整 0/1-knapsack 实现。当前 TTFT stop rule
+是诊断口径:把留下的本地请求压到预测不违约,再由悲观 combined 指标判断这次外包
+是否值得。decode 长度仍取 trace 上限(oracle);估计器与 combined-objective 消融是
+后续项。可复现 driver 为 `experiments/run_ttft_selector_matrix.sh`。

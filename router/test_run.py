@@ -200,6 +200,11 @@ class TestCloudConcurrencyGate(unittest.TestCase):
         self.assertEqual(len(results), 10)
         self.assertLessEqual(rec.peak, 2)                 # gate binds
         self.assertGreaterEqual(rec.peak, 2)              # and is actually exercised
+        self.assertGreater(max(r["queue_delay_ms"] for r in results), 40.0)
+        for r in results:
+            self.assertAlmostEqual(
+                r["ttft_ms"], r["queue_delay_ms"] + r["service_ttft_ms"], places=5
+            )
 
 
 class TestParseArgsQueued(unittest.TestCase):

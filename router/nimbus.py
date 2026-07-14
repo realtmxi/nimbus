@@ -1,30 +1,26 @@
-"""Nimbus v3: cost-aware cache-displacement shedding over the waiting queue.
+"""Nimbus queue shedding with independently selectable triggers and selectors.
 
-The policy keeps the three physical quantities separate:
+The default remains the shipped v3 policy:
 
-    footprint(req)    = prompt + expected decode                    [tokens]
-    residence(req)    = prefill time + expected decode * TPOT       [s]
-    displacement(req) = footprint * residence                      [token*s]
+    trigger  = kv_gap
+    selector = cost_disp_current
 
-At each tick:
+The experimental ``ttft_pred`` trigger reuses the same queue hook but predicts
+FCFS admission over the configured local slots.  It includes time already
+waited, estimated releases of in-flight slots, own prefill, and the first
+decode step.  Trigger and selector are deliberately orthogonal so a selector
+comparison uses the same candidate set and stop rule.
 
-    gap = max(0, sum(waiting footprints)
-                 + sum(in-flight remaining decode)
-                 - KV headroom)
-    release_target = gap + hysteresis * KV headroom
-
-Requests are kicked by ascending cloud_cost / displacement until their
-footprints cover the release target. Footprint decides whether the queue fits;
-displacement decides whom to kick; cloud cost makes that ordering
-cost-sensitive. No online knapsack is involved.
-
-See docs/notion_algorithm_design_v3.md. The design is intentionally KV-bound:
-compute/slot-bound overload requires a separate trigger.
+See docs/notion_algorithm_design_v3.md for the v3 baseline and
+docs/v3_experiments_2026-07.md for the experiment record.
 """
 from __future__ import annotations
 
+import hashlib
+import heapq
 import math
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Mapping
 
 from router.common import (
     DEFAULT_KV_HYSTERESIS_FRACTION,
@@ -32,6 +28,31 @@ from router.common import (
     local_prompt_tokens,
     token_cost_usd,
 )
+
+
+NIMBUS_TRIGGERS = ("kv_gap", "ttft_pred")
+NIMBUS_SELECTORS = (
+    "cost_disp_current",
+    "cost_cachedisp_old",
+    "max_cachedisp_old",
+    "newest",
+    "waiting_random",
+)
+
+
+@dataclass(frozen=True)
+class DecisionContext:
+    """Runtime state needed by the predicted-TTFT trigger.
+
+    ``inflight_remaining_s`` contains one estimated slot-release time per
+    locally dispatched request.  Missing slots up to ``max_inflight`` are free
+    now.  Waiting ages are keyed by request id so selector reordering cannot
+    accidentally change deadline accounting.
+    """
+
+    waiting_age_s: Mapping[Any, float]
+    inflight_remaining_s: tuple[float, ...]
+    max_inflight: int
 
 
 def token_footprint(req: dict[str, Any], max_tokens_override: int | None = None) -> int:
@@ -46,6 +67,39 @@ def displacement_token_s(req: dict[str, Any], prefill_tput: float, tpot_s: float
     decode = effective_decode(req, max_tokens_override)
     residence_s = prompt / max(prefill_tput, 1e-9) + decode * tpot_s
     return token_footprint(req, max_tokens_override) * residence_s
+
+
+def classic_cachedisp_token_s(
+    req: dict[str, Any],
+    prefill_tput: float,
+    tpot_s: float,
+    max_tokens_override: int | None = None,
+) -> float:
+    """The original Nimbus v2 formula from commit ``587547a``.
+
+    ``prompt * (uncached_prompt / prefill_tput + decode * TPOT)``.  The outer
+    prompt is the full KV footprint pinned by the request; cached/processed
+    prompt tokens reduce only the remaining prefill time.
+    """
+    prompt = int(req.get("prompt_tokens") or 0)
+    if req.get("uncached_prompt_tokens") is not None:
+        remaining_prefill = max(0, int(req["uncached_prompt_tokens"]))
+    else:
+        processed = int(
+            req.get("num_processed_tokens")
+            or req.get("processed_prompt_tokens")
+            or 0
+        )
+        cached = int(
+            req.get("num_cached_tokens")
+            or req.get("cached_prompt_tokens")
+            or req.get("cached_tokens")
+            or 0
+        )
+        remaining_prefill = max(0, prompt - processed - cached)
+    decode = effective_decode(req, max_tokens_override)
+    residence_s = remaining_prefill / max(prefill_tput, 1e-9) + decode * tpot_s
+    return prompt * residence_s
 
 
 def cloud_cost_usd(req: dict[str, Any], in_price_mtok: float, out_price_mtok: float,
@@ -80,6 +134,125 @@ def shedding_score(
     return cost / displacement
 
 
+def classic_cachedisp_score(
+    req: dict[str, Any],
+    prefill_tput: float,
+    tpot_s: float,
+    in_price_mtok: float,
+    out_price_mtok: float,
+    max_tokens_override: int | None = None,
+) -> float:
+    """Cloud dollars paid per original-v2 token-second released."""
+    displacement = classic_cachedisp_token_s(
+        req, prefill_tput, tpot_s, max_tokens_override
+    )
+    cost = cloud_cost_usd(
+        req, in_price_mtok, out_price_mtok, max_tokens_override
+    )
+    if displacement <= 0:
+        return 0.0 if cost <= 0 else math.inf
+    return cost / displacement
+
+
+def _stable_random_priority(seed: int, request_id: Any) -> bytes:
+    """A retry-stable random key; stale-decision reruns keep the same order."""
+    payload = f"{seed}\0{request_id!r}".encode("utf-8")
+    return hashlib.sha256(payload).digest()
+
+
+def victim_order(
+    waiting: list[dict[str, Any]],
+    selector: str,
+    *,
+    prefill_tput: float,
+    tpot_s: float,
+    in_price_mtok: float,
+    out_price_mtok: float,
+    seed: int,
+    max_tokens_override: int | None = None,
+) -> list[dict[str, Any]]:
+    """Return a deterministic victim priority for a fixed queue snapshot."""
+    if selector == "cost_disp_current":
+        return sorted(
+            waiting,
+            key=lambda r: shedding_score(
+                r,
+                prefill_tput,
+                tpot_s,
+                in_price_mtok,
+                out_price_mtok,
+                max_tokens_override,
+            ),
+        )
+    if selector == "cost_cachedisp_old":
+        return sorted(
+            waiting,
+            key=lambda r: classic_cachedisp_score(
+                r,
+                prefill_tput,
+                tpot_s,
+                in_price_mtok,
+                out_price_mtok,
+                max_tokens_override,
+            ),
+        )
+    if selector == "max_cachedisp_old":
+        return sorted(
+            waiting,
+            key=lambda r: classic_cachedisp_token_s(
+                r, prefill_tput, tpot_s, max_tokens_override
+            ),
+            reverse=True,
+        )
+    if selector == "newest":
+        return list(reversed(waiting))
+    if selector == "waiting_random":
+        return sorted(
+            waiting,
+            key=lambda r: _stable_random_priority(seed, r.get("request_id")),
+        )
+    raise ValueError(f"unknown Nimbus selector {selector!r}")
+
+
+def predicted_waiting_ttfts_s(
+    waiting: list[dict[str, Any]],
+    context: DecisionContext,
+    *,
+    prefill_tput: float,
+    tpot_s: float,
+    max_tokens_override: int | None = None,
+) -> list[float]:
+    """Predict from-arrival TTFT for FCFS waiting requests over parallel slots.
+
+    This is a calibrated online approximation, not an engine-exact simulator.
+    Decode length is the trace/request cap in this first experiment (an oracle
+    input whose estimator ablation is intentionally separate).
+    """
+    if context.max_inflight <= 0:
+        raise ValueError("max_inflight must be positive")
+
+    slots = [max(0.0, float(x)) for x in context.inflight_remaining_s]
+    # Runtime invariants keep len(inflight) <= max_inflight.  If an injected
+    # context violates that, retain every known busy slot rather than silently
+    # discarding work and becoming optimistic.
+    slot_count = max(context.max_inflight, len(slots))
+    slots.extend([0.0] * (slot_count - len(slots)))
+    heapq.heapify(slots)
+
+    predictions: list[float] = []
+    for req in waiting:
+        slot_ready_s = heapq.heappop(slots)
+        prompt = local_prompt_tokens(req)
+        decode = effective_decode(req, max_tokens_override)
+        prefill_s = prompt / max(prefill_tput, 1e-9)
+        age_s = max(0.0, float(context.waiting_age_s.get(req.get("request_id"), 0.0)))
+        # TTFT includes the first decode step; slot residence includes all
+        # requested decode steps before the next queued request can be admitted.
+        predictions.append(age_s + slot_ready_s + prefill_s + tpot_s)
+        heapq.heappush(slots, slot_ready_s + prefill_s + decode * tpot_s)
+    return predictions
+
+
 class NimbusPolicy:
     """Queue-level shedding policy. Interface-compatible with common.Policy
     (outsource/actual_fraction) plus the on_tick hook the runner calls."""
@@ -96,13 +269,30 @@ class NimbusPolicy:
         in_price_mtok: float = 0.15,
         out_price_mtok: float = 1.20,
         hysteresis_fraction: float = DEFAULT_KV_HYSTERESIS_FRACTION,
+        trigger: str = "kv_gap",
+        selector: str = "cost_disp_current",
+        slo_s: float = 5.0,
+        ttft_guard_s: float = 0.0,
     ):
+        if trigger not in NIMBUS_TRIGGERS:
+            raise ValueError(f"unknown Nimbus trigger {trigger!r}")
+        if selector not in NIMBUS_SELECTORS:
+            raise ValueError(f"unknown Nimbus selector {selector!r}")
+        if slo_s <= 0:
+            raise ValueError("slo_s must be positive")
+        if not 0.0 <= ttft_guard_s < slo_s:
+            raise ValueError("ttft_guard_s must be in [0, slo_s)")
         self.prefill_tput = prefill_tput
         self.tpot_s = tpot_s
         self.mto = max_tokens_override
         self.in_price_mtok = in_price_mtok
         self.out_price_mtok = out_price_mtok
         self.hysteresis_fraction = hysteresis_fraction
+        self.trigger = trigger
+        self.selector = selector
+        self.slo_s = slo_s
+        self.ttft_guard_s = ttft_guard_s
+        self.needs_periodic_tick = trigger == "ttft_pred"
         self.seed = seed                 # retained for CLI/interface parity
         self.n_total = 0
         self.n_outsourced = 0
@@ -110,6 +300,17 @@ class NimbusPolicy:
         self.kick_rounds = 0
         self.last_gap_tokens = 0.0
         self.last_release_target_tokens = 0.0
+        self.last_predicted_max_ttft_s = 0.0
+        self.last_post_kick_max_ttft_s = 0.0
+        self.max_predicted_ttft_s_seen = 0.0
+        self.max_post_kick_ttft_s_seen = 0.0
+        # Runner-owned audit counters (kept here so queue_stats can report one
+        # self-contained policy record).
+        self.decision_calls = 0
+        self.decision_total_ms = 0.0
+        self.decision_max_ms = 0.0
+        self.stale_decisions = 0
+        self.applied_kick_rounds = 0
 
     def outsource(self, req: dict[str, Any]) -> bool:
         """Arrival-time hook: nimbus never outsources at arrival — every
@@ -126,13 +327,96 @@ class NimbusPolicy:
         waiting: list[dict[str, Any]],
         kv_headroom_tokens: float,
         inflight_remaining_tokens: float = 0.0,
+        context: DecisionContext | None = None,
     ) -> list[dict[str, Any]]:
-        """Cover the physical KV gap with cost-aware CacheDisp shedding.
+        """Choose victims using the configured trigger and selector.
 
         Pure w.r.t. shared state (telemetry counters only) — safe to run in a
         worker thread; the caller accounts for actually-kicked requests.
         """
         self.ticks += 1
+
+        if self.trigger == "ttft_pred":
+            if context is None:
+                raise ValueError("ttft_pred requires a DecisionContext")
+            self.last_gap_tokens = 0.0
+            self.last_release_target_tokens = 0.0
+            initial = predicted_waiting_ttfts_s(
+                waiting,
+                context,
+                prefill_tput=self.prefill_tput,
+                tpot_s=self.tpot_s,
+                max_tokens_override=self.mto,
+            )
+            self.last_predicted_max_ttft_s = max(initial, default=0.0)
+            self.max_predicted_ttft_s_seen = max(
+                self.max_predicted_ttft_s_seen,
+                self.last_predicted_max_ttft_s,
+            )
+            deadline_s = self.slo_s - self.ttft_guard_s
+            if self.last_predicted_max_ttft_s <= deadline_s:
+                self.last_post_kick_max_ttft_s = self.last_predicted_max_ttft_s
+                self.max_post_kick_ttft_s_seen = max(
+                    self.max_post_kick_ttft_s_seen,
+                    self.last_post_kick_max_ttft_s,
+                )
+                return []
+
+            ranked = victim_order(
+                waiting,
+                self.selector,
+                prefill_tput=self.prefill_tput,
+                tpot_s=self.tpot_s,
+                in_price_mtok=self.in_price_mtok,
+                out_price_mtok=self.out_price_mtok,
+                seed=self.seed,
+                max_tokens_override=self.mto,
+            )
+
+            # For a fixed victim ranking, removing a longer prefix cannot make
+            # any remaining FCFS request later.  Binary-search the minimum
+            # prefix that resolves all predicted violations.
+            def safe_after(k: int) -> bool:
+                victim_ids = {r.get("request_id") for r in ranked[:k]}
+                survivors = [
+                    r for r in waiting if r.get("request_id") not in victim_ids
+                ]
+                predictions = predicted_waiting_ttfts_s(
+                    survivors,
+                    context,
+                    prefill_tput=self.prefill_tput,
+                    tpot_s=self.tpot_s,
+                    max_tokens_override=self.mto,
+                )
+                return max(predictions, default=0.0) <= deadline_s
+
+            lo, hi = 1, len(ranked)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if safe_after(mid):
+                    hi = mid
+                else:
+                    lo = mid + 1
+            kicked = ranked[:lo]
+            victim_ids = {r.get("request_id") for r in kicked}
+            survivors = [r for r in waiting if r.get("request_id") not in victim_ids]
+            post = predicted_waiting_ttfts_s(
+                survivors,
+                context,
+                prefill_tput=self.prefill_tput,
+                tpot_s=self.tpot_s,
+                max_tokens_override=self.mto,
+            )
+            self.last_post_kick_max_ttft_s = max(post, default=0.0)
+            self.max_post_kick_ttft_s_seen = max(
+                self.max_post_kick_ttft_s_seen,
+                self.last_post_kick_max_ttft_s,
+            )
+            self.kick_rounds += 1
+            return kicked
+
+        self.last_predicted_max_ttft_s = 0.0
+        self.last_post_kick_max_ttft_s = 0.0
         waiting_footprint = sum(token_footprint(r, self.mto) for r in waiting)
         gap = max(
             0.0,
@@ -145,26 +429,24 @@ class NimbusPolicy:
             self.last_release_target_tokens = 0.0
             return []
 
+        ranked = victim_order(
+            waiting,
+            self.selector,
+            prefill_tput=self.prefill_tput,
+            tpot_s=self.tpot_s,
+            in_price_mtok=self.in_price_mtok,
+            out_price_mtok=self.out_price_mtok,
+            seed=self.seed,
+            max_tokens_override=self.mto,
+        )
         release_target = gap + (
             self.hysteresis_fraction * max(0.0, kv_headroom_tokens)
         )
         self.last_release_target_tokens = release_target
         self.kick_rounds += 1
-
-        by_score = sorted(
-            waiting,
-            key=lambda r: shedding_score(
-                r,
-                self.prefill_tput,
-                self.tpot_s,
-                self.in_price_mtok,
-                self.out_price_mtok,
-                self.mto,
-            ),
-        )
         kicked: list[dict[str, Any]] = []
         released = 0
-        for victim in by_score:
+        for victim in ranked:
             if released >= release_target:
                 break
             released += token_footprint(victim, self.mto)

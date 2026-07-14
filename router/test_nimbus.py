@@ -10,11 +10,15 @@ import unittest
 
 from router.common import DEFAULT_KV_HYSTERESIS_FRACTION, Endpoint, NullCloud
 from router.nimbus import (
+    DecisionContext,
     NimbusPolicy,
+    classic_cachedisp_token_s,
     cloud_cost_usd,
     displacement_token_s,
+    predicted_waiting_ttfts_s,
     shedding_score,
     token_footprint,
+    victim_order,
 )
 from router.run import KVMonitor, _InflightKVTracker, replay_queued
 from router.test_run import LOCAL, CLOUD, RecordingSender, mk_trace
@@ -40,6 +44,14 @@ class TestFormulas(unittest.TestCase):
             300 * (0.01 + 2.0))
         self.assertAlmostEqual(cloud_cost_usd(req, 0.15, 1.20),
                                (1000 * 0.15 + 200 * 1.20) / 1e6)
+
+    def test_original_v2_formula_is_preserved_exactly(self):
+        req = dict(self.REQ, num_cached_tokens=40, num_processed_tokens=10)
+        # Full prompt is pinned; remaining prefill is 1000 - 40 - 10 = 950.
+        self.assertAlmostEqual(
+            classic_cachedisp_token_s(req, prefill_tput=10_000, tpot_s=0.01),
+            1000 * (950 / 10_000 + 200 * 0.01),
+        )
 
 
 class TestInflightKVTracker(unittest.TestCase):
@@ -132,6 +144,114 @@ class TestOnTick(unittest.TestCase):
         pol = mk_policy()
         self.assertFalse(any(pol.outsource(self.req(i, 10, 10)) for i in range(50)))
         self.assertEqual(pol.actual_fraction, 0.0)
+
+
+class TestPredictedTTFT(unittest.TestCase):
+    @staticmethod
+    def req(rid, prompt=10, decode=10):
+        return {"request_id": rid, "prompt_tokens": prompt, "max_tokens": decode}
+
+    def test_age_own_prefill_and_first_decode_step_are_counted(self):
+        req = self.req("r", prompt=100, decode=4)
+        ctx = DecisionContext(
+            waiting_age_s={"r": 2.0}, inflight_remaining_s=(), max_inflight=1
+        )
+        self.assertEqual(
+            predicted_waiting_ttfts_s(
+                [req], ctx, prefill_tput=100.0, tpot_s=0.5
+            ),
+            [3.5],
+        )
+
+        # Equality meets the SLO; crossing it by 1 ms triggers.
+        exact = NimbusPolicy(
+            100.0, 0.5, trigger="ttft_pred", selector="newest", slo_s=3.5
+        )
+        self.assertEqual(exact.on_tick([req], 0, context=ctx), [])
+        late_ctx = DecisionContext(
+            waiting_age_s={"r": 2.001}, inflight_remaining_s=(), max_inflight=1
+        )
+        self.assertEqual(
+            [r["request_id"] for r in exact.on_tick([req], 0, context=late_ctx)],
+            ["r"],
+        )
+
+    def test_parallel_slots_and_inflight_release_are_simulated(self):
+        waiting = [self.req(i, prompt=0, decode=4) for i in range(3)]
+        ctx = DecisionContext(
+            waiting_age_s={}, inflight_remaining_s=(2.0,), max_inflight=2
+        )
+        self.assertEqual(
+            predicted_waiting_ttfts_s(
+                waiting, ctx, prefill_tput=100.0, tpot_s=0.5
+            ),
+            [0.5, 2.5, 2.5],
+        )
+
+    def test_ttft_trigger_ignores_kv_gap_and_uses_selected_prefix(self):
+        waiting = [self.req(i) for i in range(3)]
+        safe_ctx = DecisionContext(
+            waiting_age_s={}, inflight_remaining_s=(), max_inflight=3
+        )
+        pol = NimbusPolicy(
+            100.0, 0.1, trigger="ttft_pred", selector="newest", slo_s=5.0
+        )
+        self.assertEqual(pol.on_tick(waiting, kv_headroom_tokens=0, context=safe_ctx), [])
+
+        # One busy slot releases at 4s.  FCFS predictions are 4.2, 5.3, 6.4;
+        # newest-first must remove ids 2 then 1 before id 0 is safe.
+        busy_ctx = DecisionContext(
+            waiting_age_s={}, inflight_remaining_s=(4.0,), max_inflight=1
+        )
+        kicked = pol.on_tick(waiting, kv_headroom_tokens=1e9, context=busy_ctx)
+        self.assertEqual([r["request_id"] for r in kicked], [2, 1])
+        self.assertLessEqual(pol.last_post_kick_max_ttft_s, 5.0)
+
+    def test_random_selector_is_retry_stable_and_seeded(self):
+        waiting = [self.req(i) for i in range(20)]
+
+        def order(seed):
+            return [
+                r["request_id"]
+                for r in victim_order(
+                    waiting,
+                    "waiting_random",
+                    prefill_tput=100.0,
+                    tpot_s=0.1,
+                    in_price_mtok=0.15,
+                    out_price_mtok=1.2,
+                    seed=seed,
+                )
+            ]
+
+        self.assertEqual(order(7), order(7))
+        self.assertNotEqual(order(7), order(8))
+
+    def test_old_and_current_displacement_are_distinct_selectors(self):
+        # Current displacement gives decode tokens an outer-footprint term;
+        # original v2 does not.  These two requests deliberately flip order.
+        waiting = [
+            self.req("long-decode", prompt=10, decode=1000),
+            self.req("long-prompt", prompt=500, decode=10),
+        ]
+        old = victim_order(
+            waiting,
+            "max_cachedisp_old",
+            prefill_tput=1000.0,
+            tpot_s=0.01,
+            in_price_mtok=0.15,
+            out_price_mtok=1.2,
+            seed=0,
+        )
+        current = sorted(
+            waiting,
+            key=lambda r: displacement_token_s(r, 1000.0, 0.01),
+            reverse=True,
+        )
+        self.assertNotEqual(
+            [r["request_id"] for r in old],
+            [r["request_id"] for r in current],
+        )
 
 
 class TestReviewRegressions(unittest.TestCase):
@@ -271,9 +391,28 @@ class TestCodexRegressions(unittest.TestCase):
             mk_policy().hysteresis_fraction,
             DEFAULT_KV_HYSTERESIS_FRACTION,
         )
+        configured = parse_args(base + [
+            "--nimbus-trigger", "ttft_pred",
+            "--nimbus-selector", "cost_cachedisp_old",
+            "--prefill-tput", "2000",
+            "--tpot-ms", "103",
+            "--ttft-guard-ms", "250",
+            "--nimbus-tick-ms", "100",
+        ])
+        self.assertEqual(configured.nimbus_trigger, "ttft_pred")
+        self.assertEqual(configured.nimbus_selector, "cost_cachedisp_old")
+        no_kv = [
+            "--data", "t", "--scenario", "normal", "--policy", "nimbus",
+            "--local-url", "http://x", "--local-model", "m",
+            "--nimbus-trigger", "ttft_pred",
+            "--prefill-tput", "2000", "--tpot-ms", "103",
+            "--ttft-guard-ms", "250",
+        ]
+        self.assertIsNone(parse_args(no_kv).kv_capacity_tokens)
         for bad in (["--prefill-tput", "0"], ["--tpot-ms", "-1"],
                     ["--in-price", "-0.1"], ["--cloud-max-concurrency", "-1"],
-                    ["--slo-s", "0"], ["--kv-hysteresis-fraction", "1"]):
+                    ["--slo-s", "0"], ["--kv-hysteresis-fraction", "1"],
+                    ["--ttft-guard-ms", "5000"], ["--nimbus-tick-ms", "0"]):
             with self.assertRaises(SystemExit, msg=bad):
                 parse_args(base + bad)
 
@@ -288,10 +427,10 @@ class TestTickDispatchRace(unittest.TestCase):
         from router.nimbus import NimbusPolicy
 
         class SleepyPolicy(NimbusPolicy):
-            def on_tick(self, waiting, kv, inflight_remaining=0):
+            def on_tick(self, waiting, kv, inflight_remaining=0, context=None):
                 if len(waiting) >= 2:
                     _time.sleep(0.12)          # slow decision window
-                return super().on_tick(waiting, kv, inflight_remaining)
+                return super().on_tick(waiting, kv, inflight_remaining, context)
 
         # r0 small (dispatches first, completes during the slow tick),
         # r1 HUGE displacer at the queue head (the victim),
@@ -333,9 +472,9 @@ class TestStaleDecisionDiscard(unittest.TestCase):
         from router.nimbus import NimbusPolicy
 
         class SleepyPolicy(NimbusPolicy):
-            def on_tick(self, waiting, kv, inflight_remaining=0):
+            def on_tick(self, waiting, kv, inflight_remaining=0, context=None):
                 _time.sleep(0.12)                  # slow decision window
-                return super().on_tick(waiting, kv, inflight_remaining)
+                return super().on_tick(waiting, kv, inflight_remaining, context)
 
         kv_cell = [100.0]     # r0 (footprint 50) fits; r1 (150) does not — yet
 
@@ -452,11 +591,14 @@ class TestIntegration(unittest.TestCase):
     def test_runtime_passes_inflight_remaining_decode_to_policy(self):
         class CapturingPolicy(NimbusPolicy):
             def __init__(self):
-                super().__init__(prefill_tput=20_000, tpot_s=0.0095)
+                super().__init__(prefill_tput=20_000, tpot_s=0.0095,
+                                 trigger="ttft_pred", slo_s=1000.0)
                 self.seen_remaining = []
-            def on_tick(self, waiting, kv, inflight_remaining=0):
+                self.seen_contexts = []
+            def on_tick(self, waiting, kv, inflight_remaining=0, context=None):
                 self.seen_remaining.append(inflight_remaining)
-                return super().on_tick(waiting, kv, inflight_remaining)
+                self.seen_contexts.append(context)
+                return super().on_tick(waiting, kv, inflight_remaining, context)
 
         policy = CapturingPolicy()
         trace = mk_trace(3)
@@ -474,6 +616,57 @@ class TestIntegration(unittest.TestCase):
             send_local=RecordingSender(service_s=0.05), kv_monitor=FakeKV(1e9),
         ))
         self.assertIn(50, policy.seen_remaining)
+        self.assertTrue(any(c and c.max_inflight == 1 for c in policy.seen_contexts))
+        self.assertTrue(any(c and c.inflight_remaining_s for c in policy.seen_contexts))
+
+    def test_ttft_risk_ages_during_event_gap(self):
+        """A queued request must be rechecked even before arrival/completion."""
+        import tempfile
+        from pathlib import Path
+        from router.run import parse_args
+
+        trace = mk_trace(2, prompt_tokens=0, max_tokens=1)
+        out_dir = Path(tempfile.mkdtemp())
+        args = parse_args([
+            "--data", "t", "--scenario", "normal", "--policy", "nimbus",
+            "--local-url", "http://x", "--local-model", "m",
+            "--kv-capacity-tokens", "1000000", "--max-inflight", "1",
+            "--nimbus-trigger", "ttft_pred", "--nimbus-selector", "newest",
+            "--prefill-tput", "1000", "--tpot-ms", "0", "--slo-s", "0.08",
+            "--ttft-guard-ms", "40", "--nimbus-tick-ms", "20",
+            "--out-dir", str(out_dir), "--decision-log", "decisions.jsonl",
+        ])
+        policy = NimbusPolicy(
+            1000.0, 0.0, trigger="ttft_pred", selector="newest", slo_s=0.08,
+            ttft_guard_s=0.04,
+        )
+
+        class UnusedKV:
+            read_failures = 0
+            async def available_tokens(self):
+                raise AssertionError("ttft_pred must not scrape KV metrics")
+            def invalidate(self):
+                pass
+
+        results, _, _ = asyncio.run(replay_queued(
+            args,
+            trace,
+            policy,
+            LOCAL,
+            CLOUD,
+            sink=NullCloud(CLOUD),
+            send_local=RecordingSender(service_s=0.20),
+            kv_monitor=UnusedKV(),
+        ))
+        self.assertEqual(
+            [r["request_id"] for r in results if r["endpoint"] == "cloud"],
+            [1],
+        )
+        cloud_row = next(r for r in results if r["endpoint"] == "cloud")
+        self.assertLess(cloud_row["queue_delay_ms"], 80.0)
+        import json
+        decisions = [json.loads(line) for line in (out_dir / "decisions.jsonl").read_text().splitlines()]
+        self.assertTrue(any(row.get("applied_victim_ids") == [1] for row in decisions))
 
     def test_stale_metrics_are_clamped_by_known_local_commitments(self):
         """A cached full-headroom scrape must not admit beyond capacity."""

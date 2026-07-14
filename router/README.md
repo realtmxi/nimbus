@@ -13,8 +13,8 @@ policy, recording latency, cost, and the split. Single entry point:
 |---|---|
 | `run.py` | **The entry point**: external FIFO + work-conserving dispatcher + KV monitor + CLI |
 | `common.py` | Shared library: `one_request` / `load_trace` / `SCENARIOS` (line-for-line from `vllm/run.py` @ `dff1a81`), `Endpoint`, `Policy`, `NullCloud`, billing, `summarize` |
-| `nimbus.py` | Nimbus v3: physical KV-gap trigger + cost/displacement density ordering (`--policy nimbus --kv-capacity-tokens N`) |
-| `test_run.py` / `test_common.py` / `test_nimbus.py` | 56 unit tests; no network / aiohttp / GPU needed |
+| `nimbus.py` | Nimbus v3 baseline plus orthogonal KV-gap / predicted-TTFT triggers and victim-selector ablations |
+| `test_run.py` / `test_common.py` / `test_nimbus.py` | 63 unit tests; no network / aiohttp / GPU needed |
 
 ## Architecture
 
@@ -68,7 +68,10 @@ Output: per-request JSONL (`ttft_ms = queue_delay_ms + service_ttft_ms`,
 measured from the trace arrival time, comparable with open-loop) plus
 `.summary.json` (overall/local/cloud sections + queue telemetry). Each section
 reports `slo_measured_n` — the explicit SLO denominator after `routed_only`
-rows are excluded. Billing: failed requests cost $0; the local side always $0.
+rows are excluded. `pessimistic_combined` also counts every cloud route as an
+SLO violation, so NullCloud cannot reward over-shedding. Billing: failed
+requests cost $0; the local side always $0. `--decision-log FILE` optionally
+records each applied/stale Nimbus decision and its victim ordering.
 
 Local tests (no network/GPU): `python3 -m unittest router.test_common router.test_run router.test_nimbus`
 
@@ -132,3 +135,27 @@ This policy is deliberately **KV-bound**. Compute/slot-bound overload requires a
 separate trigger and is not silently treated as KV pressure. No online
 knapsack solver runs in v3; an exact cover-form DP is planned as an offline
 evaluation reference and is not yet implemented.
+
+## Experimental predicted-TTFT trigger
+
+`--nimbus-trigger ttft_pred` predicts FCFS admission over local slots from
+waiting age, per-request in-flight progress, own prefill, and the first decode
+step. It does not read the KV gauge. Its absolute timing parameters must be
+explicitly calibrated at the deployment's operating batch:
+
+```bash
+python -m router.run ... --policy nimbus \
+  --nimbus-trigger ttft_pred --nimbus-selector cost_cachedisp_old \
+  --prefill-tput 2000 --tpot-ms 103 --slo-s 5 \
+  --ttft-guard-ms 300 --nimbus-tick-ms 250
+```
+
+Selectors are `newest`, `waiting_random`, `max_cachedisp_old`,
+`cost_cachedisp_old`, and `cost_disp_current`. The two `*_cachedisp_old`
+variants reuse the original v2 weight formula but are heuristic orderings, not
+the historical exact 0/1-knapsack implementation. The current TTFT stop rule
+is diagnostic: it makes all retained local requests predicted-safe, then the
+reported pessimistic-combined metric reveals whether that shedding was
+actually worthwhile. Decode length is still the trace cap (oracle); estimator
+and combined-objective ablations remain follow-up work. The reproducible driver
+is `experiments/run_ttft_selector_matrix.sh`.

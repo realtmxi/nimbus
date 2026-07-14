@@ -474,15 +474,32 @@ def summarize(results: list[dict[str, Any]], policy: Policy, slo_s: float) -> di
 
     local_rows = [r for r in results if r["endpoint"] == "local"]
     cloud_rows = [r for r in results if r["endpoint"] == "cloud"]
+    overall = side_stats(results)
+    local = side_stats(local_rows)
+    cloud = side_stats(cloud_rows)
+    # Paper-facing conservative bound: every cloud-routed request misses the
+    # local TTFT SLO.  This keeps NullCloud runs comparable without inventing a
+    # cloud latency and prevents an aggressive shedder from looking good merely
+    # because routed-only rows are absent from the measured denominator.
+    pessimistic_violations = local["slo_violations"] + len(cloud_rows)
 
     return {
         "policy": policy.name,
         "target_fraction": policy.p,
         "actual_fraction": policy.actual_fraction,
         "slo_s": slo_s,
-        "overall": side_stats(results),
-        "local": side_stats(local_rows),
-        "cloud": side_stats(cloud_rows),
+        "overall": overall,
+        "local": local,
+        "cloud": cloud,
+        "pessimistic_combined": {
+            "slo_violations": pessimistic_violations,
+            "slo_n": len(results),
+            "slo_violation_pct": (
+                100.0 * pessimistic_violations / max(len(results), 1)
+            ),
+            "cloud_assumed_violations": len(cloud_rows),
+            "cost_usd": overall["cost_usd"],
+        },
     }
 
 

@@ -247,6 +247,9 @@ class TestSummarize(unittest.TestCase):
         self.assertEqual(s["actual_fraction"], 0.4)
         self.assertEqual(s["local"]["errors"], {"TimeoutError": 1})
         self.assertEqual(s["local"]["ttft_p50_ms"], 100.0)              # nearest-rank of [100, 9000]
+        self.assertEqual(s["pessimistic_combined"]["slo_violations"], 4)
+        self.assertEqual(s["pessimistic_combined"]["slo_n"], 5)
+        self.assertEqual(s["pessimistic_combined"]["slo_violation_pct"], 80.0)
 
     def test_empty_side(self):
         s = summarize([self.mk("local", 100.0)], Policy("all_local", 0, 0), 5.0)
@@ -302,6 +305,8 @@ class TestNullCloud(unittest.TestCase):
         self.assertEqual(s["overall"]["slo_measured_n"], 1)    # only the local row measured
         self.assertEqual(s["overall"]["slo_violations"], 0)
         self.assertGreater(s["cloud"]["cost_usd"], 0.0)        # but still counted & billed
+        self.assertEqual(s["pessimistic_combined"]["slo_violations"], 3)
+        self.assertEqual(s["pessimistic_combined"]["slo_violation_pct"], 75.0)
 
 
 if __name__ == "__main__":

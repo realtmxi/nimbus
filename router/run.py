@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import time
 from dataclasses import dataclass
@@ -54,6 +55,7 @@ from router.common import (
     resolve_output_path,
     summarize,
 )
+from router.nimbus import DecisionContext, NIMBUS_SELECTORS, NIMBUS_TRIGGERS
 
 try:
     import aiohttp
@@ -123,6 +125,7 @@ class LocalAdmission:
         self.max_inflight = int(max_inflight)
         self.inflight = 0
         self.peak_inflight = 0   # telemetry
+        self.peak_waiting = 0
 
     def fits(self, req: dict[str, Any]) -> bool:
         return self.inflight < self.max_inflight
@@ -149,6 +152,23 @@ class _InflightKVState:
     def current_tokens(self) -> int:
         return self.prompt_tokens + self.generated_tokens
 
+    def estimated_remaining_service_s(
+        self,
+        prefill_tput: float,
+        tpot_s: float,
+    ) -> float:
+        """Conservative time until this request releases its local slot."""
+        remaining_decode_s = self.remaining_decode * tpot_s
+        if self.generated_tokens > 0:
+            return remaining_decode_s
+        full_service_s = (
+            self.prompt_tokens / max(prefill_tput, 1e-9)
+            + self.expected_decode * tpot_s
+        )
+        # Before the first progress report, do not mistake client scheduling or
+        # connection wait for completed prefill/decode work.
+        return full_service_s
+
 
 class _InflightKVTracker:
     """Client-known KV state, updated from exact cumulative engine usage."""
@@ -156,12 +176,14 @@ class _InflightKVTracker:
     def __init__(self, max_tokens_override: int | None):
         self.max_tokens_override = max_tokens_override
         self._states: dict[Any, _InflightKVState] = {}
+        self._version = 0
 
     def add(self, req: dict[str, Any]) -> None:
         self._states[req["request_id"]] = _InflightKVState(
             prompt_tokens=local_prompt_tokens(req),
             expected_decode=effective_decode(req, self.max_tokens_override),
         )
+        self._version += 1
 
     def update_generated(self, request_id: Any, generated_tokens: int) -> None:
         state = self._states.get(request_id)
@@ -170,10 +192,18 @@ class _InflightKVTracker:
         generated = min(state.expected_decode, max(0, int(generated_tokens)))
         # Cumulative stream usage should be monotone. Keep that invariant even
         # if an endpoint repeats or reorders a progress update.
-        state.generated_tokens = max(state.generated_tokens, generated)
+        updated = max(state.generated_tokens, generated)
+        if updated != state.generated_tokens:
+            state.generated_tokens = updated
+            self._version += 1
 
     def remove(self, request_id: Any) -> None:
-        self._states.pop(request_id, None)
+        if self._states.pop(request_id, None) is not None:
+            self._version += 1
+
+    @property
+    def version(self) -> int:
+        return self._version
 
     @property
     def remaining_decode_tokens(self) -> int:
@@ -182,6 +212,16 @@ class _InflightKVTracker:
     @property
     def predicted_current_tokens(self) -> int:
         return sum(state.current_tokens for state in self._states.values())
+
+    def remaining_service_s(
+        self,
+        prefill_tput: float,
+        tpot_s: float,
+    ) -> tuple[float, ...]:
+        return tuple(
+            state.estimated_remaining_service_s(prefill_tput, tpot_s)
+            for state in self._states.values()
+        )
 
 
 async def replay_queued(
@@ -205,6 +245,7 @@ async def replay_queued(
     results: list[dict[str, Any]] = []
     pending: set[asyncio.Task] = set()
     has_tick = hasattr(policy, "on_tick")
+    needs_kv = has_tick and getattr(policy, "trigger", "kv_gap") == "kv_gap"
     # Baselines keep their original payload and pay no Nimbus bookkeeping cost.
     # Injected test senders retain each full commitment until completion.
     inflight_kv = _InflightKVTracker(args.max_tokens) if has_tick else None
@@ -220,7 +261,7 @@ async def replay_queued(
                   if getattr(args, "cloud_max_concurrency", 0) > 0 else None)
 
     async with session_cm as session:
-        if (kv_monitor is None and hasattr(policy, "on_tick")
+        if (kv_monitor is None and needs_kv
                 and session is not None and args.local_url):
             kv_monitor = KVMonitor(session, metrics_url_of(args.local_url),
                                    args.kv_capacity_tokens)
@@ -250,10 +291,21 @@ async def replay_queued(
 
         run_start = time.perf_counter()
         f = out.open("w", encoding="utf-8")
+        decision_f = None
+        if args.decision_log is not None:
+            decision_path = args.decision_log
+            if not decision_path.is_absolute():
+                decision_path = args.out_dir / decision_path
+            decision_path.parent.mkdir(parents=True, exist_ok=True)
+            decision_f = decision_path.open("w", encoding="utf-8", buffering=1)
 
         def record(res: dict[str, Any]) -> None:
             results.append(res)
             f.write(json.dumps(res, ensure_ascii=False) + "\n")
+
+        def record_decision(row: dict[str, Any]) -> None:
+            if decision_f is not None:
+                decision_f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
         async def serve_local(req: dict[str, Any], arrival_due: float) -> None:
             dispatch_t = time.perf_counter()
@@ -325,10 +377,13 @@ async def replay_queued(
                 _finalize_cloud(res, queue_delay_ms)
                 record(res)
             else:
+                cloud_queued_at = time.perf_counter()
                 async def cloud_task():
+                    send_started_at = cloud_queued_at
                     try:
                         if cloud_gate is not None:
                             async with cloud_gate:
+                                send_started_at = time.perf_counter()
                                 res = await send_cloud(req, due)
                         else:
                             res = await send_cloud(req, due)
@@ -344,7 +399,10 @@ async def replay_queued(
                                "chunks": 0, "prompt_tokens": None,
                                "completion_tokens": None, "output_chars": 0,
                                "cost_usd": 0.0, "scheduled_lag_ms": 0.0}
-                    _finalize_cloud(res, queue_delay_ms)
+                    cloud_gate_wait_ms = max(
+                        0.0, (send_started_at - cloud_queued_at) * 1000
+                    )
+                    _finalize_cloud(res, queue_delay_ms + cloud_gate_wait_ms)
                     record(res)
                 task = asyncio.create_task(cloud_task())
                 pending.add(task)
@@ -357,9 +415,10 @@ async def replay_queued(
         # decision re-runs on the fresh queue before admission resumes.
         tick_busy = False
         tick_rerun = False
+        decision_seq = 0
 
         async def maybe_kick() -> None:
-            nonlocal tick_busy, tick_rerun
+            nonlocal tick_busy, tick_rerun, decision_seq
             if not has_tick:
                 return
             assert inflight_kv is not None
@@ -373,12 +432,15 @@ async def replay_queued(
                 retries = 0
                 while True:
                     tick_rerun = False
-                    kv_avail = (await kv_monitor.available_tokens()
-                                if kv_monitor is not None else float("inf"))
+                    kv_avail = (
+                        await kv_monitor.available_tokens()
+                        if needs_kv and kv_monitor is not None
+                        else float("inf")
+                    )
                     # The 250ms metrics cache can briefly predate newly
                     # dispatched prompts. Clamp headroom with commitments we
                     # already know about so a burst cannot slip through blind.
-                    if args.kv_capacity_tokens is not None:
+                    if needs_kv and args.kv_capacity_tokens is not None:
                         predicted_headroom = max(
                             0.0,
                             float(args.kv_capacity_tokens)
@@ -386,21 +448,79 @@ async def replay_queued(
                         )
                         kv_avail = min(kv_avail, predicted_headroom)
                     snapshot = [r for r, _ in queue]
+                    decision_seq += 1
+                    this_decision = decision_seq
+                    snapshot_ids = (
+                        [r["request_id"] for r in snapshot]
+                        if decision_f is not None else None
+                    )
+                    snapshot_hash = (
+                        hashlib.sha256(repr(snapshot_ids).encode("utf-8")).hexdigest()[:16]
+                        if decision_f is not None else None
+                    )
                     remaining_decode = inflight_kv.remaining_decode_tokens
+                    context = None
+                    progress_version = None
+                    if getattr(policy, "trigger", None) == "ttft_pred":
+                        decision_now = time.perf_counter()
+                        progress_version = inflight_kv.version
+                        context = DecisionContext(
+                            waiting_age_s={
+                                r["request_id"]: max(0.0, decision_now - due)
+                                for r, due in queue
+                            },
+                            inflight_remaining_s=inflight_kv.remaining_service_s(
+                                policy.prefill_tput,
+                                policy.tpot_s,
+                            ),
+                            max_inflight=args.max_inflight,
+                        )
                     # heavy work runs off-thread so a deep-queue decision cannot
                     # stall arrival pacing / completions / the KV scrape
+                    on_tick_args = (
+                        (snapshot, kv_avail, remaining_decode, context)
+                        if context is not None
+                        else (snapshot, kv_avail, remaining_decode)
+                    )
+                    decision_started = time.perf_counter()
                     victims = await asyncio.get_running_loop().run_in_executor(
-                        None, policy.on_tick, snapshot, kv_avail, remaining_decode)
+                        None, policy.on_tick, *on_tick_args
+                    )
+                    decision_ms = (time.perf_counter() - decision_started) * 1000
+                    if hasattr(policy, "decision_calls"):
+                        policy.decision_calls += 1
+                        policy.decision_total_ms += decision_ms
+                        policy.decision_max_ms = max(policy.decision_max_ms, decision_ms)
+                    if (progress_version is not None
+                            and inflight_kv.version != progress_version):
+                        tick_rerun = True
                     # a decision computed on a stale window must not be applied:
                     # a completion may have freed KV (stale kicks over-outsource)
                     # or arrivals changed the set. Discard and re-decide on
                     # fresh state — bounded, then apply the latest anyway so a
                     # busy system cannot livelock the shed path.
                     if tick_rerun and queue and retries < 3:
+                        if hasattr(policy, "stale_decisions"):
+                            policy.stale_decisions += 1
+                        record_decision({
+                            "decision_id": this_decision,
+                            "at_s": time.perf_counter() - run_start,
+                            "status": "stale_retry",
+                            "trigger": getattr(policy, "trigger", None),
+                            "selector": getattr(policy, "selector", None),
+                            "snapshot_n": len(snapshot),
+                            "snapshot_hash": snapshot_hash,
+                            "inflight_n": len(context.inflight_remaining_s) if context else admission.inflight,
+                            "predicted_max_ttft_s": getattr(policy, "last_predicted_max_ttft_s", None),
+                            "post_kick_max_ttft_s": getattr(policy, "last_post_kick_max_ttft_s", None),
+                            "proposed_victim_ids": [v["request_id"] for v in victims],
+                            "decision_ms": decision_ms,
+                        })
                         retries += 1
                         if kv_monitor is not None:
                             kv_monitor.invalidate()
                         continue
+                    applied_ids = []
                     for v in victims:
                         idx = next((i for i, (r, _) in enumerate(queue)
                                     if r["request_id"] == v["request_id"]), None)
@@ -409,24 +529,64 @@ async def replay_queued(
                         req, due = queue.pop(idx)
                         waited_ms = max(0.0, (time.perf_counter() - due) * 1000)
                         policy.n_outsourced += 1
+                        applied_ids.append(req["request_id"])
                         route_cloud(req, due, queue_delay_ms=waited_ms)
+                    if applied_ids and hasattr(policy, "applied_kick_rounds"):
+                        policy.applied_kick_rounds += 1
+                    record_decision({
+                        "decision_id": this_decision,
+                        "at_s": time.perf_counter() - run_start,
+                        "status": (
+                            "applied_stale_bounded"
+                            if tick_rerun else ("applied" if applied_ids else "no_op")
+                        ),
+                        "trigger": getattr(policy, "trigger", None),
+                        "selector": getattr(policy, "selector", None),
+                        "snapshot_n": len(snapshot),
+                        "snapshot_hash": snapshot_hash,
+                        "inflight_n": len(context.inflight_remaining_s) if context else admission.inflight,
+                        "predicted_max_ttft_s": getattr(policy, "last_predicted_max_ttft_s", None),
+                        "post_kick_max_ttft_s": getattr(policy, "last_post_kick_max_ttft_s", None),
+                        "proposed_victim_ids": [v["request_id"] for v in victims],
+                        "applied_victim_ids": applied_ids,
+                        "decision_ms": decision_ms,
+                    })
                     if not tick_rerun or not queue:
                         break               # queue unchanged since snapshot
                     retries = 0             # applied; handle the new events
             finally:
                 tick_busy = False
 
+        periodic_tick_s = (
+            args.nimbus_tick_ms / 1000.0
+            if getattr(policy, "needs_periodic_tick", False)
+            else None
+        )
+
+        async def wait_for_arrival(due: float) -> None:
+            """Sleep to an arrival while periodically rechecking TTFT risk."""
+            while True:
+                wait = due - time.perf_counter()
+                if wait <= 0:
+                    return
+                if periodic_tick_s is None:
+                    await asyncio.sleep(wait)
+                    return
+                await asyncio.sleep(min(wait, periodic_tick_s))
+                if queue:
+                    await maybe_kick()
+                    maybe_dispatch()
+
         try:
             for req in trace:
                 due = run_start + req["relative_arrival_s"] * args.time_scale
-                wait = due - time.perf_counter()
-                if wait > 0:
-                    await asyncio.sleep(wait)
+                await wait_for_arrival(due)
 
                 if policy.outsource(req):
                     route_cloud(req, due)
                 else:
                     queue.append((req, due))
+                    admission.peak_waiting = max(admission.peak_waiting, len(queue))
                     # policy adjudicates BEFORE local admission: with a real KV
                     # signal this is KV-aware admission — a saturated engine
                     # (avail ~ 0) sheds new arrivals even while slots are free
@@ -435,13 +595,39 @@ async def replay_queued(
 
             # drain: everything left in queue/in flight completes through the
             # same dispatcher (completions re-trigger maybe_dispatch)
+            next_periodic_tick_at = (
+                time.perf_counter() + periodic_tick_s
+                if periodic_tick_s is not None
+                else None
+            )
             while queue or pending:
                 if pending:
-                    done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                    timeout = (
+                        max(0.0, next_periodic_tick_at - time.perf_counter())
+                        if next_periodic_tick_at is not None
+                        else None
+                    )
+                    done, _ = await asyncio.wait(
+                        pending,
+                        return_when=asyncio.FIRST_COMPLETED,
+                        timeout=timeout,
+                    )
+                    now = time.perf_counter()
+                    if (next_periodic_tick_at is not None
+                            and now >= next_periodic_tick_at):
+                        while next_periodic_tick_at <= now:
+                            next_periodic_tick_at += periodic_tick_s
+                    else:
+                        now = None
+                    if now is not None and queue:
+                        await maybe_kick()
+                        maybe_dispatch()
                 else:  # queue non-empty, nothing in flight -> dispatch now
                     maybe_dispatch()
         finally:
             f.close()
+            if decision_f is not None:
+                decision_f.close()
 
     print(f"raw: {out}")
     return results, admission, kv_monitor
@@ -465,17 +651,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # nimbus policy (see router/nimbus.py)
     parser.add_argument("--kv-capacity-tokens", type=float, default=None,
                         help="engine KV capacity in tokens, from the vLLM startup "
-                             "log 'GPU KV cache size: N tokens' (required for --policy nimbus)")
-    parser.add_argument("--prefill-tput", type=float, default=20000.0,
-                        help="prefill throughput tokens/s for the displacement estimate "
-                             "(kick priority only — relative ordering is what matters)")
-    parser.add_argument("--tpot-ms", type=float, default=9.5,
-                        help="per-output-token time (ms) for the displacement estimate; "
-                             "9.5ms measured on the 35B-A3B+MTP setup")
+                             "log 'GPU KV cache size: N tokens' (required for kv_gap)")
+    parser.add_argument("--prefill-tput", type=float, default=None,
+                        help="effective per-request prefill tokens/s at the operating "
+                             "batch (required calibration for ttft_pred; kv_gap "
+                             "otherwise defaults to 20000)")
+    parser.add_argument("--tpot-ms", type=float, default=None,
+                        help="effective per-request TPOT at the operating batch "
+                             "(required calibration for ttft_pred; kv_gap otherwise "
+                             "defaults to the 35B/MTP profile, 9.5ms)")
     parser.add_argument("--kv-hysteresis-fraction", type=float,
                         default=DEFAULT_KV_HYSTERESIS_FRACTION,
                         help="extra KV headroom fraction released per v3 shedding "
                              "round (default: %(default)s)")
+    parser.add_argument("--nimbus-trigger", choices=NIMBUS_TRIGGERS, default="kv_gap",
+                        help="queue shedding trigger (default preserves Nimbus v3)")
+    parser.add_argument("--nimbus-selector", choices=NIMBUS_SELECTORS,
+                        default="cost_disp_current",
+                        help="victim ordering, independent of the trigger")
+    parser.add_argument("--ttft-guard-ms", type=float, default=None,
+                        help="trigger this many ms before the TTFT SLO (required "
+                             "for ttft_pred; cover tick + decision latency)")
+    parser.add_argument("--nimbus-tick-ms", type=float, default=250.0,
+                        help="wall-clock recheck interval for ttft_pred")
 
     parser.add_argument("--cloud", choices=["null", "real"], default="null")
     parser.add_argument("--cloud-url", default=None)
@@ -495,8 +693,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--timeout-s", type=float, default=DEFAULT_TIMEOUT_S)
     parser.add_argument("--out-dir", type=Path, default=Path("results"))
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--decision-log", type=Path, default=None,
+                        help="optional JSONL audit log for Nimbus decisions")
 
     args = parser.parse_args(argv)
+
+    if args.slo_s <= 0 or args.timeout_s <= 0:
+        parser.error("--slo-s and --timeout-s must be > 0")
+    if args.policy == "nimbus" and args.nimbus_trigger == "ttft_pred":
+        missing = [
+            flag for flag, value in (
+                ("--prefill-tput", args.prefill_tput),
+                ("--tpot-ms", args.tpot_ms),
+                ("--ttft-guard-ms", args.ttft_guard_ms),
+            ) if value is None
+        ]
+        if missing:
+            parser.error("ttft_pred requires explicit calibrated " + ", ".join(missing))
+    if args.prefill_tput is None:
+        args.prefill_tput = 20_000.0
+    if args.tpot_ms is None:
+        args.tpot_ms = 9.5
+    if args.ttft_guard_ms is None:
+        args.ttft_guard_ms = 0.0
 
     if args.max_inflight <= 0:
         parser.error("--max-inflight must be >= 1 (0 would deadlock the dispatcher)")
@@ -509,20 +728,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--tpot-ms must be >= 0")
     if not 0.0 <= args.kv_hysteresis_fraction < 1.0:
         parser.error("--kv-hysteresis-fraction must be in [0,1)")
+    if args.ttft_guard_ms < 0 or args.ttft_guard_ms >= args.slo_s * 1000.0:
+        parser.error("--ttft-guard-ms must be in [0, --slo-s)")
+    if args.nimbus_tick_ms <= 0:
+        parser.error("--nimbus-tick-ms must be > 0")
     if args.in_price < 0 or args.out_price < 0:
         parser.error("--in-price/--out-price must be >= 0")
     if args.cloud_max_concurrency < 0:
         parser.error("--cloud-max-concurrency must be >= 0 (0 = unlimited)")
-    if args.slo_s <= 0 or args.timeout_s <= 0:
-        parser.error("--slo-s and --timeout-s must be > 0")
     if args.time_scale <= 0:
         parser.error("--time-scale must be > 0")
     needs_local = args.policy in ("all_local", "random", "nimbus")
     needs_cloud = args.policy in ("all_cloud", "random", "nimbus")
-    if args.policy == "nimbus" and (args.kv_capacity_tokens is None
-                                    or args.kv_capacity_tokens <= 0):
-        parser.error("--policy nimbus requires --kv-capacity-tokens > 0 "
-                     "(read it from the vLLM startup log)")
+    if (args.policy == "nimbus" and args.nimbus_trigger == "kv_gap"
+            and (args.kv_capacity_tokens is None
+                 or args.kv_capacity_tokens <= 0)):
+        parser.error("--policy nimbus --nimbus-trigger kv_gap requires "
+                     "--kv-capacity-tokens > 0 (read it from the vLLM startup log)")
     if needs_local and not (args.local_url and args.local_model):
         parser.error(f"--policy {args.policy} requires --local-url and --local-model")
     if needs_cloud and args.cloud == "real" and not args.cloud_url:
@@ -549,11 +771,31 @@ def queue_stats(results: list[dict[str, Any]], admission: LocalAdmission,
         "queue_delay_p99_ms": pct(99),
         "queue_delay_max_ms": delays[-1] if delays else None,
         "peak_inflight": admission.peak_inflight,
+        "peak_waiting": admission.peak_waiting,
     }
     if policy is not None and hasattr(policy, "on_tick"):
         stats["nimbus_ticks"] = policy.ticks
         stats["nimbus_kick_rounds"] = policy.kick_rounds
         stats["nimbus_kicked"] = policy.n_outsourced
+        stats["nimbus_trigger"] = getattr(policy, "trigger", None)
+        stats["nimbus_selector"] = getattr(policy, "selector", None)
+        stats["nimbus_applied_kick_rounds"] = getattr(
+            policy, "applied_kick_rounds", None
+        )
+        stats["nimbus_stale_decisions"] = getattr(policy, "stale_decisions", None)
+        decision_calls = getattr(policy, "decision_calls", 0)
+        stats["nimbus_decision_calls"] = decision_calls
+        stats["nimbus_decision_mean_ms"] = (
+            getattr(policy, "decision_total_ms", 0.0) / decision_calls
+            if decision_calls else 0.0
+        )
+        stats["nimbus_decision_max_ms"] = getattr(policy, "decision_max_ms", 0.0)
+        stats["nimbus_max_predicted_ttft_s"] = getattr(
+            policy, "max_predicted_ttft_s_seen", None
+        )
+        stats["nimbus_max_post_kick_ttft_s"] = getattr(
+            policy, "max_post_kick_ttft_s_seen", None
+        )
     if kv_monitor is not None:
         stats["kv_read_failures"] = kv_monitor.read_failures
     return stats
@@ -571,7 +813,11 @@ async def main() -> None:
                               max_tokens_override=args.max_tokens,
                               in_price_mtok=args.in_price,
                               out_price_mtok=args.out_price,
-                              hysteresis_fraction=args.kv_hysteresis_fraction)
+                              hysteresis_fraction=args.kv_hysteresis_fraction,
+                              trigger=args.nimbus_trigger,
+                              selector=args.nimbus_selector,
+                              slo_s=args.slo_s,
+                              ttft_guard_s=args.ttft_guard_ms / 1000.0)
     else:
         policy = Policy(args.policy, args.fraction, args.seed)
     needs_cloud = args.policy in ("all_cloud", "random", "nimbus")
@@ -580,6 +826,24 @@ async def main() -> None:
     results, admission, kv_mon = await replay_queued(args, trace, policy, local, cloud, sink)
     summary = summarize(results, policy, args.slo_s)
     summary["queue"] = queue_stats(results, admission, policy, kv_mon)
+    summary["config"] = {
+        "scenario": args.scenario,
+        "seed": args.seed,
+        "time_scale": args.time_scale,
+        "max_inflight": args.max_inflight,
+        "max_tokens_override": args.max_tokens,
+        "nimbus_trigger": args.nimbus_trigger,
+        "nimbus_selector": args.nimbus_selector,
+        "prefill_tput": args.prefill_tput,
+        "tpot_ms": args.tpot_ms,
+        "slo_s": args.slo_s,
+        "ttft_guard_ms": args.ttft_guard_ms,
+        "nimbus_tick_ms": args.nimbus_tick_ms,
+        "kv_capacity_tokens": args.kv_capacity_tokens,
+        "kv_hysteresis_fraction": args.kv_hysteresis_fraction,
+        "cloud": args.cloud,
+        "cloud_max_concurrency": args.cloud_max_concurrency,
+    }
 
     out = resolve_output_path(args)
     summary_path = out.with_name(out.stem + ".summary.json")

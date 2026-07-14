@@ -17,7 +17,7 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
 
 1. The `router/` framework (external FIFO + work-conserving dispatcher + policies)
    is validated layer-by-layer against the team's trusted open-loop harness
-   (parity ratio 1.003; queue neutrality 110 vs 111 ms). 56/56 unit tests, no GPU needed.
+   (parity ratio 1.003; queue neutrality 110 vs 111 ms). 63/63 unit tests, no GPU needed.
 2. v3 nimbus on the team's hardest cell (`extreme_burst_1200`, n=11,605) produced
    a spectacular headline: **34% self-selected outsourcing, local TTFT p50
    325 s → 0.32 s, SLO violations 97.9% → 0.0%**, cost $1.79.
@@ -43,7 +43,7 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
 | `router/run.py` | Single entry point: external FIFO, work-conserving dispatcher, KV monitor, inflight-KV tracker, CLI |
 | `router/common.py` | Trace loading (BurstGPT windows byte-identical to the trusted `vllm/run.py`; `--scenario full` for arbitrary traces), payloads, SSE client, NullCloud sink, billing, summaries |
 | `router/nimbus.py` | v3 policy: gap trigger + ascending cost/displacement shedding |
-| `router/test_*.py` | 56 unit tests, no network/GPU (`python3 -m unittest router.test_common router.test_run router.test_nimbus`) |
+| `router/test_*.py` | 63 unit tests, no network/GPU (`python3 -m unittest router.test_common router.test_run router.test_nimbus`) |
 | `tools/kv_gauge_probe.py` | Live probe that established the Section-4 finding (stdlib only) |
 | `tools/analyze_eb1200.py` | Timeline reconstruction that flagged the anomaly from a result JSONL |
 
