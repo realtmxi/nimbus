@@ -26,6 +26,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from router.common import Endpoint, one_request
+from router.nimbus import DecisionContext, predicted_waiting_ttfts_s
 from tools.materialize_token_aligned_trace import (
     _tokenizer_fingerprint,
     sized_unique_prompt,
@@ -63,6 +64,27 @@ def _summary(values: list[float]) -> dict[str, float | None]:
     }
 
 
+def _weighted_linear_fit(
+    points: list[tuple[float, float, float]],
+) -> tuple[float, float]:
+    """Fit ``y = intercept + slope*x`` for positive-weight observations."""
+    if not points or any(weight <= 0 for _, _, weight in points):
+        raise ValueError("weighted fit requires positive-weight observations")
+    weight_sum = sum(weight for _, _, weight in points)
+    x_mean = sum(x * weight for x, _, weight in points) / weight_sum
+    y_mean = sum(y * weight for _, y, weight in points) / weight_sum
+    denominator = sum(
+        weight * (x - x_mean) ** 2 for x, _, weight in points
+    )
+    if denominator <= 0:
+        raise ValueError("weighted fit requires distinct x values")
+    slope = sum(
+        weight * (x - x_mean) * (y - y_mean)
+        for x, y, weight in points
+    ) / denominator
+    return y_mean - slope * x_mean, slope
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--base-url", default="http://127.0.0.1:8010")
@@ -93,6 +115,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steady-warmup-max-ttft-ms", type=float, default=5000.0)
     parser.add_argument("--nimbus-tick-ms", type=float, default=250.0,
                         help="periodic trigger delay included in guard recommendation")
+    parser.add_argument("--slo-s", type=float, default=5.0,
+                        help="TTFT SLO used for held-out violation classification")
     parser.add_argument("--timeout-s", type=float, default=600.0)
     parser.add_argument("--salt", default="nimbus-ttft-profile-v1")
     parser.add_argument("--output", type=Path, required=True)
@@ -106,8 +130,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--timeout-s and --kv-capacity-tokens must be positive")
     if args.server_pid <= 0:
         parser.error("--server-pid must be positive")
-    if args.nimbus_tick_ms <= 0 or args.steady_warmup_max_ttft_ms <= 0:
-        parser.error("--nimbus-tick-ms and --steady-warmup-max-ttft-ms must be positive")
+    if (args.nimbus_tick_ms <= 0 or args.steady_warmup_max_ttft_ms <= 0
+            or args.slo_s <= 0):
+        parser.error(
+            "--nimbus-tick-ms, --steady-warmup-max-ttft-ms, and --slo-s "
+            "must be positive"
+        )
     return args
 
 
@@ -327,10 +355,16 @@ async def run() -> None:
             repeat_summaries.append({
                 "repeat": repeat,
                 "n": len(repeat_rows),
+                "scheduler_prompt_total_tokens": sum(
+                    int(row["scheduler_prompt_tokens"]) for row in repeat_rows
+                ),
                 "scheduler_prompt_median_tokens": statistics.median(
                     int(row["scheduler_prompt_tokens"]) for row in repeat_rows
                 ),
                 "ttft_median_ms": statistics.median(
+                    float(row["ttft_ms"]) for row in repeat_rows
+                ),
+                "ttft_max_ms": max(
                     float(row["ttft_ms"]) for row in repeat_rows
                 ),
                 "tpot_median_ms": statistics.median(
@@ -365,66 +399,208 @@ async def run() -> None:
             ]),
         })
 
-    # Reserve one independently scheduled repeat as held-out evidence.  This
-    # calibration is deliberately conservative and deployment-specific: the
-    # slowest effective prefill rate and slowest repeat-median TPOT from the
-    # calibration blocks feed the online predictor.  It is not a claim that
-    # the engine literally executes one request at that scalar rate.
+    # Reserve one independently scheduled repeat as held-out evidence.  Fit
+    # TTFT order statistics against cumulative prompt work, with every
+    # cell/repeat block receiving equal total weight. Request ids do not prove
+    # engine service order after concurrent HTTP submission; within each
+    # homogeneous-prompt cell, sorted TTFT is the auditable service-wave order.
+    # This also prevents the
+    # 128-request cell from dominating the deployment service curve merely by
+    # contributing 128 times as many rows.
     heldout_repeat = args.repeats - 1
-    calibration_repeat_summaries = [
-        summary
-        for cell in cells
-        for summary in cell["repeat_summaries"]
-        if summary["repeat"] != heldout_repeat
+    calibration_rows = [
+        row for row in raw_samples if row["repeat"] != heldout_repeat
     ]
-    recommended_tpot_ms = max(
-        float(summary["tpot_median_ms"])
-        for summary in calibration_repeat_summaries
-    )
-    rate_candidates = []
-    for summary in calibration_repeat_summaries:
-        prompt_tokens = float(summary["scheduler_prompt_median_tokens"])
-        prefill_component_s = max(
-            0.001,
-            (
-                float(summary["ttft_median_ms"])
-                - recommended_tpot_ms
-            ) / 1000.0,
-        )
-        rate_candidates.append(prompt_tokens / prefill_component_s)
-    recommended_prefill_tput = min(rate_candidates)
-    if (not math.isfinite(recommended_prefill_tput)
-            or recommended_prefill_tput <= 0):
-        raise RuntimeError("could not derive a positive prefill calibration")
-
     heldout_rows = [
         row for row in raw_samples if row["repeat"] == heldout_repeat
     ]
-    heldout_underprediction_ms = []
-    heldout_predictions_ms = []
-    for row in heldout_rows:
-        predicted_ms = (
-            float(row["scheduler_prompt_tokens"])
-            / recommended_prefill_tput * 1000.0
-            + recommended_tpot_ms
+
+    def block_rows(
+        source: list[dict[str, Any]],
+        offered_concurrency: int,
+        prompt_tokens: int,
+        repeat: int,
+    ) -> list[dict[str, Any]]:
+        return sorted(
+            (
+                row for row in source
+                if row["offered_concurrency"] == offered_concurrency
+                and row["target_prompt_tokens"] == prompt_tokens
+                and row["repeat"] == repeat
+            ),
+            key=lambda row: (
+                float(row["ttft_ms"]), int(row["request_id"])
+            ),
         )
-        heldout_predictions_ms.append(predicted_ms)
-        heldout_underprediction_ms.append(
-            max(0.0, float(row["ttft_ms"]) - predicted_ms)
-        )
-    error_guard_ms = math.ceil(
-        _percentile(heldout_underprediction_ms, 0.99) or 0.0
+
+    fit_points: list[tuple[float, float, float]] = []
+    for offered_concurrency, prompt_tokens in args.cells:
+        for repeat in range(heldout_repeat):
+            rows = block_rows(
+                calibration_rows, offered_concurrency, prompt_tokens, repeat
+            )
+            if len(rows) != offered_concurrency:
+                raise RuntimeError(
+                    "incomplete calibration block: "
+                    f"B={offered_concurrency} P={prompt_tokens} repeat={repeat}"
+                )
+            cumulative_prompt = 0.0
+            row_weight = 1.0 / len(rows)
+            for row in rows:
+                cumulative_prompt += float(row["scheduler_prompt_tokens"])
+                fit_points.append((
+                    cumulative_prompt,
+                    float(row["ttft_ms"]),
+                    row_weight,
+                ))
+
+    fitted_intercept_ms, fitted_slope_ms_per_token = _weighted_linear_fit(
+        fit_points
     )
-    recommended_guard_ms = math.ceil(error_guard_ms + args.nimbus_tick_ms)
-    uncovered_n = sum(
-        float(row["ttft_ms"]) > predicted_ms + error_guard_ms
-        for row, predicted_ms in zip(heldout_rows, heldout_predictions_ms)
+    if (not math.isfinite(fitted_slope_ms_per_token)
+            or fitted_slope_ms_per_token <= 0):
+        raise RuntimeError("shared-prefill fit did not produce a positive slope")
+    recommended_prefill_tput = 1000.0 / fitted_slope_ms_per_token
+    recommended_first_token_overhead_ms = max(0.0, fitted_intercept_ms)
+    # Slot release uses a distinct quantity from the TTFT intercept.  Keep the
+    # observed calibration maximum TPOT conservative for decode residence.
+    recommended_tpot_ms = max(
+        float(row["tpot_ms"]) for row in calibration_rows
     )
 
+    def predicted_rows_ms(
+        rows: list[dict[str, Any]], offered_concurrency: int
+    ) -> list[float]:
+        requests = [{
+            "request_id": row["request_id"],
+            "prompt_tokens": int(row["scheduler_prompt_tokens"]),
+            "uncached_prompt_tokens": int(row["scheduler_prompt_tokens"]),
+            "max_tokens": int(row["decode_tokens_requested"]),
+        } for row in rows]
+        return [
+            value * 1000.0
+            for value in predicted_waiting_ttfts_s(
+                requests,
+                DecisionContext(
+                    waiting_age_s={},
+                    inflight_remaining_s=(),
+                    max_inflight=offered_concurrency,
+                ),
+                prefill_tput=recommended_prefill_tput,
+                tpot_s=recommended_tpot_ms / 1000.0,
+                first_token_overhead_s=(
+                    recommended_first_token_overhead_ms / 1000.0
+                ),
+            )
+        ]
+
+    calibration_underprediction_ms: list[float] = []
+    for offered_concurrency, prompt_tokens in args.cells:
+        for repeat in range(heldout_repeat):
+            rows = block_rows(
+                calibration_rows, offered_concurrency, prompt_tokens, repeat
+            )
+            predictions_ms = predicted_rows_ms(rows, offered_concurrency)
+            calibration_underprediction_ms.extend(
+                max(0.0, float(row["ttft_ms"]) - predicted_ms)
+                for row, predicted_ms in zip(rows, predictions_ms)
+            )
+    p99_error_guard_ms = math.ceil(
+        _percentile(calibration_underprediction_ms, 0.99) or 0.0
+    )
+    recommended_guard_ms = math.ceil(
+        p99_error_guard_ms + args.nimbus_tick_ms
+    )
+
+    heldout_underprediction_ms: list[float] = []
+    confusion = {
+        "true_positive": 0,
+        "false_negative": 0,
+        "false_positive": 0,
+        "true_negative": 0,
+    }
+    slo_ms = args.slo_s * 1000.0
+    for offered_concurrency, prompt_tokens in args.cells:
+        rows = block_rows(
+            heldout_rows, offered_concurrency, prompt_tokens, heldout_repeat
+        )
+        if len(rows) != offered_concurrency:
+            raise RuntimeError(
+                "incomplete held-out block: "
+                f"B={offered_concurrency} P={prompt_tokens}"
+            )
+        predictions_ms = predicted_rows_ms(rows, offered_concurrency)
+        for row, predicted_ms in zip(rows, predictions_ms):
+            heldout_underprediction_ms.append(
+                max(0.0, float(row["ttft_ms"]) - predicted_ms)
+            )
+            actual_violation = float(row["ttft_ms"]) > slo_ms
+            predicted_violation = (
+                predicted_ms + recommended_guard_ms > slo_ms
+            )
+            key = (
+                "true_positive" if actual_violation else "false_positive"
+            ) if predicted_violation else (
+                "false_negative" if actual_violation else "true_negative"
+            )
+            confusion[key] += 1
+
+    uncovered_n = sum(
+        error > p99_error_guard_ms for error in heldout_underprediction_ms
+    )
+    uncovered_after_recommended_n = sum(
+        error > recommended_guard_ms for error in heldout_underprediction_ms
+    )
+    weight_sum = sum(weight for _, _, weight in fit_points)
+    weighted_y_mean = sum(
+        y * weight for _, y, weight in fit_points
+    ) / weight_sum
+    residual_ss = sum(
+        weight * (
+            y - (
+                recommended_first_token_overhead_ms
+                + fitted_slope_ms_per_token * x
+            )
+        ) ** 2
+        for x, y, weight in fit_points
+    )
+    total_ss = sum(
+        weight * (y - weighted_y_mean) ** 2
+        for _, y, weight in fit_points
+    )
+    weighted_r_squared = 1.0 - residual_ss / total_ss
+
+    if recommended_guard_ms >= slo_ms:
+        raise RuntimeError(
+            f"recommended guard {recommended_guard_ms}ms is not below "
+            f"the {slo_ms}ms SLO"
+        )
+    if confusion["false_negative"]:
+        raise RuntimeError(
+            "held-out TTFT classifier has false negatives: "
+            f"{confusion}"
+        )
+
     artifact = {
-        "schema_version": 1,
+        "schema_version": 2,
         "created_at_unix_s": time.time(),
         "tool_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "predictor_module_sha256": hashlib.sha256(
+            Path(predicted_waiting_ttfts_s.__code__.co_filename).read_bytes()
+        ).hexdigest(),
+        "dependency_sha256": {
+            "router/common.py": hashlib.sha256(
+                (Path(__file__).resolve().parents[1] / "router/common.py")
+                .read_bytes()
+            ).hexdigest(),
+            "tools/materialize_token_aligned_trace.py": hashlib.sha256(
+                (
+                    Path(__file__).resolve().parent
+                    / "materialize_token_aligned_trace.py"
+                ).read_bytes()
+            ).hexdigest(),
+        },
+        "predictor_model": "seq_slots_shared_prefill_lane_v1",
         "command_argv": sys.argv,
         "python_version": sys.version,
         "transformers_version": transformers.__version__,
@@ -449,6 +625,7 @@ async def run() -> None:
             "allow_overload_cells": args.allow_overload_cells,
             "steady_warmup_max_ttft_ms": args.steady_warmup_max_ttft_ms,
             "nimbus_tick_ms": args.nimbus_tick_ms,
+            "slo_s": args.slo_s,
             "timeout_s": args.timeout_s,
         },
         "temporary_directory": tempfile.gettempdir(),
@@ -479,8 +656,10 @@ async def run() -> None:
         "fingerprint": fingerprint,
         "predictor_calibration": {
             "method": (
-                "slowest calibration-block effective prefill rate plus "
-                "slowest calibration-block median TPOT; final repeat held out"
+                "equal-cell weighted least squares of TTFT against cumulative "
+                "prompt tokens in within-cell TTFT order-statistic order; "
+                "calibration p99 positive "
+                "residual plus tick forms the guard; final repeat is held out"
             ),
             "scope": (
                 "independent no-queue service TTFT under offered concurrency; "
@@ -488,16 +667,29 @@ async def run() -> None:
             ),
             "calibration_repeats": list(range(heldout_repeat)),
             "heldout_repeat": heldout_repeat,
+            "within_cell_order": "ttft_order_statistics",
             "recommended_prefill_tput_tokens_per_s": recommended_prefill_tput,
             "recommended_tpot_ms": recommended_tpot_ms,
+            "recommended_first_token_overhead_ms": (
+                recommended_first_token_overhead_ms
+            ),
+            "weighted_r_squared": weighted_r_squared,
+            "target_slo_s": args.slo_s,
+            "calibration_underprediction_ms": _summary(
+                calibration_underprediction_ms
+            ),
             "heldout_underprediction_ms": _summary(
                 heldout_underprediction_ms
             ),
-            "prediction_error_guard_ms_p99": error_guard_ms,
+            "prediction_error_guard_ms_p99": p99_error_guard_ms,
             "nimbus_tick_guard_ms": args.nimbus_tick_ms,
             "recommended_ttft_guard_ms": recommended_guard_ms,
             "heldout_n": len(heldout_rows),
+            "heldout_violation_confusion": confusion,
             "heldout_uncovered_after_error_guard_n": uncovered_n,
+            "heldout_uncovered_after_recommended_guard_n": (
+                uncovered_after_recommended_n
+            ),
         },
         "cells": cells,
         "samples": raw_samples,

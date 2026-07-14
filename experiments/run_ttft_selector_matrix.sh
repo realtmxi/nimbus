@@ -49,7 +49,7 @@ fi
 # an unstable whole-file hash.
 PREFLIGHT="$($PYBIN - "$DATA" "$DATA_MANIFEST" "$PROFILE" "$SERVER_LOG" \
   "$SERVER_PID" "$BASE_URL" "$MODEL" "$MAX_INFLIGHT" "${KV_CAP:-}" \
-  "$NIMBUS_TICK_MS" "$TEMPERATURE" "$IGNORE_EOS" <<'PY'
+  "$NIMBUS_TICK_MS" "$SLO_S" "$TEMPERATURE" "$IGNORE_EOS" <<'PY'
 import hashlib
 import json
 import os
@@ -59,7 +59,7 @@ import urllib.request
 
 (
     data_path, manifest_path, profile_path, log_path, server_pid, url, model,
-    max_inflight, requested_kv, tick_ms, temperature, ignore_eos,
+    max_inflight, requested_kv, tick_ms, slo_s, temperature, ignore_eos,
 ) = sys.argv[1:]
 
 def sha(path):
@@ -77,6 +77,18 @@ if manifest.get("tool_sha256") != sha(os.path.join("tools", "materialize_token_a
     raise SystemExit("trace was not materialized by the current checkout tool")
 if profile.get("tool_sha256") != sha(os.path.join("tools", "profile_ttft_batch.py")):
     raise SystemExit("PROFILE was not produced by the current checkout tool")
+if profile.get("schema_version") != 2:
+    raise SystemExit("PROFILE is not a shared-prefill-lane schema-v2 artifact")
+if profile.get("predictor_model") != "seq_slots_shared_prefill_lane_v1":
+    raise SystemExit("PROFILE predictor model does not match this matrix")
+if profile.get("predictor_module_sha256") != sha(os.path.join("router", "nimbus.py")):
+    raise SystemExit("PROFILE was not calibrated against the current predictor")
+for dependency in (
+    os.path.join("router", "common.py"),
+    os.path.join("tools", "materialize_token_aligned_trace.py"),
+):
+    if profile.get("dependency_sha256", {}).get(dependency) != sha(dependency):
+        raise SystemExit(f"PROFILE dependency differs from checkout: {dependency}")
 if manifest.get("tokenizer_fingerprint") != profile.get("tokenizer_fingerprint"):
     raise SystemExit("trace and PROFILE tokenizer fingerprints differ")
 if manifest.get("cache_mode") != "none":
@@ -158,9 +170,15 @@ if model not in model_ids:
 cal = profile.get("predictor_calibration", {})
 prefill = float(cal.get("recommended_prefill_tput_tokens_per_s", 0))
 tpot = float(cal.get("recommended_tpot_ms", -1))
+first_token = float(cal.get("recommended_first_token_overhead_ms", -1))
 guard = float(cal.get("recommended_ttft_guard_ms", -1))
-if prefill <= 0 or tpot < 0 or guard < 0 or not cal.get("heldout_n"):
+if (prefill <= 0 or tpot < 0 or first_token < 0 or guard < 0
+        or not cal.get("heldout_n")):
     raise SystemExit("PROFILE lacks a usable held-out predictor calibration")
+if float(cal.get("target_slo_s", -1)) != float(slo_s):
+    raise SystemExit("PROFILE target SLO does not match SLO_S")
+if cal.get("heldout_violation_confusion", {}).get("false_negative") != 0:
+    raise SystemExit("PROFILE held-out classifier has false negatives")
 
 fields = [
     data_sha,
@@ -171,6 +189,7 @@ fields = [
     str(profile_kv),
     repr(prefill),
     repr(tpot),
+    repr(first_token),
     repr(guard),
     profile.get("server_log_sha256_at_start"),
     hashlib.sha256(log).hexdigest(),
@@ -181,7 +200,8 @@ print("\t".join(fields))
 PY
 )"
 IFS=$'\t' read -r TRACE_SHA TRACE_MANIFEST_SHA TRACE_N TRACE_SCENARIO PROFILE_SHA KV_CAP \
-  PREFILL_TPUT TPOT_MS TTFT_GUARD_MS SERVER_LOG_PREFIX_SHA SERVER_LOG_SHA \
+  PREFILL_TPUT TPOT_MS FIRST_TOKEN_OVERHEAD_MS TTFT_GUARD_MS \
+  SERVER_LOG_PREFIX_SHA SERVER_LOG_SHA \
   ENDPOINT_VERSION_SHA ENDPOINT_MODELS_SHA <<< "$PREFLIGHT"
 SCENARIO=${SCENARIO:-$TRACE_SCENARIO}
 if [[ "$SCENARIO" != "$TRACE_SCENARIO" ]]; then
@@ -235,7 +255,8 @@ RUN_FINGERPRINT="$($PYBIN - "$TRACE_SHA" "$TRACE_MANIFEST_SHA" "$PROFILE_SHA" \
   "$SERVER_LOG_PREFIX_SHA" "$SERVER_PID" "$ENDPOINT_VERSION_SHA" \
   "$ENDPOINT_MODELS_SHA" "$BASE_URL" "$CHAT_URL" "$COMMIT" "$SCENARIO" \
   "$MAX_INFLIGHT" "$KV_CAP" \
-  "$PREFILL_TPUT" "$TPOT_MS" "$SLO_S" "$TTFT_GUARD_MS" \
+  "$PREFILL_TPUT" "$TPOT_MS" "$FIRST_TOKEN_OVERHEAD_MS" \
+  "$SLO_S" "$TTFT_GUARD_MS" \
   "$NIMBUS_TICK_MS" "$TEMPERATURE" "$IGNORE_EOS" "$IN_PRICE" \
   "$OUT_PRICE" "$ARM_ORDER_MODE" "$ARM_ORDER_SEED" "$@" <<'PY'
 import hashlib
@@ -272,8 +293,9 @@ else
     printf 'python=%s\n' "$($PYBIN --version 2>&1)"
     printf 'scenario=%s max_inflight=%s kv_cap=%s\n' \
       "$SCENARIO" "$MAX_INFLIGHT" "$KV_CAP"
-    printf 'prefill_tput=%s tpot_ms=%s slo_s=%s guard_ms=%s tick_ms=%s\n' \
-      "$PREFILL_TPUT" "$TPOT_MS" "$SLO_S" "$TTFT_GUARD_MS" "$NIMBUS_TICK_MS"
+    printf 'prefill_tput=%s tpot_ms=%s first_token_overhead_ms=%s slo_s=%s guard_ms=%s tick_ms=%s\n' \
+      "$PREFILL_TPUT" "$TPOT_MS" "$FIRST_TOKEN_OVERHEAD_MS" \
+      "$SLO_S" "$TTFT_GUARD_MS" "$NIMBUS_TICK_MS"
     printf 'temperature=%s ignore_eos=%s in_price=%s out_price=%s\n' \
       "$TEMPERATURE" "$IGNORE_EOS" "$IN_PRICE" "$OUT_PRICE"
     printf 'arm_order_mode=%s arm_order_seed=%s\n' \
@@ -334,6 +356,7 @@ PY
     --nimbus-trigger "$trigger" --nimbus-selector "$selector" --seed "$seed"
     --kv-capacity-tokens "$KV_CAP"
     --prefill-tput "$PREFILL_TPUT" --tpot-ms "$TPOT_MS"
+    --first-token-overhead-ms "$FIRST_TOKEN_OVERHEAD_MS"
     --slo-s "$SLO_S" --ttft-guard-ms "$TTFT_GUARD_MS"
     --nimbus-tick-ms "$NIMBUS_TICK_MS"
     --in-price "$IN_PRICE" --out-price "$OUT_PRICE"
@@ -352,8 +375,11 @@ PY
   "${cmd[@]}"
   "$PYBIN" - "$raw" "$summary" "$decisions" "$marker" \
     "$RUN_FINGERPRINT" "$arm" \
-    "$TRACE_N" "$PREFILL_TPUT" "$TPOT_MS" "$TTFT_GUARD_MS" \
-    "$IN_PRICE" "$OUT_PRICE" <<'PY'
+    "$TRACE_N" "$PREFILL_TPUT" "$TPOT_MS" "$FIRST_TOKEN_OVERHEAD_MS" \
+    "$TTFT_GUARD_MS" \
+    "$IN_PRICE" "$OUT_PRICE" "$SLO_S" "$NIMBUS_TICK_MS" \
+    "$MAX_INFLIGHT" "$TEMPERATURE" "$IGNORE_EOS" "$KV_CAP" \
+    "$MODEL" "$CHAT_URL" "$SCENARIO" <<'PY'
 import hashlib
 import json
 import os
@@ -362,10 +388,14 @@ import tempfile
 
 (
     raw_path, summary_path, decisions_path, marker_path, fingerprint, arm, trace_n,
-    prefill_tput, tpot_ms, guard_ms, in_price, out_price,
+    prefill_tput, tpot_ms, first_token_overhead_ms, guard_ms,
+    in_price, out_price, slo_s, tick_ms, max_inflight, temperature,
+    ignore_eos, kv_cap, model, chat_url, scenario,
 ) = sys.argv[1:]
 summary = json.load(open(summary_path, encoding="utf-8"))
 overall = summary["overall"]
+if summary.get("policy") != "nimbus":
+    raise SystemExit(f"summary policy is not nimbus: {summary.get('policy')}")
 if overall["success"] != overall["n"]:
     raise SystemExit(f"arm has failures: {overall['success']}/{overall['n']}")
 if overall["n"] != int(trace_n):
@@ -385,16 +415,41 @@ if alignment.get("decode_cap_hit_n") != alignment.get("decode_measured_n"):
     raise SystemExit(f"decode did not reach controlled cap: {alignment}")
 
 config = summary.get("config", {})
-expected = {
+trigger, selector, seed = arm.split(":", 2)
+expected_float = {
     "prefill_tput": float(prefill_tput),
     "tpot_ms": float(tpot_ms),
+    "first_token_overhead_ms": float(first_token_overhead_ms),
     "ttft_guard_ms": float(guard_ms),
     "in_price": float(in_price),
     "out_price": float(out_price),
+    "slo_s": float(slo_s),
+    "nimbus_tick_ms": float(tick_ms),
+    "temperature": float(temperature),
+    "kv_capacity_tokens": float(kv_cap),
+    "time_scale": 1.0,
 }
-for key, value in expected.items():
+for key, value in expected_float.items():
     if float(config.get(key, float("nan"))) != value:
         raise SystemExit(f"summary config {key}={config.get(key)} != {value}")
+expected_exact = {
+    "scenario": scenario,
+    "seed": int(seed),
+    "max_inflight": int(max_inflight),
+    "ignore_eos": ignore_eos == "1",
+    "nimbus_trigger": trigger,
+    "nimbus_selector": selector,
+    "local_model": model,
+    "local_url": chat_url,
+    "cloud": "null",
+    "max_tokens_override": None,
+}
+for key, value in expected_exact.items():
+    if config.get(key) != value:
+        raise SystemExit(f"summary config {key}={config.get(key)!r} != {value!r}")
+queue = summary.get("queue", {})
+if queue.get("nimbus_trigger") != trigger or queue.get("nimbus_selector") != selector:
+    raise SystemExit("queue telemetry trigger/selector does not match arm")
 
 artifacts = {}
 for name, path in (

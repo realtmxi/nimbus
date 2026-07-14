@@ -17,7 +17,7 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
 
 1. The `router/` framework (external FIFO + work-conserving dispatcher + policies)
    remains validated against the trusted open-loop harness (parity 1.003; queue
-   neutrality 110 vs 111 ms). **70/70** unit tests pass without network/GPU.
+   neutrality 110 vs 111 ms). **75/75** unit tests pass without network/GPU.
 2. The current experiment keeps **TTFT violation as the trigger**. KV is not the
    objective and did not replace the original algorithm. The original v2 weight
    `prompt × (uncached_prompt/prefill_tput + decode×TPOT)` is preserved exactly
@@ -47,11 +47,11 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
 | `router/run.py` | Single entry point: external FIFO, work-conserving dispatcher, KV monitor, inflight-KV tracker, CLI |
 | `router/common.py` | Trace loading (BurstGPT windows byte-identical to the trusted `vllm/run.py`; `--scenario full` for arbitrary traces), payloads, SSE client, NullCloud sink, billing, summaries |
 | `router/nimbus.py` | v3 policy: gap trigger + ascending cost/displacement shedding |
-| `router/test_*.py` | 70 unit tests, no network/GPU (`python3 -m unittest router.test_common router.test_run router.test_nimbus`) |
+| `router/test_*.py` | 75 unit tests, no network/GPU (`python3 -m unittest router.test_common router.test_run router.test_nimbus`) |
 | `tools/kv_gauge_probe.py` | Live probe that established the Section-4 finding (stdlib only) |
 | `tools/analyze_eb1200.py` | Timeline reconstruction that flagged the anomaly from a result JSONL |
 | `tools/materialize_token_aligned_trace.py` | Atomic, tokenizer-fingerprinted no-cache trace materializer |
-| `tools/profile_ttft_batch.py` | Same-payload warmup/profile with a held-out scalar calibration artifact |
+| `tools/profile_ttft_batch.py` | Same-payload warmup/profile with a held-out shared-prefill-lane calibration artifact |
 
 Validation ladder (all on the GPU box, Qwen3.6-35B-A3B + MTP(5), details in
 [`../router/README.md`](../router/README.md)):
@@ -323,6 +323,39 @@ The first framework checkpoint is local commit `b930ab2`. The audit-hardening
 checkpoint and GPU results are recorded after they complete; do not substitute
 the historical dense numbers above for them.
 
+### 5c. CALIBRATION AUDIT 2026-07-14 — 128 slots are not 128 prefill lanes
+
+The first same-server profile was structurally valid: 60/60 measured blocks and
+1,420/1,420 requests succeeded with exact prompt/decode usage. It nevertheless
+produced `prefill=52.504 tok/s`, `TPOT=118.411 ms`, and a `7,792 ms` recommended
+guard. The 5 s matrix correctly refused this artifact because its guard already
+exceeded the SLO.
+
+This was not a bad server. In the held-out `P=512, B=128` block, service TTFT
+ranged from 159 ms to 17.412 s in roughly 16-request waves. The active engine
+reported `max_num_batched_tokens=8192`, exactly 16 × 512: sequence slots admit
+the requests, but one bounded prefill-compute lane determines when each wave
+gets a first token. The old predictor assigned all 128 free-slot requests the
+same TTFT and the old profiler divided one request's 512 tokens by the batch
+median; both abstractions were wrong.
+
+An independent 512-request, 52-cohort token-aligned slice established the
+queue-level all-local anchor: 512/512 success, exact usage, TTFT p50/p95 =
+56.007/152.686 s, 88.09% local 5 s violations, queue-delay p50 = 51.091 s.
+This is a real pressure slice, not a no-op smoke.
+
+The predictor is therefore being revised without changing the original v2
+selector formula: sequence-slot releases plus a shared FIFO prefill lane;
+unfinished in-flight prompts conservatively retain their full work until exact
+stream usage proves first-token completion. Profile schema v2 separately fits
+shared prefill throughput and fixed first-token overhead, keeps TPOT for decode
+residence/the old weight, and compares TTFT order statistics inside each
+homogeneous-prompt cell instead of pretending request ids reveal engine service
+order. It derives the error guard only from calibration repeats and accepts the
+final repeat only if the 5 s classifier has zero false negatives. The new
+profile and queue-level TTFT arm remain required before any selector result is
+reported.
+
 ---
 
 ## 6. Cloud-side accounting (headline-metric decision)
@@ -340,7 +373,7 @@ A real-cloud leg (`--cloud real …`) is only needed once, pre-submission.
 
 1. **Finish and commit the audit contract.** Atomic token-aligned materializer,
    complete-cohort/stale-arrival protection, local usage telemetry, no-cache
-   server/profile binding, and completion markers. *Accept:* 70/70 tests,
+   server/profile binding, and completion markers. *Accept:* 75/75 tests,
    `py_compile`, `bash -n`, and `git diff --check` green.
 2. **Start one dense Qwen3-32B no-cache server and keep one lifecycle.** Record
    the exact parent PID; verify `enable_prefix_caching=False`, KV capacity, and

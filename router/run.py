@@ -55,7 +55,12 @@ from router.common import (
     resolve_output_path,
     summarize,
 )
-from router.nimbus import DecisionContext, NIMBUS_SELECTORS, NIMBUS_TRIGGERS
+from router.nimbus import (
+    DecisionContext,
+    InflightPrefill,
+    NIMBUS_SELECTORS,
+    NIMBUS_TRIGGERS,
+)
 
 try:
     import aiohttp
@@ -152,24 +157,6 @@ class _InflightKVState:
     def current_tokens(self) -> int:
         return self.prompt_tokens + self.generated_tokens
 
-    def estimated_remaining_service_s(
-        self,
-        prefill_tput: float,
-        tpot_s: float,
-    ) -> float:
-        """Conservative time until this request releases its local slot."""
-        remaining_decode_s = self.remaining_decode * tpot_s
-        if self.generated_tokens > 0:
-            return remaining_decode_s
-        full_service_s = (
-            self.prompt_tokens / max(prefill_tput, 1e-9)
-            + self.expected_decode * tpot_s
-        )
-        # Before the first progress report, do not mistake client scheduling or
-        # connection wait for completed prefill/decode work.
-        return full_service_s
-
-
 class _InflightKVTracker:
     """Client-known KV state, updated from exact cumulative engine usage."""
 
@@ -213,14 +200,28 @@ class _InflightKVTracker:
     def predicted_current_tokens(self) -> int:
         return sum(state.current_tokens for state in self._states.values())
 
-    def remaining_service_s(
-        self,
-        prefill_tput: float,
-        tpot_s: float,
-    ) -> tuple[float, ...]:
-        return tuple(
-            state.estimated_remaining_service_s(prefill_tput, tpot_s)
+    @property
+    def unfinished_prefill_tokens(self) -> int:
+        """Conservative shared-lane work not known to have reached first token."""
+        return sum(
+            state.prompt_tokens
             for state in self._states.values()
+            if state.generated_tokens == 0
+        )
+
+    @property
+    def inflight_prefills(self) -> tuple[InflightPrefill, ...]:
+        return tuple(
+            InflightPrefill(state.prompt_tokens, state.expected_decode)
+            for state in self._states.values()
+            if state.generated_tokens == 0
+        )
+
+    def decode_remaining_service_s(self, tpot_s: float) -> tuple[float, ...]:
+        return tuple(
+            state.remaining_decode * tpot_s
+            for state in self._states.values()
+            if state.generated_tokens > 0
         )
 
 
@@ -316,11 +317,25 @@ async def replay_queued(
                 return {}
             return {
                 "prediction_scope": "waiting_only",
+                "prediction_model": "seq_slots_shared_prefill_lane_v1",
                 "waiting_predicted_max_ttft_s": getattr(
                     policy, "last_predicted_max_ttft_s", None
                 ),
                 "waiting_post_kick_max_ttft_s": getattr(
                     policy, "last_post_kick_max_ttft_s", None
+                ),
+            }
+
+        def prediction_context_telemetry(
+            context: DecisionContext | None,
+        ) -> dict[str, Any]:
+            if context is None:
+                return {}
+            return {
+                "inflight_decode_n": len(context.inflight_remaining_s),
+                "inflight_prefill_n": len(context.inflight_prefills),
+                "inflight_prefill_tokens": sum(
+                    state.prompt_tokens for state in context.inflight_prefills
                 ),
             }
 
@@ -521,11 +536,13 @@ async def replay_queued(
                                 r["request_id"]: max(0.0, decision_now - due)
                                 for r, due in queue
                             },
-                            inflight_remaining_s=inflight_kv.remaining_service_s(
-                                policy.prefill_tput,
-                                policy.tpot_s,
+                            inflight_remaining_s=(
+                                inflight_kv.decode_remaining_service_s(
+                                    policy.tpot_s
+                                )
                             ),
                             max_inflight=args.max_inflight,
+                            inflight_prefills=inflight_kv.inflight_prefills,
                         )
                     # heavy work runs off-thread so a deep-queue decision cannot
                     # stall arrival pacing / completions / the KV scrape
@@ -561,9 +578,10 @@ async def replay_queued(
                             "snapshot_n": len(snapshot),
                             "snapshot_hash": snapshot_hash,
                             "inflight_n": (
-                                len(context.inflight_remaining_s)
+                                context.inflight_n
                                 if context else admission.inflight
                             ),
+                            **prediction_context_telemetry(context),
                             **prediction_telemetry(),
                             "proposed_victim_ids": [
                                 v["request_id"] for v in victims
@@ -590,7 +608,11 @@ async def replay_queued(
                             "selector": getattr(policy, "selector", None),
                             "snapshot_n": len(snapshot),
                             "snapshot_hash": snapshot_hash,
-                            "inflight_n": len(context.inflight_remaining_s) if context else admission.inflight,
+                            "inflight_n": (
+                                context.inflight_n
+                                if context else admission.inflight
+                            ),
+                            **prediction_context_telemetry(context),
                             **prediction_telemetry(),
                             "proposed_victim_ids": [v["request_id"] for v in victims],
                             "decision_ms": decision_ms,
@@ -623,7 +645,11 @@ async def replay_queued(
                         "selector": getattr(policy, "selector", None),
                         "snapshot_n": len(snapshot),
                         "snapshot_hash": snapshot_hash,
-                        "inflight_n": len(context.inflight_remaining_s) if context else admission.inflight,
+                        "inflight_n": (
+                            context.inflight_n
+                            if context else admission.inflight
+                        ),
+                        **prediction_context_telemetry(context),
                         **prediction_telemetry(),
                         "proposed_victim_ids": [v["request_id"] for v in victims],
                         "applied_victim_ids": applied_ids,
@@ -772,13 +798,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="engine KV capacity in tokens, from the vLLM startup "
                              "log 'GPU KV cache size: N tokens' (required for kv_gap)")
     parser.add_argument("--prefill-tput", type=float, default=None,
-                        help="effective per-request prefill tokens/s at the operating "
-                             "batch (required calibration for ttft_pred; kv_gap "
+                        help="shared prefill-lane tokens/s for the deployment "
+                             "(required calibration for ttft_pred; kv_gap "
                              "otherwise defaults to 20000)")
     parser.add_argument("--tpot-ms", type=float, default=None,
                         help="effective per-request TPOT at the operating batch "
                              "(required calibration for ttft_pred; kv_gap otherwise "
                              "defaults to the 35B/MTP profile, 9.5ms)")
+    parser.add_argument("--first-token-overhead-ms", type=float, default=None,
+                        help="fixed TTFT intercept for the shared prefill model "
+                             "(required calibration for ttft_pred; distinct "
+                             "from decode TPOT)")
     parser.add_argument("--kv-hysteresis-fraction", type=float,
                         default=DEFAULT_KV_HYSTERESIS_FRACTION,
                         help="extra KV headroom fraction released per v3 shedding "
@@ -829,6 +859,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             flag for flag, value in (
                 ("--prefill-tput", args.prefill_tput),
                 ("--tpot-ms", args.tpot_ms),
+                ("--first-token-overhead-ms", args.first_token_overhead_ms),
                 ("--ttft-guard-ms", args.ttft_guard_ms),
             ) if value is None
         ]
@@ -838,6 +869,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.prefill_tput = 20_000.0
     if args.tpot_ms is None:
         args.tpot_ms = 9.5
+    if args.first_token_overhead_ms is None:
+        args.first_token_overhead_ms = args.tpot_ms
     if args.ttft_guard_ms is None:
         args.ttft_guard_ms = 0.0
 
@@ -850,6 +883,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--prefill-tput must be > 0")
     if args.tpot_ms < 0:
         parser.error("--tpot-ms must be >= 0")
+    if args.first_token_overhead_ms < 0:
+        parser.error("--first-token-overhead-ms must be >= 0")
     if args.temperature is not None and args.temperature < 0:
         parser.error("--temperature must be >= 0")
     if not 0.0 <= args.kv_hysteresis_fraction < 1.0:
@@ -918,6 +953,9 @@ def queue_stats(results: list[dict[str, Any]], admission: LocalAdmission,
         stats["nimbus_decision_max_ms"] = getattr(policy, "decision_max_ms", 0.0)
         if getattr(policy, "trigger", None) == "ttft_pred":
             stats["nimbus_prediction_scope"] = "waiting_only"
+            stats["nimbus_prediction_model"] = (
+                "seq_slots_shared_prefill_lane_v1"
+            )
             stats["nimbus_max_waiting_predicted_ttft_s"] = getattr(
                 policy, "max_predicted_ttft_s_seen", None
             )
@@ -1021,7 +1059,10 @@ async def main() -> None:
                               trigger=args.nimbus_trigger,
                               selector=args.nimbus_selector,
                               slo_s=args.slo_s,
-                              ttft_guard_s=args.ttft_guard_ms / 1000.0)
+                              ttft_guard_s=args.ttft_guard_ms / 1000.0,
+                              first_token_overhead_s=(
+                                  args.first_token_overhead_ms / 1000.0
+                              ))
     else:
         policy = Policy(args.policy, args.fraction, args.seed)
     needs_cloud = args.policy in ("all_cloud", "random", "nimbus")
@@ -1043,6 +1084,7 @@ async def main() -> None:
         "nimbus_selector": args.nimbus_selector,
         "prefill_tput": args.prefill_tput,
         "tpot_ms": args.tpot_ms,
+        "first_token_overhead_ms": args.first_token_overhead_ms,
         "slo_s": args.slo_s,
         "ttft_guard_ms": args.ttft_guard_ms,
         "nimbus_tick_ms": args.nimbus_tick_ms,

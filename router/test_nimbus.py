@@ -11,6 +11,7 @@ import unittest
 from router.common import DEFAULT_KV_HYSTERESIS_FRACTION, Endpoint, NullCloud
 from router.nimbus import (
     DecisionContext,
+    InflightPrefill,
     NimbusPolicy,
     classic_cachedisp_token_s,
     cloud_cost_usd,
@@ -66,12 +67,20 @@ class TestInflightKVTracker(unittest.TestCase):
         tracker.add(req)
         self.assertEqual(tracker.predicted_current_tokens, 20)
         self.assertEqual(tracker.remaining_decode_tokens, 50)
+        self.assertEqual(tracker.unfinished_prefill_tokens, 20)
+        self.assertEqual(
+            tracker.inflight_prefills,
+            (InflightPrefill(prompt_tokens=20, decode_tokens=50),),
+        )
 
         # One content delta may contain seven MTP-accepted tokens. The exact
         # cumulative usage, not the one chunk, advances current KV by seven.
         tracker.update_generated("mtp", 7)
         self.assertEqual(tracker.predicted_current_tokens, 27)
         self.assertEqual(tracker.remaining_decode_tokens, 43)
+        self.assertEqual(tracker.unfinished_prefill_tokens, 0)
+        self.assertEqual(tracker.inflight_prefills, ())
+        self.assertEqual(tracker.decode_remaining_service_s(0.5), (21.5,))
         self.assertEqual(
             tracker.predicted_current_tokens + tracker.remaining_decode_tokens,
             70,
@@ -82,6 +91,9 @@ class TestInflightKVTracker(unittest.TestCase):
         tracker.remove("mtp")
         self.assertEqual(tracker.predicted_current_tokens, 0)
         self.assertEqual(tracker.remaining_decode_tokens, 0)
+        self.assertEqual(tracker.unfinished_prefill_tokens, 0)
+        self.assertEqual(tracker.inflight_prefills, ())
+        self.assertEqual(tracker.decode_remaining_service_s(0.5), ())
 
 
 def mk_policy(**kw):
@@ -176,6 +188,29 @@ class TestPredictedTTFT(unittest.TestCase):
             ["r"],
         )
 
+    def test_fixed_first_token_overhead_is_distinct_from_decode_tpot(self):
+        req = self.req("r", prompt=100, decode=4)
+        ctx = DecisionContext(
+            waiting_age_s={"r": 2.0}, inflight_remaining_s=(), max_inflight=1
+        )
+        self.assertEqual(
+            predicted_waiting_ttfts_s(
+                [req], ctx, prefill_tput=100.0, tpot_s=0.5,
+                first_token_overhead_s=0.25,
+            ),
+            [3.25],
+        )
+
+    def test_profile_weighted_line_fit(self):
+        from tools.profile_ttft_batch import _weighted_linear_fit
+        intercept, slope = _weighted_linear_fit([
+            (0.0, 2.0, 0.5),
+            (1.0, 5.0, 1.0),
+            (2.0, 8.0, 2.0),
+        ])
+        self.assertAlmostEqual(intercept, 2.0)
+        self.assertAlmostEqual(slope, 3.0)
+
     def test_parallel_slots_and_inflight_release_are_simulated(self):
         waiting = [self.req(i, prompt=0, decode=4) for i in range(3)]
         ctx = DecisionContext(
@@ -186,6 +221,46 @@ class TestPredictedTTFT(unittest.TestCase):
                 waiting, ctx, prefill_tput=100.0, tpot_s=0.5
             ),
             [0.5, 2.5, 2.5],
+        )
+
+    def test_free_slots_do_not_make_shared_prefill_simultaneous(self):
+        waiting = [self.req(i, prompt=100, decode=0) for i in range(3)]
+        ctx = DecisionContext(
+            waiting_age_s={}, inflight_remaining_s=(), max_inflight=3
+        )
+        self.assertEqual(
+            predicted_waiting_ttfts_s(
+                waiting, ctx, prefill_tput=100.0, tpot_s=0.5
+            ),
+            [1.5, 2.5, 3.5],
+        )
+
+    def test_unfinished_inflight_prefill_precedes_waiting_work(self):
+        req = self.req("waiting", prompt=100, decode=0)
+        ctx = DecisionContext(
+            waiting_age_s={}, inflight_remaining_s=(), max_inflight=2,
+            inflight_prefills=(
+                InflightPrefill(prompt_tokens=200, decode_tokens=4),
+            ),
+        )
+        self.assertEqual(
+            predicted_waiting_ttfts_s(
+                [req], ctx, prefill_tput=100.0, tpot_s=0.5
+            ),
+            [3.5],
+        )
+
+    def test_slot_release_includes_distinct_first_token_overhead(self):
+        waiting = [self.req(i, prompt=0, decode=1) for i in range(2)]
+        ctx = DecisionContext(
+            waiting_age_s={}, inflight_remaining_s=(), max_inflight=1
+        )
+        self.assertEqual(
+            predicted_waiting_ttfts_s(
+                waiting, ctx, prefill_tput=100.0, tpot_s=0.1,
+                first_token_overhead_s=0.5,
+            ),
+            [0.5, 1.0],
         )
 
     def test_ttft_trigger_ignores_kv_gap_and_uses_selected_prefix(self):
@@ -396,6 +471,7 @@ class TestCodexRegressions(unittest.TestCase):
             "--nimbus-selector", "cost_cachedisp_old",
             "--prefill-tput", "2000",
             "--tpot-ms", "103",
+            "--first-token-overhead-ms", "462",
             "--ttft-guard-ms", "250",
             "--nimbus-tick-ms", "100",
         ])
@@ -406,10 +482,12 @@ class TestCodexRegressions(unittest.TestCase):
             "--local-url", "http://x", "--local-model", "m",
             "--nimbus-trigger", "ttft_pred",
             "--prefill-tput", "2000", "--tpot-ms", "103",
+            "--first-token-overhead-ms", "462",
             "--ttft-guard-ms", "250",
         ]
         self.assertIsNone(parse_args(no_kv).kv_capacity_tokens)
         for bad in (["--prefill-tput", "0"], ["--tpot-ms", "-1"],
+                    ["--first-token-overhead-ms", "-1"],
                     ["--temperature", "-0.1"],
                     ["--in-price", "-0.1"], ["--cloud-max-concurrency", "-1"],
                     ["--slo-s", "0"], ["--kv-hysteresis-fraction", "1"],
@@ -759,7 +837,11 @@ class TestIntegration(unittest.TestCase):
         ))
         self.assertIn(50, policy.seen_remaining)
         self.assertTrue(any(c and c.max_inflight == 1 for c in policy.seen_contexts))
-        self.assertTrue(any(c and c.inflight_remaining_s for c in policy.seen_contexts))
+        self.assertTrue(any(c and c.inflight_prefills for c in policy.seen_contexts))
+        self.assertTrue(any(
+            c and sum(x.prompt_tokens for x in c.inflight_prefills) > 0
+            for c in policy.seen_contexts
+        ))
 
     def test_ttft_risk_ages_during_event_gap(self):
         """A queued request must be rechecked even before arrival/completion."""
@@ -775,6 +857,7 @@ class TestIntegration(unittest.TestCase):
             "--kv-capacity-tokens", "1000000", "--max-inflight", "1",
             "--nimbus-trigger", "ttft_pred", "--nimbus-selector", "newest",
             "--prefill-tput", "1000", "--tpot-ms", "0", "--slo-s", "0.08",
+            "--first-token-overhead-ms", "0",
             "--ttft-guard-ms", "40", "--nimbus-tick-ms", "20",
             "--out-dir", str(out_dir), "--decision-log", "decisions.jsonl",
         ])

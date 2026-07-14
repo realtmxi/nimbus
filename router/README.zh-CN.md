@@ -14,7 +14,7 @@
 | `run.py` | **唯一入口**:外部 FIFO + work-conserving dispatcher + KV 读数器 + CLI |
 | `common.py` | 共享库:`one_request`/`load_trace`/`SCENARIOS`(逐行取自 `vllm/run.py` @ `dff1a81`)、`Endpoint`、`Policy`、`NullCloud`、计费、`summarize` |
 | `nimbus.py` | Nimbus v3 baseline + 正交的 KV-gap / 预测 TTFT 触发器与 victim-selector 消融 |
-| `test_run.py` / `test_common.py` / `test_nimbus.py` | 70 个单元测试,无需网络/aiohttp/GPU |
+| `test_run.py` / `test_common.py` / `test_nimbus.py` | 75 个单元测试,无需网络/aiohttp/GPU |
 
 ## 架构
 
@@ -126,16 +126,22 @@ displacement 只进入踢出排序,cloud price 让排序具备成本意识。额
 
 ## 实验性预测 TTFT 触发器
 
-`--nimbus-trigger ttft_pred` 用已等待时间、每条在途请求的进度、本请求 prefill
-和首个 decode step,在本地 slots 上模拟 FCFS admission;它不读取 KV gauge。
-绝对时间参数必须按该部署的工作 batch 显式标定:
+`--nimbus-trigger ttft_pred` 同时模拟两个资源:本地 sequence slots 和一条共享
+prefill compute lane。128 个空 slot 不代表 128 个并发 prompt 能同时拿到首 token。
+模型计入已等待时间、精确 decode 进度、尚未首 token 的在途 prefill 全量工作、
+等待队列的累计 prefill,以及单独拟合的固定首 token 开销;它不读取 KV gauge。
+绝对时间参数必须在同一部署上显式标定:
 
 ```bash
 python -m router.run ... --policy nimbus \
   --nimbus-trigger ttft_pred --nimbus-selector cost_cachedisp_old \
-  --prefill-tput 2000 --tpot-ms 103 --slo-s 5 \
-  --ttft-guard-ms 300 --nimbus-tick-ms 250
+  --prefill-tput 3270 --tpot-ms 152 --first-token-overhead-ms 461 --slo-s 5 \
+  --ttft-guard-ms 1685 --nimbus-tick-ms 250
 ```
+
+上面的数字只展示参数彼此独立,实际必须读取同一 server 的 profile artifact。
+`first-token-overhead-ms` 只进入 TTFT;`tpot-ms` 用于 decode slot residence,同时仍
+进入原 v2 weight,不能把二者混成一个参数。
 
 selector 有 `newest`、`waiting_random`、`max_cachedisp_old`、
 `cost_cachedisp_old`、`cost_disp_current`。两个 `*_cachedisp_old` 只复用原 v2
@@ -167,6 +173,7 @@ python tools/profile_ttft_batch.py \
   --tokenizer <model-path> --server-log <active-vllm.log> \
   --server-pid <recorded-pid> \
   --kv-capacity-tokens <startup-log-token-capacity> \
+  --slo-s 5 \
   --output <profile.json>
 
 DATA=<aligned.jsonl> BASE_URL=http://127.0.0.1:8010 MODEL=qwen3-32b \

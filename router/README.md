@@ -14,7 +14,7 @@ policy, recording latency, cost, and the split. Single entry point:
 | `run.py` | **The entry point**: external FIFO + work-conserving dispatcher + KV monitor + CLI |
 | `common.py` | Shared library: `one_request` / `load_trace` / `SCENARIOS` (line-for-line from `vllm/run.py` @ `dff1a81`), `Endpoint`, `Policy`, `NullCloud`, billing, `summarize` |
 | `nimbus.py` | Nimbus v3 baseline plus orthogonal KV-gap / predicted-TTFT triggers and victim-selector ablations |
-| `test_run.py` / `test_common.py` / `test_nimbus.py` | 70 unit tests; no network / aiohttp / GPU needed |
+| `test_run.py` / `test_common.py` / `test_nimbus.py` | 75 unit tests; no network / aiohttp / GPU needed |
 
 ## Architecture
 
@@ -144,17 +144,25 @@ evaluation reference and is not yet implemented.
 
 ## Experimental predicted-TTFT trigger
 
-`--nimbus-trigger ttft_pred` predicts FCFS admission over local slots from
-waiting age, per-request in-flight progress, own prefill, and the first decode
-step. It does not read the KV gauge. Its absolute timing parameters must be
-explicitly calibrated at the deployment's operating batch:
+`--nimbus-trigger ttft_pred` predicts FCFS admission over two resources: local
+sequence slots and one shared prefill-compute lane. This matters because 128
+free sequence slots do not make 128 concurrent prompts receive their first
+token simultaneously. The model includes waiting age, exact decode progress,
+conservative unfinished in-flight prefill work, cumulative waiting prefill,
+and a fitted fixed first-token overhead. It does not read the KV gauge. Its
+absolute timing parameters must be explicitly calibrated:
 
 ```bash
 python -m router.run ... --policy nimbus \
   --nimbus-trigger ttft_pred --nimbus-selector cost_cachedisp_old \
-  --prefill-tput 2000 --tpot-ms 103 --slo-s 5 \
-  --ttft-guard-ms 300 --nimbus-tick-ms 250
+  --prefill-tput 3270 --tpot-ms 152 --first-token-overhead-ms 461 --slo-s 5 \
+  --ttft-guard-ms 1685 --nimbus-tick-ms 250
 ```
+
+The numbers above only illustrate the separate parameters; use the values from
+the same-server profile artifact. `first-token-overhead-ms` affects only TTFT.
+`tpot-ms` estimates decode slot residence and remains part of the original v2
+weight, so the two quantities must not be conflated.
 
 Selectors are `newest`, `waiting_random`, `max_cachedisp_old`,
 `cost_cachedisp_old`, and `cost_disp_current`. The two `*_cachedisp_old`
@@ -190,6 +198,7 @@ python tools/profile_ttft_batch.py \
   --tokenizer <model-path> --server-log <active-vllm.log> \
   --server-pid <recorded-pid> \
   --kv-capacity-tokens <startup-log-token-capacity> \
+  --slo-s 5 \
   --output <profile.json>
 
 DATA=<aligned.jsonl> BASE_URL=http://127.0.0.1:8010 MODEL=qwen3-32b \

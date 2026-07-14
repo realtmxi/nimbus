@@ -6,10 +6,12 @@ The default remains the shipped v3 policy:
     selector = cost_disp_current
 
 The experimental ``ttft_pred`` trigger reuses the same queue hook but predicts
-FCFS admission over the configured local slots.  It includes time already
-waited, estimated releases of in-flight slots, own prefill, and the first
-decode step.  Trigger and selector are deliberately orthogonal so a selector
-comparison uses the same candidate set and stop rule.
+FCFS admission over two local resources: sequence slots and one shared prefill
+compute lane.  It includes time already waited, estimated releases of in-flight
+slots, unfinished in-flight prefill work, each waiting request's prefill, and
+the calibrated fixed first-token overhead.  Trigger and selector are
+deliberately orthogonal so a selector comparison uses the same candidate set
+and stop rule.
 
 See docs/notion_algorithm_design_v3.md for the v3 baseline and
 docs/v3_experiments_2026-07.md for the experiment record.
@@ -41,18 +43,34 @@ NIMBUS_SELECTORS = (
 
 
 @dataclass(frozen=True)
+class InflightPrefill:
+    """Admitted request still occupying the shared prefill lane."""
+
+    prompt_tokens: int
+    decode_tokens: int
+
+
+@dataclass(frozen=True)
 class DecisionContext:
     """Runtime state needed by the predicted-TTFT trigger.
 
     ``inflight_remaining_s`` contains one estimated slot-release time per
-    locally dispatched request.  Missing slots up to ``max_inflight`` are free
-    now.  Waiting ages are keyed by request id so selector reordering cannot
-    accidentally change deadline accounting.
+    request already known to be decoding.  ``inflight_prefills`` contains
+    admitted requests that have not produced a first token, in dispatch order;
+    the simulator derives both their shared-lane completion and slot release
+    instead of counting their prefill twice.  Missing slots up to
+    ``max_inflight`` are free now.  Waiting ages are keyed by request id so
+    selector reordering cannot accidentally change deadline accounting.
     """
 
     waiting_age_s: Mapping[Any, float]
     inflight_remaining_s: tuple[float, ...]
     max_inflight: int
+    inflight_prefills: tuple[InflightPrefill, ...] = ()
+
+    @property
+    def inflight_n(self) -> int:
+        return len(self.inflight_remaining_s) + len(self.inflight_prefills)
 
 
 def token_footprint(req: dict[str, Any], max_tokens_override: int | None = None) -> int:
@@ -220,18 +238,45 @@ def predicted_waiting_ttfts_s(
     *,
     prefill_tput: float,
     tpot_s: float,
+    first_token_overhead_s: float | None = None,
     max_tokens_override: int | None = None,
 ) -> list[float]:
-    """Predict from-arrival TTFT for FCFS waiting requests over parallel slots.
+    """Predict from-arrival TTFT over sequence slots plus shared prefill.
 
     This is a calibrated online approximation, not an engine-exact simulator.
     Decode length is the trace/request cap in this first experiment (an oracle
-    input whose estimator ablation is intentionally separate).
+    input whose estimator ablation is intentionally separate).  Prefill work
+    is serialized because continuous-batching engines share a bounded prefill
+    token budget: giving 128 requests 128 free sequence slots does not make all
+    128 first tokens simultaneous.
     """
     if context.max_inflight <= 0:
         raise ValueError("max_inflight must be positive")
+    first_token_s = (
+        tpot_s
+        if first_token_overhead_s is None
+        else float(first_token_overhead_s)
+    )
+    if first_token_s < 0:
+        raise ValueError("first_token_overhead_s must be non-negative")
+    if any(
+        state.prompt_tokens < 0 or state.decode_tokens < 0
+        for state in context.inflight_prefills
+    ):
+        raise ValueError("inflight prefill token counts must be non-negative")
 
     slots = [max(0.0, float(x)) for x in context.inflight_remaining_s]
+    prefill_ready_s = 0.0
+    for state in context.inflight_prefills:
+        prefill_ready_s += (
+            float(state.prompt_tokens) / max(prefill_tput, 1e-9)
+        )
+        heapq.heappush(
+            slots,
+            prefill_ready_s
+            + first_token_s
+            + max(0, state.decode_tokens - 1) * tpot_s,
+        )
     # Runtime invariants keep len(inflight) <= max_inflight.  If an injected
     # context violates that, retain every known busy slot rather than silently
     # discarding work and becoming optimistic.
@@ -239,17 +284,29 @@ def predicted_waiting_ttfts_s(
     slots.extend([0.0] * (slot_count - len(slots)))
     heapq.heapify(slots)
 
+    # The tracker cannot observe partial prefill progress, so each admitted
+    # prefill above retains its full work until exact output usage proves it
+    # reached decode.  This is conservative without inventing engine progress.
     predictions: list[float] = []
     for req in waiting:
         slot_ready_s = heapq.heappop(slots)
         prompt = local_prompt_tokens(req)
         decode = effective_decode(req, max_tokens_override)
         prefill_s = prompt / max(prefill_tput, 1e-9)
+        prefill_started_s = max(slot_ready_s, prefill_ready_s)
+        prefill_done_s = prefill_started_s + prefill_s
         age_s = max(0.0, float(context.waiting_age_s.get(req.get("request_id"), 0.0)))
-        # TTFT includes the first decode step; slot residence includes all
-        # requested decode steps before the next queued request can be admitted.
-        predictions.append(age_s + slot_ready_s + prefill_s + tpot_s)
-        heapq.heappush(slots, slot_ready_s + prefill_s + decode * tpot_s)
+        # TTFT includes the fitted fixed first-token overhead. Slot residence
+        # includes all requested decode steps after prefill before the next
+        # queued request can be admitted; waiting prefill cannot overtake it.
+        predictions.append(age_s + prefill_done_s + first_token_s)
+        heapq.heappush(
+            slots,
+            prefill_done_s
+            + first_token_s
+            + max(0, decode - 1) * tpot_s,
+        )
+        prefill_ready_s = prefill_done_s
     return predictions
 
 
@@ -273,6 +330,7 @@ class NimbusPolicy:
         selector: str = "cost_disp_current",
         slo_s: float = 5.0,
         ttft_guard_s: float = 0.0,
+        first_token_overhead_s: float | None = None,
     ):
         if trigger not in NIMBUS_TRIGGERS:
             raise ValueError(f"unknown Nimbus trigger {trigger!r}")
@@ -292,6 +350,13 @@ class NimbusPolicy:
         self.selector = selector
         self.slo_s = slo_s
         self.ttft_guard_s = ttft_guard_s
+        self.first_token_overhead_s = (
+            tpot_s
+            if first_token_overhead_s is None
+            else first_token_overhead_s
+        )
+        if self.first_token_overhead_s < 0:
+            raise ValueError("first_token_overhead_s must be non-negative")
         self.needs_periodic_tick = trigger == "ttft_pred"
         self.seed = seed                 # retained for CLI/interface parity
         self.n_total = 0
@@ -346,6 +411,7 @@ class NimbusPolicy:
                 context,
                 prefill_tput=self.prefill_tput,
                 tpot_s=self.tpot_s,
+                first_token_overhead_s=self.first_token_overhead_s,
                 max_tokens_override=self.mto,
             )
             self.last_predicted_max_ttft_s = max(initial, default=0.0)
@@ -386,6 +452,7 @@ class NimbusPolicy:
                     context,
                     prefill_tput=self.prefill_tput,
                     tpot_s=self.tpot_s,
+                    first_token_overhead_s=self.first_token_overhead_s,
                     max_tokens_override=self.mto,
                 )
                 return max(predictions, default=0.0) <= deadline_s
@@ -405,6 +472,7 @@ class NimbusPolicy:
                 context,
                 prefill_tput=self.prefill_tput,
                 tpot_s=self.tpot_s,
+                first_token_overhead_s=self.first_token_overhead_s,
                 max_tokens_override=self.mto,
             )
             self.last_post_kick_max_ttft_s = max(post, default=0.0)
