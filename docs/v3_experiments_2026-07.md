@@ -510,6 +510,21 @@ floor; it returns in the full cell. The 2026-07-14 pass is run 0
   deterministic selector, the selection-layer claim is void regardless of the
   old/current ordering.
 
+**Execution note (2026-07-15, added while the campaign's profile stage was
+still running — no matrix data existed yet).** A concurrent session had
+already deployed `cac4a5d` (one commit before this registration) to the GPU
+box and started the item-6 campaign: fresh server lifecycle (same recipe, KV
+112,656 confirmed) plus a fresh lifecycle-1 profile. That session will likely
+execute item 6 as written at `cac4a5d`: Latin square over
+old/`newest`/current plus ≥3 separate `waiting_random` seeds — i.e. `newest`
+inside the rotation and random arms not position-balanced. To avoid duplicate
+GPU load and cross-contamination of its calibration, this session did NOT
+launch a second campaign. The **decision rule above is frozen as-is** and
+applies unchanged to that design (it needs paired old-vs-current blocks,
+intra-arm spread, and ≥3 random seeds — all present); the random arms'
+lack of position balancing is recorded as a limitation, and the executed arm
+table will be documented from the run manifests, not assumed.
+
 **Explicit non-goals.** This matrix cannot show generalization — it reuses
 the same 512 requests as run 0, so it measures run-to-run noise and order
 effects only. Generalization is assigned to the full 11,605-request cell
