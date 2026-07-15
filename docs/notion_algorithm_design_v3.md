@@ -2,13 +2,16 @@
 
 # Nimbus Algorithm Design (v3, KV-bound)
 
-> **Status (2026-07-14): shipped baseline, not the current experiment
+> **Status (2026-07-15): shipped baseline, not the current experiment
 > trigger.** The repository still defaults to the `kv_gap` algorithm described
-> here. The July-14 dense-32B experiment explicitly selects the orthogonal
+> here. The July-14/15 dense-32B experiment explicitly selects the orthogonal
 > `ttft_pred` trigger, which sheds only when calibrated waiting-request TTFT is
 > predicted to violate the SLO; it then compares the same victim-ordering
-> signals under one stop rule. That path is experimental, not yet the default.
-> See [`v3_experiments_2026-07.md`](v3_experiments_2026-07.md), Sections 5b–5d.
+> signals under one stop rule. Six repeatability blocks promote
+> `ttft_pred + cost_cachedisp_old` to the primary experimental candidate, but
+> do not replace this default; current displacement remains a required
+> comparator. See
+> [`v3_experiments_2026-07.md`](v3_experiments_2026-07.md), Sections 5b–5g.
 > Its no-cache leg has `cached_tokens=0`, so it does not validate the cached
 > term of the original v2 formula.
 

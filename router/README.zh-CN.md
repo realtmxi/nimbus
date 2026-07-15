@@ -150,7 +150,9 @@ weight 公式做启发式排序,**不是**历史完整 0/1-knapsack 实现。当
 请求不在这个 post-kick 声明里,因此 decision log/summary 明确标作
 `prediction_scope=waiting_only`。再由悲观 combined 指标判断这次外包是否值得。
 decode 长度仍取 trace 上限(oracle);估计器与 combined-objective 消融是后续项。
-可复现 driver 为 `experiments/run_ttft_selector_matrix.sh`。
+可复现 driver 为 `experiments/run_ttft_selector_matrix.sh`;显式的
+`anchor:all_local:0` arm 复用同一套绑定 manifest/marker 合约,但不会假装该
+anchor 存在 Nimbus trigger 或 decision log。
 
 ### token 对齐的 no-cache 实验前置条件
 

@@ -174,7 +174,9 @@ decision log and summary label the scope `waiting_only`. The reported
 pessimistic-combined metric then reveals whether that shedding was actually
 worthwhile. Decode length is still the trace cap (oracle); estimator and
 combined-objective ablations remain follow-up work. The reproducible driver is
-`experiments/run_ttft_selector_matrix.sh`.
+`experiments/run_ttft_selector_matrix.sh`; an explicit
+`anchor:all_local:0` arm uses the same bound manifest/marker contract without
+pretending the anchor has a Nimbus trigger or decision log.
 
 ### Token-aligned no-cache experiment prerequisite
 

@@ -15,6 +15,15 @@ The current online implementation is `router/`, following
 The top-level `nimbus/` package is the legacy FLOP/online-knapsack prototype;
 it is retained only for historical analysis and is not imported by the router.
 
+**Algorithm status (2026-07-15):** the shipped/default router remains
+`kv_gap + cost_disp_current`. A dense-32B no-cache campaign is evaluating
+`ttft_pred + cost_cachedisp_old`: predicted TTFT decides when/how much to shed,
+while the exact old V2 token-seconds formula ranks whom to shed. Six
+repeatability blocks made it the primary experimental candidate, not the new
+default. See
+[`docs/v3_experiments_2026-07.md`](docs/v3_experiments_2026-07.md), Sections
+5b–5g, for the evidence and remaining gates.
+
 ## Repository Structure
 
 ```

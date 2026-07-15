@@ -2,12 +2,13 @@
 
 # Nimbus 算法设计（v3，KV 受限）
 
-> **状态（2026-07-14）：这是已发布的 baseline，不是当前实验的触发器。**
-> 仓库默认仍是本文描述的 `kv_gap`。7 月 14 日 dense-32B 实验显式选择了
+> **状态（2026-07-15）：这是已发布的 baseline，不是当前实验的触发器。**
+> 仓库默认仍是本文描述的 `kv_gap`。7 月 14–15 日 dense-32B 实验显式选择了
 > 与 selector 正交的 `ttft_pred`：只有在标定模型预测等待请求将违反 TTFT
-> SLO 时才外发，再在同一停止条件下比较不同的 victim ordering。该路径目前
-> 仍是实验选项，并未改成默认算法。详见
-> [`v3_experiments_2026-07.md`](v3_experiments_2026-07.md) 第 5b–5d 节。
+> SLO 时才外发，再在同一停止条件下比较不同的 victim ordering。六个重复性
+> block 将 `ttft_pred + cost_cachedisp_old` 提升为首要实验候选，但没有替换
+> 本文默认算法；current displacement 仍是必须保留的对照。详见
+> [`v3_experiments_2026-07.md`](v3_experiments_2026-07.md) 第 5b–5g 节。
 > 该腿关闭了 prefix cache，`cached_tokens=0`，因此不能验证旧 v2 公式中的
 > cached-token 项。
 

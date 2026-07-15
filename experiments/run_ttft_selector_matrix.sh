@@ -268,6 +268,13 @@ else
   ARM_ORDER_MODE=explicit
 fi
 
+# Validate every arm before creating a manifest or launching router.run.  The
+# only non-Nimbus arm is the exact audited anchor spelling below; near-misses
+# are rejected rather than leaking "anchor" into argparse as a trigger name.
+for arm in "$@"; do
+  "$PYBIN" -m tools.ttft_matrix_evidence describe-arm "$arm" >/dev/null
+done
+
 COMMIT=$(git rev-parse HEAD)
 RUN_FINGERPRINT="$($PYBIN - "$TRACE_SHA" "$TRACE_MANIFEST_SHA" "$PROFILE_SHA" \
   "$SERVER_LOG_PREFIX_SHA" "$SERVER_PID" "$ENDPOINT_VERSION_SHA" \
@@ -327,38 +334,31 @@ else
 fi
 
 for arm in "$@"; do
-  IFS=: read -r trigger selector seed <<< "$arm"
-  if [[ -z "$trigger" || -z "$selector" || -z "$seed" ]]; then
-    printf 'invalid arm %q; expected trigger:selector:seed\n' "$arm" >&2
-    exit 2
-  fi
+  read -r _arm_kind _policy trigger selector seed < <(
+    "$PYBIN" -m tools.ttft_matrix_evidence describe-arm "$arm"
+  )
 
   stem="${SCENARIO}_${trigger}_${selector}_seed${seed}"
   raw="$OUT_DIR/${stem}.jsonl"
   summary="$OUT_DIR/${stem}.summary.json"
   decisions="$OUT_DIR/${stem}.decisions.jsonl"
   marker="$OUT_DIR/${stem}.complete.json"
+  evidence_cmd=(
+    "$PYBIN" -m tools.ttft_matrix_evidence validate
+    --raw "$raw" --summary "$summary" --decisions "$decisions"
+    --marker "$marker" --fingerprint "$RUN_FINGERPRINT" --arm "$arm"
+    --trace-n "$TRACE_N"
+    --prefill-tput "$PREFILL_TPUT" --tpot-ms "$TPOT_MS"
+    --first-token-overhead-ms "$FIRST_TOKEN_OVERHEAD_MS"
+    --ttft-guard-ms "$TTFT_GUARD_MS"
+    --in-price "$IN_PRICE" --out-price "$OUT_PRICE"
+    --slo-s "$SLO_S" --nimbus-tick-ms "$NIMBUS_TICK_MS"
+    --max-inflight "$MAX_INFLIGHT" --temperature "$TEMPERATURE"
+    --ignore-eos "$IGNORE_EOS" --kv-capacity-tokens "$KV_CAP"
+    --model "$MODEL" --chat-url "$CHAT_URL" --scenario "$SCENARIO"
+  )
   if [[ -e "$marker" ]]; then
-    "$PYBIN" - "$marker" "$raw" "$summary" "$decisions" \
-      "$RUN_FINGERPRINT" "$arm" <<'PY'
-import hashlib
-import json
-import sys
-marker_path, raw_path, summary_path, decisions_path, fingerprint, arm = sys.argv[1:]
-marker = json.load(open(marker_path, encoding="utf-8"))
-if marker.get("run_fingerprint") != fingerprint or marker.get("arm") != arm:
-    raise SystemExit("completion marker does not match this matrix run")
-for name, path in (
-    ("raw", raw_path), ("summary", summary_path), ("decisions", decisions_path)
-):
-    content = open(path, "rb").read()
-    evidence = marker.get("artifacts", {}).get(name, {})
-    if hashlib.sha256(content).hexdigest() != evidence.get("sha256"):
-        raise SystemExit(f"completed {name} hash no longer matches its marker")
-    line_n = sum(bool(line.strip()) for line in content.splitlines())
-    if line_n != evidence.get("nonempty_line_n"):
-        raise SystemExit(f"completed {name} line count no longer matches marker")
-PY
+    "${evidence_cmd[@]}"
     printf 'skip completed arm: %s\n' "$arm"
     continue
   fi
@@ -367,11 +367,15 @@ PY
     exit 3
   fi
 
+  policy_args=()
+  while IFS= read -r arg; do
+    policy_args+=("$arg")
+  done < <("$PYBIN" -m tools.ttft_matrix_evidence policy-cli "$arm")
   cmd=(
     "$PYBIN" -m router.run
-    --data "$DATA" --scenario "$SCENARIO" --policy nimbus
+    --data "$DATA" --scenario "$SCENARIO" "${policy_args[@]}"
     --local-url "$CHAT_URL" --local-model "$MODEL" --max-inflight "$MAX_INFLIGHT"
-    --nimbus-trigger "$trigger" --nimbus-selector "$selector" --seed "$seed"
+    --seed "$seed"
     --kv-capacity-tokens "$KV_CAP"
     --prefill-tput "$PREFILL_TPUT" --tpot-ms "$TPOT_MS"
     --first-token-overhead-ms "$FIRST_TOKEN_OVERHEAD_MS"
@@ -391,117 +395,7 @@ PY
     printf '\n'
   } >> "$EVENTS"
   "${cmd[@]}"
-  "$PYBIN" - "$raw" "$summary" "$decisions" "$marker" \
-    "$RUN_FINGERPRINT" "$arm" \
-    "$TRACE_N" "$PREFILL_TPUT" "$TPOT_MS" "$FIRST_TOKEN_OVERHEAD_MS" \
-    "$TTFT_GUARD_MS" \
-    "$IN_PRICE" "$OUT_PRICE" "$SLO_S" "$NIMBUS_TICK_MS" \
-    "$MAX_INFLIGHT" "$TEMPERATURE" "$IGNORE_EOS" "$KV_CAP" \
-    "$MODEL" "$CHAT_URL" "$SCENARIO" <<'PY'
-import hashlib
-import json
-import os
-import sys
-import tempfile
-
-(
-    raw_path, summary_path, decisions_path, marker_path, fingerprint, arm, trace_n,
-    prefill_tput, tpot_ms, first_token_overhead_ms, guard_ms,
-    in_price, out_price, slo_s, tick_ms, max_inflight, temperature,
-    ignore_eos, kv_cap, model, chat_url, scenario,
-) = sys.argv[1:]
-summary = json.load(open(summary_path, encoding="utf-8"))
-overall = summary["overall"]
-if summary.get("policy") != "nimbus":
-    raise SystemExit(f"summary policy is not nimbus: {summary.get('policy')}")
-if overall["success"] != overall["n"]:
-    raise SystemExit(f"arm has failures: {overall['success']}/{overall['n']}")
-if overall["n"] != int(trace_n):
-    raise SystemExit(f"arm row count {overall['n']} != trace n {trace_n}")
-alignment = summary.get("token_alignment", {})
-if not alignment.get("measured_n"):
-    raise SystemExit("no measured local rows for token-alignment audit")
-if alignment.get("missing_prompt_usage_n") != 0:
-    raise SystemExit(f"missing prompt usage: {alignment}")
-if alignment.get("prompt_exact_n") != alignment.get("measured_n"):
-    raise SystemExit(f"prompt token mismatch: {alignment}")
-if alignment.get("decode_measured_n") != alignment.get("measured_n"):
-    raise SystemExit(f"missing completion usage: {alignment}")
-if alignment.get("missing_completion_usage_n") != 0:
-    raise SystemExit(f"missing completion usage: {alignment}")
-if alignment.get("decode_cap_hit_n") != alignment.get("decode_measured_n"):
-    raise SystemExit(f"decode did not reach controlled cap: {alignment}")
-
-config = summary.get("config", {})
-trigger, selector, seed = arm.split(":", 2)
-expected_float = {
-    "prefill_tput": float(prefill_tput),
-    "tpot_ms": float(tpot_ms),
-    "first_token_overhead_ms": float(first_token_overhead_ms),
-    "ttft_guard_ms": float(guard_ms),
-    "in_price": float(in_price),
-    "out_price": float(out_price),
-    "slo_s": float(slo_s),
-    "nimbus_tick_ms": float(tick_ms),
-    "temperature": float(temperature),
-    "kv_capacity_tokens": float(kv_cap),
-    "time_scale": 1.0,
-}
-for key, value in expected_float.items():
-    if float(config.get(key, float("nan"))) != value:
-        raise SystemExit(f"summary config {key}={config.get(key)} != {value}")
-expected_exact = {
-    "scenario": scenario,
-    "seed": int(seed),
-    "max_inflight": int(max_inflight),
-    "ignore_eos": ignore_eos == "1",
-    "nimbus_trigger": trigger,
-    "nimbus_selector": selector,
-    "local_model": model,
-    "local_url": chat_url,
-    "cloud": "null",
-    "max_tokens_override": None,
-}
-for key, value in expected_exact.items():
-    if config.get(key) != value:
-        raise SystemExit(f"summary config {key}={config.get(key)!r} != {value!r}")
-queue = summary.get("queue", {})
-if queue.get("nimbus_trigger") != trigger or queue.get("nimbus_selector") != selector:
-    raise SystemExit("queue telemetry trigger/selector does not match arm")
-
-artifacts = {}
-for name, path in (
-    ("raw", raw_path), ("summary", summary_path), ("decisions", decisions_path)
-):
-    content = open(path, "rb").read()
-    artifacts[name] = {
-        "sha256": hashlib.sha256(content).hexdigest(),
-        "nonempty_line_n": sum(
-            bool(line.strip()) for line in content.splitlines()
-        ),
-    }
-if artifacts["raw"]["nonempty_line_n"] != int(trace_n):
-    raise SystemExit("raw artifact line count does not equal trace n")
-if artifacts["decisions"]["nonempty_line_n"] <= 0:
-    raise SystemExit("decision log is empty")
-marker = {
-    "schema_version": 1,
-    "run_fingerprint": fingerprint,
-    "arm": arm,
-    "artifacts": artifacts,
-}
-directory = os.path.dirname(marker_path) or "."
-with tempfile.NamedTemporaryFile(
-    mode="w", encoding="utf-8", dir=directory,
-    prefix=".complete.", suffix=".tmp", delete=False,
-) as f:
-    tmp = f.name
-    json.dump(marker, f, indent=2)
-    f.write("\n")
-    f.flush()
-    os.fsync(f.fileno())
-os.replace(tmp, marker_path)
-PY
+  "${evidence_cmd[@]}" --write-marker
   printf 'arm_finished_at=%s arm=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$arm" \
     >> "$EVENTS"
   sleep "$COOLDOWN_S"
