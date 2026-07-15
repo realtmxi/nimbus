@@ -465,6 +465,65 @@ reached 20/18/15 candidates (old/current/newest). Multi-request decisions were
 unique and exactly equal to each arm's routed rows. The matrix is explicitly
 labeled `single-pass exploratory`.
 
+### 5e. PRE-REGISTERED 2026-07-15 — balanced replicate matrix (design + decision rule)
+
+Registered before the runs; the runs must be judged against this contract.
+
+**Question.** Is the 9-request old-vs-current gap real (the observed
+same-selector noise floor is 12 requests, Section 5d), and does either
+deterministic selector beat chance under the identical `ttft_pred` trigger?
+
+**Design.** 3×3 Latin square on the same heldout512 slice, one fresh no-cache
+server lifecycle, and a fresh same-recipe profile — the PID/log binding makes
+the retired v2 profile unusable by construction, so the r2 fit doubles as a
+calibration-stability check against v2 (3264.25 tok/s, 455.11 ms overhead,
+151.84 ms TPOT, 1683 ms guard). Arms are passed as explicit argv per block
+(`ARM_ORDER_MODE=explicit` in each manifest):
+
+| Block | Pos 1 | Pos 2 | Pos 3 |
+|---|---|---|---|
+| 1 | old | current | waiting_random(101) |
+| 2 | current | waiting_random(202) | old |
+| 3 | waiting_random(303) | old | current |
+
+Every arm occupies every position exactly once. `waiting_random` sits inside
+the square because it is the chance control for the selection layer; `newest`
+is a real policy (naive admission spill), not a chance control, and is not
+replicated — its single-pass deficit (63.67% vs 50.20%) dwarfs the noise
+floor; it returns in the full cell. The 2026-07-14 pass is run 0
+(order-confounded; reported separately, not averaged in).
+
+**Decision rule (registered).**
+- Primary metric: pessimistic combined violation. With 0 local violations this
+  equals the kicked fraction — intended: fewer kicks at equal local safety =
+  more relief per kick. Secondary: NullCloud cost; the winner must not be >5%
+  worse on mean cost.
+- Adopt old-v2 as the primary selector iff it wins ≥2/3 blocks on the primary
+  metric AND its mean advantage exceeds the max intra-arm spread across
+  blocks. Mirrored condition for current displacement.
+- Tie (mean gap ≤ intra-arm spread): adopt old-v2 anyway — it is the original
+  design and the simpler story ("the weight was right; the trigger was
+  wrong") — and demote current displacement to an ablation arm. Record the
+  tie explicitly; the paper claim then becomes "old ≈ current, both ≫ chance
+  and naive spill", not "old > current".
+- Falsification: if any waiting_random block lands within 5 pp of the best
+  deterministic selector, the selection-layer claim is void regardless of the
+  old/current ordering.
+
+**Explicit non-goals.** This matrix cannot show generalization — it reuses
+the same 512 requests as run 0, so it measures run-to-run noise and order
+effects only. Generalization is assigned to the full 11,605-request cell
+(11,093 requests untouched by any tuning), gated on this matrix, with
+same-server anchor arms rerun from scratch: `kv_gap + cost_disp_current` (the
+v3 default) and `all_local` — the July-13 dense anchors came from a
+mis-calibrated TPOT (78 ms vs measured ~103 ms), a cache-enabled server, and
+a non-token-aligned trace, and must not be cited for comparison. Debts that
+block any default flip are unchanged (Section 7 item 7): estimated-vs-oracle
+decode (trigger and weight both consume oracle decode lengths today), a
+real-cloud leg (pessimistic combined ranks arms fairly only because every arm
+shares NullCloud), the `max_cachedisp_old` ablation (is the cost division
+load-bearing?), and the cache-aware `(P−C)` term.
+
 ---
 
 ## 6. Cloud-side accounting (headline-metric decision)
@@ -501,12 +560,14 @@ upper bound under NullCloud, not observed cloud latency. A real-cloud leg
    configuration bindings passed. Old-v2 ordering beat `newest` clearly in one
    pass. Its 9-request lead over current is smaller than the observed
    12-request same-selector difference, so that comparison remains unresolved.
-6. **NEXT — establish repeatability before changing the default.** Run at least
-   three complete 512-request matrices in balanced cyclic order
-   (old→newest→current, newest→current→old, current→old→newest), plus
-   `waiting_random` with ≥3 seeds. Use the stable endpoint fingerprint from
-   `93bf9f1`; report paired distributions, not only one aggregate table. If the
-   old-v2 selector remains Pareto-better, repeat the full 11,605-request cell.
+6. **RUNNING — establish repeatability before changing the default.** Design
+   and decision rule are pre-registered in Section 5e (`waiting_random` moved
+   inside the Latin square as the chance control; `newest` dropped from the
+   rotation because its margin dwarfs the noise floor — it returns in the full
+   cell). Uses the stable endpoint fingerprint from `93bf9f1`; report paired
+   per-block distributions, not only one aggregate table. If old-v2 passes the
+   5e rule, run the full 11,605-request cell with same-server `kv_gap` v3 and
+   `all_local` anchor arms.
 7. **THEN restore missing semantics:** cache-aware trace for the cached-token
    term; estimated-vs-oracle decode; historical exact 0/1-DP/offline oracle;
    load/guard sweeps; real-cloud latency leg. The hybrid binding-resource result
