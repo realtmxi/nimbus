@@ -2,20 +2,21 @@
 
 # Nimbus Algorithm Design (v3, KV-bound)
 
-> **Status (2026-07-15): shipped baseline, not the current experiment
-> trigger.** The repository still defaults to the `kv_gap` algorithm described
-> here. The July-14/15 dense-32B experiment explicitly selects the orthogonal
-> `ttft_pred` trigger, which sheds only when calibrated waiting-request TTFT is
-> predicted to violate the SLO; it then compares the same victim-ordering
-> signals under one stop rule. Six repeatability blocks promote
-> `ttft_pred + cost_cachedisp_old` to the primary experimental candidate, but
-> do not replace this default; current displacement remains a required
-> comparator. See
+> **Status (2026-07-15): shipped baseline, not the recommended TTFT design.**
+> The repository still defaults to the `kv_gap` algorithm described here, but
+> the completed 11,605-request dense-32B no-cache cell falsified it as a
+> sufficient TTFT-safety trigger on that workload: 5,249/5,545 retained-local
+> requests violated 5 s. Under the orthogonal `ttft_pred` trigger, exact old-V2
+> and current-displacement ordering each had zero local violations; old V2 was
+> route-equivalent and cheaper. The frozen selector-independent safety gate
+> still failed because naive `newest` had 39 violations outside the profile
+> support envelope. The next design step is therefore a support-aware TTFT
+> predictor, not a return to KV-only triggering. No default is changed; the
+> no-cache/oracle-decode/NullCloud cell also does not validate the cached term,
+> an online decode estimator, or real-cloud SLO. See
 > [`v3_experiments_2026-07.md`](v3_experiments_2026-07.md), Sections 5b–5g.
-> Its no-cache leg has `cached_tokens=0`, so it does not validate the cached
-> term of the original v2 formula.
 
-**Scope assumption (stated up front):** the binding local resource is the KV
+**Scope assumption of this historical baseline:** the binding local resource is the KV
 cache. Experiments use workloads where KV saturates first (e.g. long-prompt
 production slices). Compute/slot-bound overload is out of scope for this
 design and is discussed under limitations.
@@ -104,13 +105,15 @@ million input tokens, $1.20 per million output tokens).
 
 ## Part 2 — Two quantities of the system
 
-**K_headroom — how much GPU memory we may still commit (unit: tokens).** Not
-an estimate: the serving engine (vLLM) exposes a metrics endpoint that we poll
-every 0.25 s for the real KV usage. Example: total capacity 216,512 tokens,
-requests currently running inside the engine occupy 166,000 → K_headroom =
-50,512. (If a safety-capped capacity `K_safe` — e.g. 90 % of total — is used,
-then `K_headroom = K_safe − current_KV_usage`; by default `K_headroom =
-K_avail`, the raw free amount.)
+**K_headroom — how much GPU memory we may still commit (unit: tokens).** This
+quantity is valid only after a deployment-specific gauge probe establishes
+that the serving engine's metric is token-KV occupancy. The same metric name
+can instead represent per-sequence state on a hybrid architecture; multiplying
+that percentage by a token capacity would then invent a false unit. In a
+verified token-KV deployment, poll every 0.25 s. Example: total capacity
+216,512 tokens and measured occupancy 166,000 gives K_headroom = 50,512. (If a
+safety-capped capacity `K_safe` — e.g. 90 % of total — is used, then
+`K_headroom = K_safe − current_KV_usage`; by default `K_headroom = K_avail`.)
 
 **remaining_decode of an in-flight request (unit: tokens).** A running request
 keeps growing — each generated token takes one more KV slot. Its remaining

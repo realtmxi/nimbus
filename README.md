@@ -15,12 +15,17 @@ The current online implementation is `router/`, following
 The top-level `nimbus/` package is the legacy FLOP/online-knapsack prototype;
 it is retained only for historical analysis and is not imported by the router.
 
-**Algorithm status (2026-07-15):** the shipped/default router remains
-`kv_gap + cost_disp_current`. A dense-32B no-cache campaign is evaluating
-`ttft_pred + cost_cachedisp_old`: predicted TTFT decides when/how much to shed,
-while the exact old V2 token-seconds formula ranks whom to shed. Six
-repeatability blocks made it the primary experimental candidate, not the new
-default. See
+**Algorithm status (2026-07-15):** the shipped/default Nimbus combination
+remains `kv_gap + cost_disp_current`, but the completed dense-32B no-cache full
+cell falsified it as a sufficient TTFT-safety trigger on that workload (94.7%
+of retained-local requests violated 5 s). The experimental direction is
+`ttft_pred` for when/how much to shed, with a resource-sensitive selector for
+whom. Exact old-V2 `cost_cachedisp_old` and current `cost_disp_current` each had
+zero local violations; old V2 was route-equivalent and cheaper. The frozen
+all-selector safety gate nevertheless failed because naive `newest` left 39
+local violations outside the calibration support envelope. Therefore old V2
+survives as an ordering signal, TTFT predictor hardening is next, and no
+default has been changed. See
 [`docs/v3_experiments_2026-07.md`](docs/v3_experiments_2026-07.md), Sections
 5b–5g, for the evidence and remaining gates.
 

@@ -115,8 +115,10 @@ release_target = G + 0.05 × K_headroom
     直到 Σ footprint(kicked) >= release_target
 ```
 
-footprint 与 `/metrics` 实读的 headroom 单位一致,共同决定"放不放得下";
-displacement 只进入踢出排序,cloud price 让排序具备成本意识。额外释放 5% headroom
+只有当 deployment gauge 探针已验证 token-KV 语义时，footprint 与
+`/metrics` headroom 才共享同一单位，并共同决定"放不放得下"。metric 名称
+本身不是证明：hybrid-model gauge 可能表示每序列状态。displacement 只进入
+踢出排序，cloud price 让排序具备成本意识。额外释放 5% headroom
 避免紧接着再次触发。Nimbus 本地请求会启用 vLLM continuous usage stats,按精确累计
 生成 token 数跟踪进度,不再把 MTP content chunk 当作单个 token。
 
@@ -153,6 +155,16 @@ decode 长度仍取 trace 上限(oracle);估计器与 combined-objective 消融�
 可复现 driver 为 `experiments/run_ttft_selector_matrix.sh`;显式的
 `anchor:all_local:0` arm 复用同一套绑定 manifest/marker 合约,但不会假装该
 anchor 存在 Nimbus trigger 或 decision log。
+
+**当前证据边界（2026-07-15）。** 在已完成的预注册 11,605-request dense-32B
+no-cache full cell 中，`ttft_pred + cost_cachedisp_old` 与 `ttft_pred +
+cost_disp_current` 留在本地的请求均为 0 违约；old V2 位于冻结的路由等价带内，
+且成本低 4.98%。`ttft_pred + newest` 留下 39 个违约，这些违约都发生在
+client-visible load 超出 profile 支持域时；`kv_gap + cost_disp_current` 则留下 5,249 个违约。
+因此 `ttft_pred` 仍属实验性，还需要显式 support-envelope/resource fallback；
+`kv_gap` 保留为代码默认是为了兼容，并不代表它已被证明能保证 TTFT 安全。
+详见 [`../docs/v3_experiments_2026-07.md`](../docs/v3_experiments_2026-07.md)
+第 5g 节。
 
 ### token 对齐的 no-cache 实验前置条件
 

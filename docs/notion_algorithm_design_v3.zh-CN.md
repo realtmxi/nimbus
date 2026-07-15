@@ -2,17 +2,19 @@
 
 # Nimbus 算法设计（v3，KV 受限）
 
-> **状态（2026-07-15）：这是已发布的 baseline，不是当前实验的触发器。**
-> 仓库默认仍是本文描述的 `kv_gap`。7 月 14–15 日 dense-32B 实验显式选择了
-> 与 selector 正交的 `ttft_pred`：只有在标定模型预测等待请求将违反 TTFT
-> SLO 时才外发，再在同一停止条件下比较不同的 victim ordering。六个重复性
-> block 将 `ttft_pred + cost_cachedisp_old` 提升为首要实验候选，但没有替换
-> 本文默认算法；current displacement 仍是必须保留的对照。详见
+> **状态（2026-07-15）：这是已发布 baseline，不是推荐的 TTFT 设计。**
+> 仓库默认仍是本文描述的 `kv_gap`，但已完成的 11,605-request dense-32B
+> no-cache full cell 已否定它在该负载上足以保证 TTFT 安全：留下本地的 5,545 个
+> 请求中有 5,249 个超过 5 秒。换成正交的 `ttft_pred` 触发器后，exact old-V2
+> 与 current-displacement 排序都做到本地 0 违约；old V2 的路由数等价且成本
+> 更低。冻结的 selector-independent safety gate 仍然失败，因为 naive
+> `newest` 在 profile 支持域外留下了 39 个违约。所以下一步应做 support-aware
+> TTFT predictor，而不是退回 KV-only 触发。仓库默认暂不改变；这条
+> no-cache/oracle-decode/NullCloud 实验也不能验证 cached-token 项、在线 decode
+> 估计或真实云 SLO。详见
 > [`v3_experiments_2026-07.md`](v3_experiments_2026-07.md) 第 5b–5g 节。
-> 该腿关闭了 prefix cache，`cached_tokens=0`，因此不能验证旧 v2 公式中的
-> cached-token 项。
 
-**范围假设（开宗明义）：** 本地绑定资源是 KV 缓存。实验使用 KV 先饱和的负载（例如长 prompt 的生产切片）。算力/slot 受限的过载不在本设计范围内，在 limitations 中讨论。
+**这一历史 baseline 的范围假设：** 本地绑定资源是 KV 缓存。实验使用 KV 先饱和的负载（例如长 prompt 的生产切片）。算力/slot 受限的过载不在本设计范围内，在 limitations 中讨论。
 
 ---
 
@@ -75,7 +77,14 @@ cost(r) = 2000 × ($0.15 / 1M) + 300 × ($1.20 / 1M) ≈ $0.0007
 
 ## 第 2 部分 — 系统的两个量
 
-**K_headroom — 我们还可再承诺多少 GPU 内存（单位：tokens）。** 不是估计：服务引擎（vLLM）暴露 metrics 端点，我们每 0.25 s 轮询真实 KV 用量。例子：总容量 216,512 tokens，引擎内正在跑的请求占 166,000 → K_headroom = 50,512。（若使用安全上限 `K_safe`——例如总量的 90%——则 `K_headroom = K_safe − current_KV_usage`；默认 `K_headroom = K_avail`，即原始空闲量。）
+**K_headroom — 我们还可再承诺多少 GPU 内存（单位：tokens）。**
+只有当 deployment-specific gauge 探针已证明服务引擎的 metric 确实表示
+token-KV occupancy 时，这个量才成立。同名 metric 在 hybrid 架构上可能
+表示每序列固定状态；此时再把百分比乘以 token 容量，就是人为造出错误单位。
+在已验证 token-KV 语义的部署上，可每 0.25 s 轮询：例如总容量 216,512
+tokens，实测占用 166,000，则 K_headroom = 50,512。（若使用安全上限
+`K_safe`，则 `K_headroom = K_safe − current_KV_usage`；默认
+`K_headroom = K_avail`。）
 
 **飞行中请求的 remaining_decode（单位：tokens）。** 正在跑的请求会持续增长——每生成一个 token 多占一个 KV 槽。其剩余增长为 `expected output tokens − tokens generated so far`。对于本地 vLLM 请求，实现会启用 `stream_options.continuous_usage_stats`，在每次流式更新中读取引擎给出的精确累计 completion-token 数。实现不会再把 content chunk 当成 token：MTP 下一个 content chunk 可以包含多个已接受 token。这笔已承诺的未来增长必须计入压力。若端点未返回 continuous usage，请求会显式失败，而不是静默退回有偏的 chunk 计数。
 

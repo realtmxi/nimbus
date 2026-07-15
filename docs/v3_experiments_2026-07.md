@@ -6,7 +6,7 @@ assumptions, and the exact queue of next experiments. Written so a person or age
 shipped-v3 (`kv_gap`) design baseline:
 [`notion_algorithm_design_v3.md`](notion_algorithm_design_v3.md); the current
 July-14/15 TTFT experiment contract and results are authoritative in Sections
-5b–5f below. Framework usage: [`../router/README.md`](../router/README.md).
+5b–5g below. Framework usage: [`../router/README.md`](../router/README.md).
 
 **Path convention** (per [`../AGENTS.md`](../AGENTS.md), machine names / usernames /
 absolute scratch paths are never committed): `$MSCRATCH` = the project owner's
@@ -19,7 +19,8 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
 
 1. The `router/` framework (external FIFO + work-conserving dispatcher + policies)
    remains validated against the trusted open-loop harness (parity 1.003; queue
-   neutrality 110 vs 111 ms). **75/75** unit tests pass without network/GPU.
+   neutrality 110 vs 111 ms). The final July-15 tree passes **111/111** offline
+   tests: 75 router tests plus 36 experiment-evidence tests.
 2. The July-14 rerun explicitly uses **predicted TTFT violation as the trigger**;
    KV is neither its objective nor its trigger. The repository default remains
    the shipped `kv_gap + cost_disp_current` baseline until a separate design
@@ -51,6 +52,18 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
    it does not change the repository default. The no-cache leg still does not
    validate the cached term, provider cache pricing, or prefix-cache
    displacement.
+6. The pre-registered 11,605-request full cell then separated trigger safety
+   from victim ordering. `ttft_pred + cost_cachedisp_old` (A) and
+   `ttft_pred + cost_disp_current` (C) each had **0 local violations**; A and C
+   were route-equivalent (6,748 vs 6,729 routed, delta +19 inside the frozen
+   ±363-row band), while A cost less ($3.34405 vs $3.51914). Naive `newest`
+   (B) had 39/3,014 local violations, so the frozen A/B/C-zero safety gate
+   failed; the shipped `kv_gap` anchor (K) had 5,249/5,545 local violations and
+   is not a TTFT-safe trigger on this cell. This keeps TTFT violation as the
+   design objective, keeps old V2 as a supported ordering signal, and adds an
+   explicit support-envelope/resource-model hardening step before any default
+   change. The all-local pressure-anchor result and five-marker audit are in
+   Section 5g.
 
 ---
 
@@ -67,6 +80,8 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
 | `tools/materialize_token_aligned_trace.py` | Atomic, tokenizer-fingerprinted no-cache trace materializer |
 | `tools/profile_ttft_batch.py` | Same-payload warmup/profile with a held-out shared-prefill-lane calibration artifact |
 | `tools/analyze_ttft_repeatability.py` | Parameterized block-level validator/aggregator; no request-level pseudo-replication |
+| `tools/analyze_ttft_full_cell.py` | Exact five-marker/full-cell integrity audit and frozen-gate scorer |
+| `tools/analyze_ttft_violation_context.py` | Bound request/decision/profile/server-context diagnostic; explicitly cannot replay selector causality |
 | `tools/ttft_matrix_evidence.py` | Tested arm parser and semantic/hash completion-marker validator, including `all_local` anchors |
 | `experiments/run_ttft_selector_matrix.sh` | Server/profile/trace-bound multi-arm runner with per-arm completion markers |
 
@@ -664,7 +679,7 @@ python3 tools/analyze_ttft_repeatability.py "$CAMPAIGN"/block*
 The tool exits 2 on failed requests, inexact local token accounting, or any
 measured local violation; its JSON mode is intended for downstream tables.
 
-### 5g. PRE-REGISTERED 2026-07-15 — 11,605-request generalization gate
+### 5g. PRE-REGISTERED AND EXECUTED 2026-07-15 — 11,605-request generalization gate
 
 Registered and committed before any full-cell arm was launched. The existing
 full token-aligned trace contains 11,605 requests across the complete 1,199 s
@@ -711,6 +726,124 @@ Acceptance rules, frozen before launch:
   TTFT p50 above 5 s. A failed outcome criterion falsifies the corresponding
   claim but is not an infrastructure reason to terminate later arms.
 
+#### Executed result
+
+The matrix ran at detached clean commit `c6de62a` in the frozen B/K/C/A/L
+order, with no outcome-based stop. All five arms used the same token-aligned
+trace, dense Qwen3-32B no-cache server lifecycle, schema-v2 profile, model,
+prices, 128-request client cap, and 5 s SLO. The exact marker/artifact and gate
+audit is reproduced by `tools/analyze_ttft_full_cell.py`; the B diagnostic is
+reproduced by `tools/analyze_ttft_violation_context.py`.
+
+| Arm | Routed / local | Local TTFT p50 / p95 / p99 | Local violations | Pessimistic combined | Cost |
+|---|---:|---:|---:|---:|---:|
+| A: TTFT + old V2 | 6,748 / 4,857 | 1.795 / 2.612 / 2.867 s | **0 / 4,857** | 58.147% | **$3.344049** |
+| B: TTFT + newest | 8,591 / 3,014 | 2.063 / 3.316 / 5.354 s | **39 / 3,014 (1.294%)** | 74.364% | $3.643557 |
+| C: TTFT + current displacement | 6,729 / 4,876 | 1.959 / 2.752 / 2.974 s | **0 / 4,876** | **57.984%** | $3.519140 |
+| K: shipped `kv_gap` | 6,060 / 5,545 | 18.277 / 21.946 / 23.537 s | **5,249 / 5,545 (94.662%)** | 97.449% | $3.477171 |
+| L: all-local pressure anchor | 0 / 11,605 | 1,951.571 / 3,818.696 / 3,982.782 s | **11,544 / 11,605 (99.474%)** | 99.474% | $0 |
+
+A and C are equivalent in **route count**, not in selected identities. Their
+routed sets intersect on 5,452 requests but differ on 2,573 (Jaccard 0.679;
+A-only 1,296, C-only 1,277). The A-only set has prompt/decode p50 527/160;
+the C-only set has 186/315. This is consistent with old V2's outer `P` versus
+current displacement's outer `(P+D)`, and the two exclusive sets account for
+A's $0.175091 lower cost. It is not an independent per-snapshot ranking proof:
+C ran before A in one lifecycle, dynamic feedback differs, and the decision
+schema lacks the state needed to replay either ordering.
+
+The pre-registered comparisons (whole-arm results; the 11,605 requests are not
+treated as independent replicates) are:
+
+| Frozen gate | Result | Observation |
+|---|---:|---|
+| Evidence integrity | **PASS** | Five exact markers/hashes; each arm 11,605/11,605 successful with exact local tokens |
+| L pressure anchor | **PASS** | 99.474% local violations and p50 1,951.571 s >5 s |
+| A/B/C local safety | **FAIL** | A=0, B=39, C=0 local violations |
+| A/B/C post-kick bound | **PASS** | maxima 3.287906 / 3.287984 / 3.287990 s ≤3.288 s |
+| A vs C equivalence | **PASS** | A-C=+19 rows (+0.1637 pp), inside inclusive ±363-row band |
+| A cost vs C | **PASS** | A/C cost ratio 0.950246 ≤1.05 |
+| A vs B signal | **PASS** | A improves pessimistic combined by 16.217 pp |
+| A Pareto vs K | **PASS** | A is strictly better on both local and pessimistic-combined violations |
+
+The full gate therefore fails the frozen selector-independent safety claim
+even though both resource-sensitive orderings A and C are locally safe. B's 39
+violations are real, but the decision schema cannot replay selector ranking or
+assign request-level selector causality. The bound diagnostic establishes the
+following narrower chain:
+
+- 32/39 had service TTFT alone above 5 s; the other 7 crossed 5 s only after
+  adding client queue delay. Queue delay alone explains none of the 39.
+- All 39 were dispatched with 126–128 client-visible active local HTTP
+  requests and planned `prompt + requested decode` commitment above both the
+  profile's 98,304-token cell maximum and the 112,656-token declared-capacity
+  proxy. That planned commitment is not measured KV occupancy.
+- B-arm local-request TPOT p50 was 1.259× its calibrated value; among violating
+  requests it was 1.371×. Yet the closest recorded pre-dispatch decisions still
+  reported post-kick maxima of 2.543–3.285 s.
+- The engine-reported cache-usage gauge was 98.1–100% near all 39 first-token
+  timestamps, but that gauge is architecture-dependent and the explicit clock
+  alignment reuses periodic samples. It is correlation, not a token-KV causal
+  claim.
+
+**Algorithm conclusion.** The exact old V2 token-seconds formula survives as a
+victim-ordering signal: A is safe, route-equivalent to C under the frozen band,
+and about 5% cheaper in this full cell after also costing less in all six
+repeatability blocks. What this cell falsifies is `kv_gap` as a sufficient
+TTFT-safety trigger: K routed 52.2% but left 94.7% of retained-local requests in
+violation. TTFT violation remains the correct objective/trigger direction;
+the predictor must gain an explicit calibrated support envelope and
+deployment-resource fallback so a future selector-independent safety claim
+does not rely on the resulting local mix. No repository default is changed by
+this experiment, and the cache/decode-estimator/real-cloud/sweep debts still
+block one.
+
+The next implementation target is therefore the following control loop; it is
+a design target, not code shipped by this commit:
+
+```text
+state = calibrated deployment features
+        (waiting age/work, active sequence occupancy, shared-prefill work,
+         planned commitment/workload mix, and any deployment-validated gauge)
+
+if state is outside the profile support envelope:
+    apply a conservative admission/spill fallback
+elif max predicted waiting TTFT > SLO - guard:
+    rank waiting requests by cloud_cost / exact_old_v2_weight
+    spill the shortest prefix whose survivors are predicted safe
+else:
+    admit normally
+```
+
+This keeps the original v2 `P × (U/prefill_tput + D × TPOT)` formula in
+the decision, but in the place its unit supports: victim ordering. It does not
+invent a token-second capacity budget. TTFT remains the stop condition, while
+KV/sequence/compute measurements describe deployment state and predictor
+support.
+
+Reproduce the frozen gate and the bound B diagnosis. The gate command exits 1
+for this valid-but-failed outcome; exit 2 means invalid evidence:
+
+```bash
+FULL=$MSCRATCH/router_ttft_full_c6de62a_20260715/full11605_bkcal
+PROFILE=$MSCRATCH/router_ttft_repeat_cac4a5d_20260715/ttft_profile_v2_cac4a5d_lifecycle1.json
+SERVER_LOG=$MSCRATCH/router_ttft_repeat_cac4a5d_20260715/vllm_qwen32b_nocache.log
+
+python3 tools/analyze_ttft_full_cell.py "$FULL" \
+  --json-out "$FULL/full_cell_gate.audit.json" \
+  --markdown-out "$FULL/full_cell_gate.audit.md"
+
+python3 tools/analyze_ttft_violation_context.py \
+  --raw "$FULL/extreme_burst_1200_ttft_pred_newest_seed0.jsonl" \
+  --decisions "$FULL/extreme_burst_1200_ttft_pred_newest_seed0.decisions.jsonl" \
+  --summary "$FULL/extreme_burst_1200_ttft_pred_newest_seed0.summary.json" \
+  --marker "$FULL/extreme_burst_1200_ttft_pred_newest_seed0.complete.json" \
+  --manifest "$FULL/matrix_manifest.txt" --profile "$PROFILE" \
+  --server-log "$SERVER_LOG" --server-log-arm-start '07-15 06:14:14' \
+  --json-out "$FULL/B_violation_context.audit.json" \
+  --markdown-out "$FULL/B_violation_context.audit.md"
+```
+
 ---
 
 ## 6. Cloud-side accounting (headline-metric decision)
@@ -737,12 +870,12 @@ V2 ordering is about 1.1 cents cheaper.
 
 ---
 
-## 7. Experiment queue (REVISED 2026-07-15 after the repeatability audit)
+## 7. Experiment queue (REVISED 2026-07-15 after the full-cell audit)
 
 1. **COMPLETED — audit contract.** Atomic token-aligned materializer,
    complete-cohort/stale-arrival protection, local usage telemetry, no-cache
-   server/profile binding, and completion markers; 75/75 tests, `py_compile`,
-   `bash -n`, and `git diff --check` passed.
+   server/profile binding, and completion markers; 75/75 router tests,
+   `py_compile`, `bash -n`, and `git diff --check` passed.
 2. **COMPLETED — one bound Qwen3-32B no-cache lifecycle.** PID, log prefix,
    endpoint, KV 112,656, and `max_num_seqs=128` were bound to every artifact.
    After all audits, only recorded parent PID `904943` was terminated; child
@@ -762,11 +895,22 @@ V2 ordering is about 1.1 cents cheaper.
    flip with `ACB / CBA / BAC`; see Section 5f rather than assuming the earlier
    5e table. All 24 arms passed. Old-v2 clearly beat `newest`; old/current are
    route-equivalent within run/order spread, while old-v2 cost less in 6/6.
-7. **READY — full 11,605-request generalization gate.** Exact order, integrity
-   stops, and outcome rules are registered in Section 5g before launch. It
-   includes candidate old-v2, unresolved current, `newest`, shipped `kv_gap`,
-   and same-server `all_local`; passing it still does not change the default.
-8. **THEN restore missing semantics:** cache-aware trace for the cached-token
+7. **COMPLETED — full 11,605-request generalization gate.** The exact
+   pre-registered B/K/C/A/L order fully ran; evidence integrity and the pressure
+   anchor passed, but the aggregate held-out gate failed because B had 39 local
+   violations. A and C had zero; A remained route-equivalent to C and cheaper,
+   while shipped K was grossly TTFT-unsafe. See Section 5g for the exact claim
+   boundary.
+8. **NEXT — harden the TTFT trigger outside the calibration support
+   envelope.** Profile latency as a function of deployment binding resources
+   (at minimum sequence occupancy, shared-prefill work, and workload mix), log
+   full decision snapshots/scores, and add a conservative admission/fallback
+   rule when live state leaves calibrated support. The acceptance target is
+   zero local violations for A/B/C without materially regressing A's 58.147%
+   pessimistic combined result, followed by a second full-cell lifecycle.
+   Engine cache gauge may enter only as a deployment-profiled resource feature,
+   never as a universally token-denominated TTFT trigger.
+9. **THEN restore missing semantics:** cache-aware trace for the cached-token
    term; estimated-vs-oracle decode; historical exact 0/1-DP/offline oracle;
    load/guard sweeps; real-cloud latency leg. The hybrid binding-resource result
    remains a separate architecture study, not the TTFT trigger definition.
@@ -812,6 +956,7 @@ V2 ordering is about 1.1 cents cheaper.
 | `$MSCRATCH/router_ttft_nocache_78846da/vllm_qwen32b_nocache.log` | Server configuration/lifecycle log for this matrix (KV 112,656; distinct from the July-13 server) |
 | `$MSCRATCH/router_ttft_repeat_cac4a5d_20260715/` | July-15 lifecycle profile/log/server log plus `block01_r0_abc/` … `block06_r5_bac/`; 24 audited arms |
 | `$MSCRATCH/router_ttft_repeat_cac4a5d_20260715/ttft_profile_v2_cac4a5d_lifecycle1.json` | Repeatability profile, SHA256 `ab703ddc…c819` |
+| `$MSCRATCH/router_ttft_full_c6de62a_20260715/full11605_bkcal/` | Completed pre-registered B/K/C/A/L matrix: raw/decision/summary/markers, frozen manifest, full-cell gate audit, and bound B violation-context audit |
 | `$JSCRATCH/workloads/…` | ShareGPT+BurstGPT trace (leg-1 `$DATA`) |
 | `$JSCRATCH/initial_result/` | 14,537-row real OpenRouter measurements (cloud-latency calibration) |
 | `$JSCRATCH/vllmresult/` | teammate's open-loop sweep on the same model (parity reference) |

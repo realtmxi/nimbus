@@ -130,9 +130,11 @@ if G > 0:
     until Σ footprint(kicked) >= release_target
 ```
 
-Footprint and real `/metrics` headroom share the same unit and decide whether
-the queue fits. Displacement enters only the victim ordering; cloud price makes
-that ordering cost-aware. A 5 % release margin prevents immediate retriggering.
+On a deployment whose gauge probe verifies token-KV semantics, footprint and
+`/metrics` headroom share the same unit and decide whether the queue fits. The
+metric name alone is not proof: hybrid-model gauges may instead represent
+per-sequence state. Displacement enters only the victim ordering; cloud price
+makes that ordering cost-aware. A 5 % release margin prevents immediate retriggering.
 For Nimbus local calls, the sender enables vLLM continuous usage stats and
 tracks exact cumulative generated tokens; it never treats MTP content chunks
 as individual tokens.
@@ -177,6 +179,17 @@ combined-objective ablations remain follow-up work. The reproducible driver is
 `experiments/run_ttft_selector_matrix.sh`; an explicit
 `anchor:all_local:0` arm uses the same bound manifest/marker contract without
 pretending the anchor has a Nimbus trigger or decision log.
+
+**Current evidence boundary (2026-07-15).** In the completed pre-registered
+11,605-request dense-32B no-cache cell, `ttft_pred + cost_cachedisp_old` and
+`ttft_pred + cost_disp_current` each retained zero local violations; old V2 was
+within the frozen route-equivalence band and cost 4.98% less. `ttft_pred +
+newest` left 39 violations; all occurred with client-visible load beyond the
+profile support envelope, while `kv_gap + cost_disp_current` left 5,249.
+Consequently `ttft_pred` is still experimental and needs an explicit
+support-envelope/resource fallback; `kv_gap` remains the code default for
+compatibility, not a demonstrated TTFT-safety guarantee. See Section 5g of
+[`../docs/v3_experiments_2026-07.md`](../docs/v3_experiments_2026-07.md).
 
 ### Token-aligned no-cache experiment prerequisite
 
