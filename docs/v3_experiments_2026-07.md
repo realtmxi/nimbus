@@ -933,6 +933,86 @@ of this probe**. Under that assumption, TTFT-cancel rows may be used in the next
 observed-combined TTFT cells; any paper claim that needs completed-service
 behavior still requires a full-drain sensitivity leg.
 
+### 5i. PRE-REGISTERED 2026-07-16 — direct full real-cloud A/C
+
+**Decision and deviation from the queue.** Murphy chose to skip both the
+512-request frozen-route shadow and the 512-request live pilot and proceed
+directly to the complete 11,605-request live-hybrid A/C pair. This increases
+spend and makes a bad configuration more expensive, but it does not change the
+measurement contract. The run must not start until the split local/cloud
+`ignore_eos` controls, split cloud-wait telemetry, real-cloud marker validator,
+and this pre-registration are committed. The three code prerequisites are
+captured by `4c18ae6` (83 router tests plus 41 tools tests passed). The
+operational OpenRouter budget target is **$1.20–$1.50** for both arms under the
+prompt-dominated cancellation behavior seen in E10; this is not a guaranteed
+provider-side cap, and pending generation records must not be reported as zero
+cost.
+
+**Frozen inputs and order.** Use the existing full token-aligned trace, exactly
+11,605 rows over 1,199 s, SHA256
+`465ef070d2a4a399ad41142b9e40bd9c505599d05af2f9d4dd56f9eb02024c52`;
+its manifest SHA256 is
+`c5621d3e45f7b1e2ee49485f7948a267dde65d29b34a377247061f7cccc72f7a`.
+Start a fresh no-prefix-cache Qwen3-32B lifecycle on the default healthy shared
+GPU, generate a fresh schema-v2 profile bound to that exact PID/log/code tree,
+and run one pair in the frozen order **A then C** (order-seed label
+`20260716`):
+
+- A: `ttft_pred + cost_cachedisp_old`, seed 0;
+- C: `ttft_pred + cost_disp_current`, seed 0.
+
+Both arms use the same server lifecycle, profile, trace, 5 s TTFT SLO,
+temperature 0, and 20 s inter-arm cooldown. Local requests use the controlled
+residence workload (`local_ignore_eos=true`) and must exactly match materialized
+prompt and requested decode tokens. Cloud requests use
+`qwen/qwen3-32b`, provider order `[deepinfra]`,
+`allow_fallbacks=false`, no response-cache opt-in, `cloud_ignore_eos=false`, a
+16-request pre-first-token concurrency gate, and client abort after the first
+non-empty reasoning or content token. Freeze the July-16 DeepInfra list prices
+shown by [OpenRouter](https://openrouter.ai/qwen/qwen3-32b/pricing)—input
+`$0.08/M`, output `$0.28/M`—as `in_price=0.08` and `out_price=0.28` for both
+billing estimates and selector scores. A later price change does not alter
+these registered arms.
+
+**Frozen metric.** For every request, TTFT begins at trace arrival. A cloud
+row's value is:
+
+```text
+arrival_to_first_token_ms
+  = pre_route_queue_ms + cloud_gate_wait_ms + service_ttft_ms
+```
+
+The primary outcome is `summary.overall.slo_violation_pct`. An error, timeout,
+or stream ending without a generated token is a measured violation. The
+historical `pessimistic_combined` field is not a real-cloud headline. Report
+local and cloud violation counts and TTFT distributions separately, plus route
+fraction, pre-route wait, cloud-gate wait, HTTP/error classes, requested and
+observed provider metadata, and known/pending cost coverage.
+
+**Integrity contract.** Each arm must have exactly 11,605 unique raw rows and a
+complete marker binding the raw/summary/decision hashes, trace, manifest,
+profile, server PID/log and non-secret cloud configuration. It must satisfy
+`overall.slo_measured_n == overall.n == 11605` and
+`cloud.routed_only == 0`; applied victim IDs must equal cloud request IDs;
+successful local rows must be token-exact; and every successful cloud row must
+have finite arrival-to-first-token TTFT, `stream_abort_requested=true`, and
+`response_completed=false`. Endpoint failures remain in the denominator and
+are never silently retried away. Stop only for an invalid experiment—binding or
+hash mismatch, systematic authentication/configuration rejection, corrupt
+output, or local-server death—not for an unfavorable SLO outcome.
+
+**Outcome interpretation frozen before launch.** Zero retained-local
+violations is a safety target, not an integrity prerequisite. This is one
+ordered A/C pair, so it can establish feasibility and give an observed-combined
+effect estimate, not a replicated selector-superiority claim. If the absolute
+A/C difference is below 1 percentage point, call it unresolved and run a
+reverse-order pair before naming a winner; a larger one-pass difference is
+still preliminary and must be reported with the order limitation. The run does
+not measure completed-response E2E, TPOT, answer quality, mid-stream
+reliability, or full-response deployment cost. It adopts the user-authorized
+temporary assumption that first-token cancellation does not change upstream
+cloud load; that assumption remains unvalidated.
+
 ---
 
 ## 6. Cloud-side accounting (headline-metric decision)
@@ -1016,8 +1096,11 @@ whole-run diagnostics even after observed cloud TTFT becomes the headline.
    first reasoning/content token, preserves pending cost, and records generation
    metadata. The 16-row DeepInfra smoke was 16/16 client-aborted, 0 errors, and
    0/16 above 5 s; see Section 5h for the strict claim boundary.
-9. **NEXT — 512 frozen-route cloud shadow (A then C, separately).** Replay the
-   existing A and C routed IDs at their recorded kick times, not at original
+9. **SKIPPED BY DECISION — 512 frozen-route cloud shadow (A then C,
+   separately).** The planned stitch/provider check remains a valid cheaper
+   diagnostic, but Murphy chose on July 16 to proceed directly to the full live
+   pair. The skipped design would replay the existing A and C routed IDs at
+   their recorded kick times, not at original
    trace arrival. For each cloud request compute `pre-route wait + cloud-gate
    wait + OpenRouter service TTFT`; combine those rows with the corresponding
    measured local rows. Pin DeepInfra, disable fallback, cap pre-first-token
@@ -1026,19 +1109,20 @@ whole-run diagnostics even after observed cloud TTFT becomes the headline.
    rows, no `routed_only`, every success has TTFT, error/429 rate no greater than
    1%, and an explicit observed-combined/local/cloud report. This is a cheap
    provider/stitch check, not the final hybrid result.
-10. **THEN — 512 live hybrid A/C TTFT-cancel pilot.** Before this run, split the
-    global `ignore_eos` control so local can retain the accepted controlled
-    residence workload while the cancelled cloud path does not send the
-    non-standard parameter. Also log `pre_route_queue_ms` and
-    `cloud_gate_wait_ms` separately. Run A and C on the same bound local
-    lifecycle/profile with fixed DeepInfra and no fallback. Acceptance:
+10. **SKIPPED BY DECISION — 512 live hybrid A/C TTFT-cancel pilot.** Murphy
+    accepted the extra spend/risk and selected the direct full run. Its two
+    required code prerequisites—split local/cloud `ignore_eos` and split
+    pre-route/cloud-gate waits—are incorporated into the full-cell contract.
+    The original pilot would run A and C on the same bound local
+    lifecycle/profile with fixed DeepInfra and no fallback. Its acceptance was:
     512/512 unique measured rows; exact local token alignment; A/C local
     violations remain zero; applied victims equal cloud rows; every cloud row
     has measured first-generated-token TTFT; and `overall.slo_measured_n=512`.
     The headline is `overall.slo_violation_pct`; never the real-run
     `pessimistic_combined` field.
-11. **IF THE PILOT PASSES — full 11,605 live hybrid A/C.** Pre-register arm
-    order, use the same provider/concurrency/first-token definition, and retain
+11. **PRE-REGISTERED / NEXT — direct full 11,605 live hybrid A/C.** Section 5i
+    freezes A-then-C order and the complete integrity/outcome contract. Use the
+    same provider/concurrency/first-token definition, and retain
     complete raw/decision/marker evidence. Report overall combined TTFT plus
     local/cloud splits, route fraction, gate wait, 429/error rate, and cost
     coverage. If the single-pair A/C difference is below about 1 percentage

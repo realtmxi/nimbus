@@ -95,6 +95,7 @@ ttft_pred + cost_cachedisp_old + support-envelope fallback
 | E8 | 7 月 15 日 | 检查 selector 结果能否跨顺序/重复稳定 | old V2 6/6 胜 newest；与 current 路由数等价但更便宜 | VALIDATED |
 | E9 | 7 月 15 日 | 在完整 11,605 请求上做预注册泛化 gate | A/C 0 本地违约；K 严重失败；总 gate 因 B=39 而 FAIL | VALIDATED |
 | E10 | 7 月 16 日 | 验证固定 OpenRouter provider 的首 token cancel/TTFT 路径 | DeepInfra burst 16/16 客户端断流；TTFT p50/p95/p99=467/929/1,167 ms，0/16 超 5s | MECHANISM ONLY / EXPLORATORY |
+| E11 | 7 月 16 日 | 完整 11,605 请求真实云 live-hybrid A/C | 已冻结 A→C、5s observed TTFT 与完整性规则；尚未读取结果 | PRE-REGISTERED / NOT RUN |
 
 ---
 
@@ -616,12 +617,85 @@ E2E、TPOT、正文质量、mid-stream reliability 或完整费用。
 行进入 observed combined TTFT；需要完整服务语义的论文结论仍要补 full-drain
 sensitivity leg。
 
-**下一步顺序**
+**下一步顺序（后被 E11 决策覆盖）**
 
-1. 512 frozen-route A/C cloud shadow，预算约 `$0.06`；
-2. 修好 local/cloud 独立 `ignore_eos` 与 cloud gate wait 拆分后，跑 512 live
-   hybrid A/C；
-3. pilot 通过再跑完整 11,605 live hybrid A/C；若差异小于约 1 pp，再跑逆序 pair。
+原计划依次跑 512 frozen-route shadow、512 live pilot、完整 11,605 A/C。Murphy
+在 2026-07-16 明确选择跳过两个 512 步骤，直接进入完整 live-hybrid A/C；跳过的
+便宜检查并没有被证明“没必要”，只是接受更高费用和配置出错风险来换取直接证据。
+
+### E11 — 完整 11,605 请求 real-cloud live-hybrid A/C（预注册）
+
+**状态：PRE-REGISTERED / NOT RUN。** 以下规则在启动正式 arm、读取正式结果前
+写入 repo；结果出来后只能追加，不能回改 gate。
+
+前置实现由 `4c18ae6` 固化：local/cloud 独立 `ignore_eos`、两段 cloud wait、
+real-cloud matrix fingerprint/manifest 和 marker-v2 行级审计。83 个 router tests 与
+41 个 tools tests 全绿。
+
+**决策问题**
+
+在同一个 TTFT 触发器、同一个本地部署和真实 DeepInfra 首-token TTFT 下，旧 V2
+selector（A）与 current displacement selector（C）的 observed combined 5s TTFT、
+本地安全性、外发比例和云端 gate wait 分别是多少？
+
+**固定输入、arm 与执行顺序**
+
+- 完整 token-aligned trace：11,605 行、1,199 s；SHA256
+  `465ef070d2a4a399ad41142b9e40bd9c505599d05af2f9d4dd56f9eb02024c52`；
+- manifest SHA256：
+  `c5621d3e45f7b1e2ee49485f7948a267dde65d29b34a377247061f7cccc72f7a`；
+- 新启动一个 Qwen3-32B no-prefix-cache lifecycle，并为它重新生成绑定当前
+  PID、日志、代码 hash 的 schema-v2 profile；
+- 冻结顺序 **A → C**（order-seed 标签 `20260716`）；A 为
+  `ttft_pred:cost_cachedisp_old:0`，C 为
+  `ttft_pred:cost_disp_current:0`；
+- 两臂共用 trace、server lifecycle、profile、SLO=5s、temperature=0，臂间
+  cooldown 20s；
+- local：`local_ignore_eos=true`，prompt/decode 必须与 materialized token 精确一致；
+- cloud：`qwen/qwen3-32b`，只允许 DeepInfra，fallback=false，不启用 response
+  cache，`cloud_ignore_eos=false`，首个 reasoning/content token 后客户端断流，
+  pre-first-token concurrency=16；
+- 冻结 7 月 16 日 [OpenRouter DeepInfra 标价](https://openrouter.ai/qwen/qwen3-32b/pricing)：
+  input `$0.08/M`、output `$0.28/M`，即两臂都使用 `in_price=0.08`、
+  `out_price=0.28` 做 selector score 与费用估算；后续价格变化不回改本次 arm。
+
+**冻结口径**
+
+```text
+cloud arrival→first-token TTFT
+  = pre_route_queue_ms + cloud_gate_wait_ms + service_ttft_ms
+
+primary = summary.overall.slo_violation_pct
+```
+
+错误、timeout、没有生成 token 就结束都计入 5s TTFT 违约分母；真实云结果不拿
+`pessimistic_combined` 当 headline。必须同时报告 overall/local/cloud 违约与 TTFT、
+route fraction、两段等待、HTTP/错误类型、requested/observed provider、已知与 pending
+费用覆盖。两臂 cancel-mode OpenRouter 采用 `$1.20–$1.50` 的 operational budget
+target；这是根据 E10 prompt-dominated billing 做的预算，不是 provider-side 硬上限。
+Pending generation record 不得填成 `$0`。
+
+**预注册 integrity gate**
+
+1. 每臂恰好 11,605 个唯一 raw rows；marker 绑定 raw/summary/decisions、trace、
+   manifest、profile、server PID/log 与不含密钥值的 cloud 配置；
+2. `overall.slo_measured_n == overall.n == 11605`，且
+   `cloud.routed_only == 0`；
+3. applied victim IDs 与 cloud row IDs 完全一致；成功 local rows token exact；
+4. 每条成功 cloud row 有有限、非负 arrival-to-first-token TTFT，且
+   `stream_abort_requested=true`、`response_completed=false`；
+5. 单请求 429/5xx/timeout 留在分母，不因结果难看而重跑删除。只有 hash/binding
+   不符、系统性认证/配置拒绝、输出损坏或本地 server 死亡才中止并判实验无效。
+
+**预注册 outcome 解读**
+
+- retained-local 0 违约是安全目标，不是证据完整性的先决条件；
+- 只有一个 A→C pair：能给 feasibility 和 effect estimate，不能直接声称已重复证明
+  selector superiority；
+- 若 `|A−C| < 1 percentage point`，结论必须写“未分胜负”，再跑 C→A；即使差值
+  更大也必须标为有顺序限制的一次性结果；
+- 不测完整响应 E2E、TPOT、答案质量、mid-stream reliability 或 full-response 成本；
+- 暂时采用“首 token cancel 不改变上游 cloud load”的用户授权假设，但它仍未验证。
 
 ---
 
@@ -669,12 +743,12 @@ Shipped v3: kv_gap trigger + current displacement selector
 4. **在线 decode estimate**：当前实验使用 trace/oracle decode 长度。
 5. **Cache-aware trace**：当前 no-cache 实验不能验证 `U=P−cached_tokens` 项。
 6. **真实 cloud latency**：E10 已验证固定 DeepInfra 的首-token transport/TTFT
-   路径；仍欠 512 frozen-route shadow、512 live hybrid A/C 和完整 11,605 A/C。
+   路径；E11 已预注册直接完整 11,605 A/C，两个 512 pilot 由用户明确跳过而非完成。
    Cancel 模式也不能替代 E2E/TPOT/mid-stream 的 full-drain sensitivity。
 7. **负载/guard sweep 与 offline oracle**：确定性能前沿，并与历史 0/1 DP 或
    clairvoyant oracle 比较。
 
-推荐执行顺序（7 月 16 日）：6 的 512 shadow → 512 hybrid → full A/C；随后
+当前执行顺序（7 月 16 日决策后）：直接完成 E11 full A/C；随后
 1 → 2 → 3 → 4/5 → 7。任何默认切换仍必须等 support-envelope hardening 完成。
 
 ---
