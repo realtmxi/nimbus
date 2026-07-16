@@ -28,6 +28,8 @@ survives as an ordering signal, TTFT predictor hardening is next, and no
 default has been changed. See
 [`docs/v3_experiments_2026-07.md`](docs/v3_experiments_2026-07.md), Sections
 5b–5g, for the evidence and remaining gates.
+中文时间线、每次实验目的和结果总账见
+[`docs/nimbus_experiment_ledger_2026-07.zh-CN.md`](docs/nimbus_experiment_ledger_2026-07.zh-CN.md)。
 
 ## Repository Structure
 
@@ -155,8 +157,8 @@ sufficient for cost/latency reference points.
 ## Data
 
 Trace files are not committed (multi-GB). Use `scripts/download_data.sh` to
-fetch them from `/scratch/murphy/workloads/` on gpu1. See `data/README.md` for
-schema and dataset details.
+fetch them from the out-of-band configured `$JSCRATCH/workloads/`. See
+`data/README.md` for schema and dataset details.
 
 - ShareGPT+BurstGPT: 200K requests with `block_hash_ids` for prefix overlap
 - RouteWise traces: long-context rednote agent + production freeinference logs

@@ -5,8 +5,10 @@ assumptions, and the exact queue of next experiments. Written so a person or age
 (e.g. Codex) can continue without access to prior conversations. Historical
 shipped-v3 (`kv_gap`) design baseline:
 [`notion_algorithm_design_v3.md`](notion_algorithm_design_v3.md); the current
-July-14/15 TTFT experiment contract and results are authoritative in Sections
-5b–5g below. Framework usage: [`../router/README.md`](../router/README.md).
+July-14–16 TTFT experiment contract and results are authoritative in Sections
+5b–5h below. Framework usage: [`../router/README.md`](../router/README.md).
+Chinese chronological ledger:
+[`nimbus_experiment_ledger_2026-07.zh-CN.md`](nimbus_experiment_ledger_2026-07.zh-CN.md).
 
 **Path convention** (per [`../AGENTS.md`](../AGENTS.md), machine names / usernames /
 absolute scratch paths are never committed): `$MSCRATCH` = the project owner's
@@ -19,8 +21,8 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
 
 1. The `router/` framework (external FIFO + work-conserving dispatcher + policies)
    remains validated against the trusted open-loop harness (parity 1.003; queue
-   neutrality 110 vs 111 ms). The final July-15 tree passes **111/111** offline
-   tests: 75 router tests plus 36 experiment-evidence tests.
+   neutrality 110 vs 111 ms). The July-16 tree passes **117/117** offline
+   tests: 81 router tests plus 36 experiment-evidence tests.
 2. The July-14 rerun explicitly uses **predicted TTFT violation as the trigger**;
    KV is neither its objective nor its trigger. The repository default remains
    the shipped `kv_gap + cost_disp_current` baseline until a separate design
@@ -64,6 +66,18 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
    explicit support-envelope/resource-model hardening step before any default
    change. The all-local pressure-anchor result and five-marker audit are in
    Section 5g.
+7. A July-16 real-OpenRouter probe added a fixed-provider, no-fallback,
+   first-token cancellation path (commit `e0b6686`). On 16 burst arrivals to
+   DeepInfra, all 16 client streams stopped after the first generated token,
+   with TTFT p50/p95/p99 **467/929/1,167 ms** and 0/16 above the 5 s SLO. The
+   probe also corrected an important semantic mismatch: OpenRouter separates
+   Qwen reasoning into `delta.reasoning`, while the bound local vLLM deployment
+   (no reasoning parser) emits the same tokens through `content`; Nimbus now
+   treats either as the first generated token. This validates the measurement
+   path, not a full cloud-latency distribution or completed-response SLO. Under
+   the explicitly temporary assumption that cancellation does not change cloud
+   load, the next headline metric can be observed local+cloud TTFT rather than
+   the NullCloud pessimistic bound.
 
 ---
 
@@ -74,7 +88,7 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
 | `router/run.py` | Single entry point: external FIFO, work-conserving dispatcher, KV monitor, inflight-KV tracker, CLI |
 | `router/common.py` | Trace loading (BurstGPT windows byte-identical to the trusted `vllm/run.py`; `--scenario full` for arbitrary traces), payloads, SSE client, NullCloud sink, billing, summaries |
 | `router/nimbus.py` | Shipped KV-gap baseline plus orthogonal `kv_gap` / `ttft_pred` triggers and selector ablations |
-| `router/test_*.py` | 75 unit tests, no network/GPU (`python3 -m unittest router.test_common router.test_run router.test_nimbus`) |
+| `router/test_*.py` | 81 unit tests, no network/GPU (`python3 -m unittest router.test_common router.test_run router.test_nimbus`) |
 | `tools/kv_gauge_probe.py` | Live probe that established the Section-4 finding (stdlib only) |
 | `tools/analyze_eb1200.py` | Timeline reconstruction that flagged the anomaly from a result JSONL |
 | `tools/materialize_token_aligned_trace.py` | Atomic, tokenizer-fingerprinted no-cache trace materializer |
@@ -119,7 +133,16 @@ Three-way on the same server, matched shed fraction:
 |---|---|---|---|
 | all_local | 0% | 324.8 s | 97.9% |
 | nimbus (pre-v3) | 25.6% | **12.4 s** | 94.8% |
-| random @ 0.256 (matched) | 25.6% | 108.7 s | 97.0% |
+| random matched | target 0.256, realized 25.3%* | 108.7 s | 97.0% |
+
+\*Provenance RESOLVED 2026-07-15 from the on-box summaries (`$MSCRATCH/
+router_eb/`, all three arms' raw+summary intact, hashed, and mirrored — see the
+Chinese ledger §6.4/§6.13): 25.6% is nimbus's realized self-selected fraction
+(and the random arm's `target_fraction=0.256`); 25.3% is the random arm's
+realized i.i.d. fraction (`actual_fraction=0.25274`). Both historical records
+were correct about different quantities. Random summary re-check:
+`ttft_p50_ms=108,651.19`, `slo_violation_pct=97.013` — matches this table.
+Still exploratory (pre-token-alignment replay), but now re-computable.
 
 Takeaway: *which* requests you shed matters (nimbus ≫ random at the same
 fraction), but the pre-v3 trigger under-shed badly. This motivated v3.
@@ -844,37 +867,124 @@ python3 tools/analyze_ttft_violation_context.py \
   --markdown-out "$FULL/B_violation_context.audit.md"
 ```
 
+### 5h. EXECUTED 2026-07-16 — OpenRouter first-token cancellation probe
+
+**Decision question.** Can a real-cloud leg measure Nimbus's TTFT SLO and stop
+after the first generated token without pretending that an incomplete response
+has E2E/TPOT/complete-usage evidence? The implementation captured by commit
+`e0b6686` adds three opt-in cloud controls: a fixed OpenRouter provider order,
+fallback disablement, and `--cloud-stop-after-first-token`. A probe row is a
+successful TTFT measurement but explicitly has `response_completed=false`,
+`e2e_ms=null`, `tpot_ms=null`, and pending cost until provider metadata exists.
+Default/full-drain behavior is unchanged. The resulting tree passed 81 router
+tests and 36 evidence tests (**117/117**), plus `py_compile` and
+`git diff --check`.
+
+**TTFT semantic correction.** The first attempt stopped only on non-empty
+`delta.content`. That is not comparable to the bound local deployment: local
+vLLM ran without a reasoning parser and therefore streams Qwen `<think>` tokens
+through `content`, whereas OpenRouter exposes them separately through
+`delta.reasoning` (or `reasoning_content`). The content-only request exhausted
+its 261-token cap entirely in reasoning, produced no visible content, completed
+instead of cancelling, and recorded client E2E 7.373 s / client-estimated cost
+$0.0000958 (the generation record reported $0.000094842). The corrected Nimbus
+definition is therefore **time to the first non-empty generated-token delta,
+whether reasoning or content**. `first_token_kind` records which boundary fired;
+`first_content_ttft_ms` remains separate when available.
+
+**Protocol.** Real model `qwen/qwen3-32b`; provider pinned to `deepinfra`;
+`provider.allow_fallbacks=false`; streaming; temperature 0; 5 s SLO; no
+OpenRouter response-cache header; cancel immediately after the first reasoning
+or content token. The burst smoke used the first 16 rows of the existing
+token-aligned held-out trace: 7,658 materialized prompt tokens, 4,501 total
+decode-token cap, and a 1 s trace-arrival span. This is a transport/measurement
+smoke, not a random sample or a policy comparison.
+
+| Check | Result |
+|---|---:|
+| Requests / HTTP successes / errors | 16 / 16 / 0 |
+| Client abort requested / full response completed | 16 / 0 |
+| First-token kind | 16 reasoning / 0 content |
+| TTFT min / p50 / p95 / p99 / max | 349 / 467 / 929 / 1,167 / 1,167 ms |
+| Observed TTFT violations at 5 s | **0 / 16** |
+| Raw `cost_pending_n` | 16 (the final usage SSE is intentionally not read) |
+
+The client-side transport result is 16/16, but it would be incorrect to claim
+16/16 provider-side cancellations. A delayed generation audit found only one
+of the 16 records. That record named DeepInfra, had `cancelled=true`, 847 native
+prompt tokens, 6 completion tokens, and cost $0.000026; the API-key cumulative
+usage increased by the same $0.000026. The other 15 generation IDs returned
+not-found at audit time. They remain **unknown/pending**, not zero-cost rows.
+
+Evidence lives under `$MSCRATCH/openrouter_ttft_cancel_20260716/`, with a
+repo-sibling local mirror outside git. The 16-row evidence hashes are:
+
+- raw JSONL: `e9bc6c8c72e98707ca08fd65b87a58523e6bff042ee1538a341e2453f1ccb9b5`;
+- summary: `0a45bebed96e00fa19fcdd4ea81f379f33946cd02f627bf36b1c4b81980bc4d0`;
+- billing audit: `e147071f5622a8b74a5c351ad3a525b5bddfa99c6c84c2deaeb60b2984033cab`.
+
+**Claim boundary.** The fixed-provider abort/TTFT path and local/cloud
+first-token semantics are validated. The observed latency distribution is
+exploratory (n=16, one provider, one short burst). It does not measure E2E,
+TPOT, visible-answer completion, mid-stream reliability, or complete cost. The
+working assumption that first-token cancellation does not change upstream cloud
+load is an explicit experiment assumption authorized on July 16, **not a result
+of this probe**. Under that assumption, TTFT-cancel rows may be used in the next
+observed-combined TTFT cells; any paper claim that needs completed-service
+behavior still requires a full-drain sensitivity leg.
+
 ---
 
 ## 6. Cloud-side accounting (headline-metric decision)
 
 The default cloud is a zero-latency fake sink (`--cloud null`): kicked rows are
 `routed_only=true` and excluded from SLO stats (`slo_measured_n` is the explicit
-denominator). For paper headlines, the recommended primary metric is the
-**pessimistic bound: every kicked request counts as an SLO violation** (real
-cloud p50 ≈ 10 s > 5 s SLO), with local-only violation as the secondary metric.
-Concretely,
-`pessimistic_combined = (local_slo_violations + routed_only) / N`. This is an
-upper bound under NullCloud, not observed cloud latency. A real-cloud leg
-(`--cloud real …`) is only needed once, pre-submission.
+denominator). In a NullCloud cell, report local observed SLO, route fraction,
+and estimated token cost. `pessimistic_combined =
+(local_slo_violations + routed_only) / N` remains a conservative **assumed
+upper bound** and a historical route-efficiency transform. It is not the
+headline for a real-cloud experiment. The frozen Sections 5e–5g gates retain
+their preregistered pessimistic rules; this accounting change does not rewrite
+their historical decision criteria.
 
-When every retained-local request is safe, pessimistic combined equals the
-routed fraction exactly; those are two views of one number, not independent
-evidence. Fewer routes then means that a selector bought more predicted TTFT
-relief per external request under the same safety stop rule. It does not mean
-NullCloud measured end-to-end cloud TTFT. Dollar cost can disagree with route
-count because selectors choose different prompt/decode mixes, so both must be
-reported as paired whole-run metrics; the repeatability campaign legitimately
-contains runs where current displacement routes two fewer requests while old
-V2 ordering is about 1.1 cents cheaper.
+For `--cloud real`, the primary metric is now the observed, from-arrival TTFT
+violation rate already emitted as:
+
+```text
+observed_combined_ttft = summary.overall.slo_violation_pct
+                       = count(local/cloud error, missing TTFT, or TTFT > SLO) / N
+```
+
+A valid real-cloud headline must verify
+`overall.slo_measured_n == overall.n == N` and `cloud.routed_only == 0`, then
+report overall, local, and cloud violations/TTFT separately. The existing
+`pessimistic_combined` field still marks every cloud row as a violation even in
+a real-cloud summary; ignore it for that headline. Renaming it to an explicit
+`nullcloud_upper_bound` is reporting-layer debt.
+
+For the July-16 TTFT-cancel mode, “first token” means the first non-empty
+reasoning or content delta, matching the no-reasoning-parser local vLLM stream.
+Under the explicit temporary assumption that cancellation does not change cloud
+load, such rows are valid observed TTFT measurements and can enter
+`overall.slo_violation_pct`. They are not completed-service measurements:
+`response_completed=false`, E2E/TPOT are absent, and cost may remain pending.
+Errors or a stream that ends without any generated token still count as TTFT
+violations. A full-drain sensitivity leg is required before making E2E,
+mid-stream reliability, or complete billing claims.
+
+When every retained-local request is safe, the NullCloud pessimistic bound
+equals the routed fraction exactly; those are two views of one number, not
+independent evidence. Dollar cost can disagree with route count because
+selectors choose different prompt/decode mixes, so both remain paired
+whole-run diagnostics even after observed cloud TTFT becomes the headline.
 
 ---
 
-## 7. Experiment queue (REVISED 2026-07-15 after the full-cell audit)
+## 7. Experiment queue (REVISED 2026-07-16 after the real-cloud probe)
 
 1. **COMPLETED — audit contract.** Atomic token-aligned materializer,
    complete-cohort/stale-arrival protection, local usage telemetry, no-cache
-   server/profile binding, and completion markers; 75/75 router tests,
+   server/profile binding, and completion markers; 81/81 router tests,
    `py_compile`, `bash -n`, and `git diff --check` passed.
 2. **COMPLETED — one bound Qwen3-32B no-cache lifecycle.** PID, log prefix,
    endpoint, KV 112,656, and `max_num_seqs=128` were bound to every artifact.
@@ -901,19 +1011,50 @@ V2 ordering is about 1.1 cents cheaper.
    violations. A and C had zero; A remained route-equivalent to C and cheaper,
    while shipped K was grossly TTFT-unsafe. See Section 5g for the exact claim
    boundary.
-8. **NEXT — harden the TTFT trigger outside the calibration support
-   envelope.** Profile latency as a function of deployment binding resources
-   (at minimum sequence occupancy, shared-prefill work, and workload mix), log
-   full decision snapshots/scores, and add a conservative admission/fallback
-   rule when live state leaves calibrated support. The acceptance target is
-   zero local violations for A/B/C without materially regressing A's 58.147%
-   pessimistic combined result, followed by a second full-cell lifecycle.
-   Engine cache gauge may enter only as a deployment-profiled resource feature,
-   never as a universally token-denominated TTFT trigger.
-9. **THEN restore missing semantics:** cache-aware trace for the cached-token
-   term; estimated-vs-oracle decode; historical exact 0/1-DP/offline oracle;
-   load/guard sweeps; real-cloud latency leg. The hybrid binding-resource result
-   remains a separate architecture study, not the TTFT trigger definition.
+8. **COMPLETED (probe only) — fixed-provider real-cloud TTFT cancellation.**
+   Commit `e0b6686` pins provider order, disables fallback, aborts after the
+   first reasoning/content token, preserves pending cost, and records generation
+   metadata. The 16-row DeepInfra smoke was 16/16 client-aborted, 0 errors, and
+   0/16 above 5 s; see Section 5h for the strict claim boundary.
+9. **NEXT — 512 frozen-route cloud shadow (A then C, separately).** Replay the
+   existing A and C routed IDs at their recorded kick times, not at original
+   trace arrival. For each cloud request compute `pre-route wait + cloud-gate
+   wait + OpenRouter service TTFT`; combine those rows with the corresponding
+   measured local rows. Pin DeepInfra, disable fallback, cap pre-first-token
+   client concurrency at 16, and keep pending costs pending. Budget about $0.06
+   for 523 calls. Acceptance: exact frozen IDs/times, no duplicates/missing
+   rows, no `routed_only`, every success has TTFT, error/429 rate no greater than
+   1%, and an explicit observed-combined/local/cloud report. This is a cheap
+   provider/stitch check, not the final hybrid result.
+10. **THEN — 512 live hybrid A/C TTFT-cancel pilot.** Before this run, split the
+    global `ignore_eos` control so local can retain the accepted controlled
+    residence workload while the cancelled cloud path does not send the
+    non-standard parameter. Also log `pre_route_queue_ms` and
+    `cloud_gate_wait_ms` separately. Run A and C on the same bound local
+    lifecycle/profile with fixed DeepInfra and no fallback. Acceptance:
+    512/512 unique measured rows; exact local token alignment; A/C local
+    violations remain zero; applied victims equal cloud rows; every cloud row
+    has measured first-generated-token TTFT; and `overall.slo_measured_n=512`.
+    The headline is `overall.slo_violation_pct`; never the real-run
+    `pessimistic_combined` field.
+11. **IF THE PILOT PASSES — full 11,605 live hybrid A/C.** Pre-register arm
+    order, use the same provider/concurrency/first-token definition, and retain
+    complete raw/decision/marker evidence. Report overall combined TTFT plus
+    local/cloud splits, route fraction, gate wait, 429/error rate, and cost
+    coverage. If the single-pair A/C difference is below about 1 percentage
+    point, run a reverse-order pair before claiming a winner. Cancel-mode
+    provider cost is probe expenditure, not the selector's projected
+    full-response deployment cost.
+12. **THEN harden the TTFT trigger outside the calibration support envelope.**
+    Profile deployment binding resources, log full decision snapshots/scores,
+    and add a conservative fallback when live state leaves calibrated support.
+    Engine cache gauge may enter only as a deployment-profiled resource feature,
+    never as a universally token-denominated TTFT trigger.
+13. **Restore remaining semantics:** cache-aware trace for the cached-token
+    term; estimated-vs-oracle decode; historical exact 0/1-DP/offline oracle;
+    load/guard sweeps; and at least one full-drain cloud sensitivity leg for
+    E2E/mid-stream reliability. The hybrid binding-resource result remains a
+    separate architecture study, not the TTFT trigger definition.
 
 ---
 
@@ -957,6 +1098,7 @@ V2 ordering is about 1.1 cents cheaper.
 | `$MSCRATCH/router_ttft_repeat_cac4a5d_20260715/` | July-15 lifecycle profile/log/server log plus `block01_r0_abc/` … `block06_r5_bac/`; 24 audited arms |
 | `$MSCRATCH/router_ttft_repeat_cac4a5d_20260715/ttft_profile_v2_cac4a5d_lifecycle1.json` | Repeatability profile, SHA256 `ab703ddc…c819` |
 | `$MSCRATCH/router_ttft_full_c6de62a_20260715/full11605_bkcal/` | Completed pre-registered B/K/C/A/L matrix: raw/decision/summary/markers, frozen manifest, full-cell gate audit, and bound B violation-context audit |
+| `$MSCRATCH/openrouter_ttft_cancel_20260716/` | July-16 fixed-DeepInfra TTFT-cancel smokes and 16-row burst; raw/summary plus delayed generation/billing audit (Section 5h) |
 | `$JSCRATCH/workloads/…` | ShareGPT+BurstGPT trace (leg-1 `$DATA`) |
 | `$JSCRATCH/initial_result/` | 14,537-row real OpenRouter measurements (cloud-latency calibration) |
 | `$JSCRATCH/vllmresult/` | teammate's open-loop sweep on the same model (parity reference) |

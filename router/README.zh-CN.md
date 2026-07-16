@@ -45,8 +45,15 @@ token 数/成本(`--max-tokens` 语义与真实 payload 完全一致:替换 trac
 
 `--cloud real --cloud-url … --cloud-model … --cloud-api-key-env KEY`:真实流式调用,
 `--cloud-max-concurrency`(默认 32)防 burst 下自打 429。等实验需要真实云延迟时再用。
-(Jialu 有 14k 条真实 OpenRouter 测量在 GPU 机 `/scratch/jialu/initial_result/`
+(队友有 14k 条真实 OpenRouter 测量在 `$JSCRATCH/initial_result/`
 可估分布;实测 qwen3-32b TTFT p50≈10s——reasoning+排队,云并不"快"。)
+
+若只做 OpenRouter TTFT 探针,再加
+`--cloud-provider deepinfra --cloud-no-fallbacks
+--cloud-stop-after-first-token`。最后一个参数在首个非空 reasoning 或 content delta
+后断流,与当前本地 vLLM 的首生成 token 边界一致。该模式只测 TTFT;没有完整
+E2E/TPOT,拿不到末尾 usage 时成本保持 pending。普通 real-cloud 路径仍完整读到
+`[DONE]`。
 
 ## 用法(GPU 机;`python` 用带 aiohttp 的 env,从仓库根目录跑)
 
@@ -61,7 +68,10 @@ python -m router.run --data <trace.jsonl> --scenario burst_300 \
 与 open-loop 口径可比)+ `.summary.json`(overall/local/cloud 三段 + queue 遥测)。
 每段都带 `slo_measured_n`——排除 `routed_only` 后的 SLO 显式分母。
 `pessimistic_combined` 另把每条 cloud route 都算作违约,避免 NullCloud 奖励
-过度外包。计费:失败请求 $0;local 侧恒 $0。可用 `--decision-log FILE` 记录
+过度外包;它只是 NullCloud assumed upper bound,不是真实 cloud headline。真实云看
+`overall.slo_*`,并检查 `overall.slo_measured_n == overall.n`、
+`cloud.routed_only == 0`。计费:失败请求 $0;local 侧恒 $0。可用
+`--decision-log FILE` 记录
 每次应用/作废的 Nimbus 决策及 victim 顺序。逐请求结果还会并排记录
 `scheduler_prompt_tokens` 与 endpoint 实报 `prompt_tokens`;summary 的
 `token_alignment` 会把 trace/payload 单位错位显式暴露出来。
@@ -150,7 +160,8 @@ selector 有 `newest`、`waiting_random`、`max_cachedisp_old`、
 weight 公式做启发式排序,**不是**历史完整 0/1-knapsack 实现。当前 TTFT stop rule
 是诊断口径:只把留下的**等待队列 survivors**压到预测不违约;已经 in-flight 的
 请求不在这个 post-kick 声明里,因此 decision log/summary 明确标作
-`prediction_scope=waiting_only`。再由悲观 combined 指标判断这次外包是否值得。
+`prediction_scope=waiting_only`。NullCloud 的悲观 combined 只是假设上界;真实
+cloud 用实测 `overall.slo_violation_pct`。
 decode 长度仍取 trace 上限(oracle);估计器与 combined-objective 消融是后续项。
 可复现 driver 为 `experiments/run_ttft_selector_matrix.sh`;显式的
 `anchor:all_local:0` arm 复用同一套绑定 manifest/marker 合约,但不会假装该

@@ -54,9 +54,17 @@ modeled; such rows carry `routed_only=true` and are excluded from SLO stats.
 `--cloud real --cloud-url … --cloud-model … --cloud-api-key-env KEY`: real
 streaming calls; `--cloud-max-concurrency` (default 32) guards against
 self-inflicted 429s under burst. Use only when the experiment needs real cloud
-latency. (Jialu has 14k real OpenRouter measurements on the GPU host under
-`/scratch/jialu/initial_result/` for estimating distributions; measured
+latency. (A teammate has 14k real OpenRouter measurements under
+`$JSCRATCH/initial_result/` for estimating distributions; measured
 qwen3-32b TTFT p50 ≈ 10 s — reasoning + provider queueing; the cloud is not "fast".)
+
+For the TTFT-only OpenRouter probe, additionally use
+`--cloud-provider deepinfra --cloud-no-fallbacks
+--cloud-stop-after-first-token`. The last flag aborts after the first non-empty
+reasoning or content delta (the same generated-token boundary as the bound local
+vLLM deployment). It records TTFT but deliberately leaves E2E/TPOT absent and
+cost pending when the final usage event is not received. This is an opt-in probe;
+ordinary real-cloud calls still drain to `[DONE]`.
 
 ## Usage (GPU host; use a python env with aiohttp; run from the repo root)
 
@@ -72,7 +80,10 @@ measured from the trace arrival time, comparable with open-loop) plus
 `.summary.json` (overall/local/cloud sections + queue telemetry). Each section
 reports `slo_measured_n` — the explicit SLO denominator after `routed_only`
 rows are excluded. `pessimistic_combined` also counts every cloud route as an
-SLO violation, so NullCloud cannot reward over-shedding. Billing: failed
+SLO violation, so NullCloud cannot reward over-shedding; it is a NullCloud upper
+bound, not the headline for real cloud. For real cloud use `overall.slo_*` after
+verifying `overall.slo_measured_n == overall.n` and `cloud.routed_only == 0`.
+Billing: failed
 requests cost $0; the local side always $0. `--decision-log FILE` optionally
 records each applied/stale Nimbus decision and its victim ordering. Raw rows
 also retain `scheduler_prompt_tokens` next to endpoint-reported
@@ -172,9 +183,9 @@ variants reuse the original v2 weight formula but are heuristic orderings, not
 the historical exact 0/1-knapsack implementation. The current TTFT stop rule
 is diagnostic: it makes the retained **waiting-queue survivors** predicted-safe;
 already in-flight requests are outside that post-kick claim, which is why the
-decision log and summary label the scope `waiting_only`. The reported
-pessimistic-combined metric then reveals whether that shedding was actually
-worthwhile. Decode length is still the trace cap (oracle); estimator and
+decision log and summary label the scope `waiting_only`. In NullCloud runs the
+pessimistic-combined field is only an assumed upper bound; a real-cloud run uses
+observed `overall.slo_violation_pct`. Decode length is still the trace cap (oracle); estimator and
 combined-objective ablations remain follow-up work. The reproducible driver is
 `experiments/run_ttft_selector_matrix.sh`; an explicit
 `anchor:all_local:0` arm uses the same bound manifest/marker contract without
