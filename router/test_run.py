@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from router.common import Endpoint, Policy
+from router.common import Endpoint, Policy, summarize
 from router.run import (
     LocalAdmission,
     parse_args,
@@ -242,12 +242,58 @@ class TestCloudConcurrencyGate(unittest.TestCase):
                 r["ttft_ms"], r["queue_delay_ms"] + r["service_ttft_ms"], places=5
             )
 
+    def test_ttft_probe_row_is_successful_and_keeps_arrival_accounting(self):
+        async def probe_sender(req, due):
+            await asyncio.sleep(0.005)
+            return {
+                "request_id": req["request_id"], "arrived_at": req["arrived_at"],
+                "relative_arrival_s": req["relative_arrival_s"],
+                "scheduled_lag_ms": 0.0, "endpoint": "cloud", "model": "m",
+                "success": True, "error": None, "error_type": None,
+                "http_status": 200, "ttft_ms": 5.0, "e2e_ms": None,
+                "tpot_ms": None, "chunks": 1, "prompt_tokens": None,
+                "completion_tokens": None, "output_chars": 1, "cost_usd": None,
+                "cost_pending": True, "response_completed": False,
+                "stream_abort_requested": True, "generation_id": "gen-1",
+                "provider": "DeepInfra",
+            }
+
+        args = mk_args(
+            policy="all_cloud",
+            extra=[
+                "--cloud", "real", "--cloud-url", "http://c",
+                "--cloud-model", "m", "--cloud-api-key-env", "OPENROUTER_KEY",
+                "--cloud-provider", "deepinfra", "--cloud-no-fallbacks",
+                "--cloud-stop-after-first-token",
+            ],
+        )
+        policy = Policy("all_cloud", 1.0, 0)
+        results, _, _ = run(
+            args, mk_trace(1), policy, cloud_sender=probe_sender,
+        )
+        row = results[0]
+        self.assertTrue(row["success"])
+        self.assertFalse(row["response_completed"])
+        self.assertIsNone(row["e2e_ms"])
+        self.assertAlmostEqual(
+            row["ttft_ms"], row["queue_delay_ms"] + row["service_ttft_ms"],
+            places=5,
+        )
+        summary = summarize(results, policy, slo_s=5.0)
+        self.assertEqual(summary["overall"]["slo_violations"], 0)
+        self.assertEqual(summary["overall"]["slo_measured_n"], 1)
+        self.assertIsNone(summary["overall"]["cost_usd"])
+        self.assertEqual(summary["overall"]["cost_pending_n"], 1)
+
 
 class TestParseArgsQueued(unittest.TestCase):
     def test_random_default_cloud_is_null_sink(self):
         args = parse_args(["--data", "t", "--scenario", "normal", "--policy", "random",
                            "--local-url", "http://l", "--local-model", "m"])
         self.assertEqual(args.cloud, "null")  # default: fake sink, no url/key needed
+        self.assertIsNone(args.cloud_provider)
+        self.assertFalse(args.cloud_no_fallbacks)
+        self.assertFalse(args.cloud_stop_after_first_token)
 
     def test_real_cloud_requires_url_and_model(self):
         base = ["--data", "t", "--scenario", "normal", "--policy", "all_cloud",
@@ -267,6 +313,50 @@ class TestParseArgsQueued(unittest.TestCase):
                            "--cloud-url", "http://c"])
         _, cloud = build_endpoints(args)
         self.assertEqual(cloud.model, "m")
+
+    def test_ttft_probe_requires_fixed_authenticated_real_cloud(self):
+        base = [
+            "--data", "t", "--scenario", "normal", "--policy", "all_cloud",
+            "--cloud", "real", "--cloud-url", "http://c", "--cloud-model", "m",
+            "--cloud-stop-after-first-token",
+        ]
+        with self.assertRaises(SystemExit):
+            parse_args(base)  # no provider / no-fallback / key env
+        with self.assertRaises(SystemExit):
+            parse_args(base + ["--cloud-provider", "deepinfra",
+                               "--cloud-api-key-env", "OPENROUTER_KEY"])
+        with self.assertRaises(SystemExit):
+            parse_args(base + ["--cloud-provider", "deepinfra",
+                               "--cloud-no-fallbacks"])
+        with self.assertRaises(SystemExit):
+            parse_args(base + ["--cloud-provider", "deepinfra",
+                               "--cloud-provider", "groq", "--cloud-no-fallbacks",
+                               "--cloud-api-key-env", "OPENROUTER_KEY"])
+        with self.assertRaises(SystemExit):
+            parse_args(base + ["--cloud-provider", "deepinfra",
+                               "--cloud-no-fallbacks", "--cloud-api-key-env",
+                               "OPENROUTER_KEY", "--ignore-eos"])
+
+        args = parse_args(base + [
+            "--cloud-provider", "deepinfra", "--cloud-no-fallbacks",
+            "--cloud-api-key-env", "OPENROUTER_KEY",
+        ])
+        self.assertEqual(args.cloud_provider, ["deepinfra"])
+        self.assertTrue(args.cloud_no_fallbacks)
+        self.assertTrue(args.cloud_stop_after_first_token)
+
+    def test_openrouter_options_rejected_for_null_cloud(self):
+        base = [
+            "--data", "t", "--scenario", "normal", "--policy", "random",
+            "--local-url", "http://l", "--local-model", "m",
+        ]
+        for option in (
+            ["--cloud-provider", "deepinfra"],
+            ["--cloud-no-fallbacks"],
+            ["--cloud-stop-after-first-token"],
+        ):
+            with self.assertRaises(SystemExit):
+                parse_args(base + option)
 
     def test_summary_lives_next_to_raw_output(self):
         from router.common import resolve_output_path

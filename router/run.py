@@ -292,7 +292,16 @@ async def replay_queued(
                                          max_tokens_override=args.max_tokens,
                                          timeout_s=args.timeout_s,
                                          temperature=args.temperature,
-                                         ignore_eos=args.ignore_eos)
+                                         ignore_eos=args.ignore_eos,
+                                         provider_order=args.cloud_provider,
+                                         allow_fallbacks=(
+                                             False
+                                             if args.cloud_no_fallbacks
+                                             else None
+                                         ),
+                                         stop_after_first_token=(
+                                             args.cloud_stop_after_first_token
+                                         ))
 
         run_start = time.perf_counter()
         f = out.open("w", encoding="utf-8")
@@ -831,6 +840,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cloud-max-concurrency", type=int, default=32,
                         help="cap concurrent REAL cloud requests (0 = unlimited); "
                              "guards against self-inflicted 429s under burst")
+    parser.add_argument("--cloud-provider", action="append", default=None,
+                        help="OpenRouter provider slug in priority order; repeat "
+                             "the flag to supply more than one")
+    parser.add_argument("--cloud-no-fallbacks", action="store_true",
+                        help="send OpenRouter provider.allow_fallbacks=false")
+    parser.add_argument("--cloud-stop-after-first-token", action="store_true",
+                        help="TTFT-only probe: abort the real cloud stream after "
+                             "the first non-empty content or reasoning delta")
     parser.add_argument("--in-price", type=float, default=0.15)
     parser.add_argument("--out-price", type=float, default=1.20)
 
@@ -901,6 +918,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--time-scale must be > 0")
     needs_local = args.policy in ("all_local", "random", "nimbus")
     needs_cloud = args.policy in ("all_cloud", "random", "nimbus")
+    if args.cloud_provider:
+        args.cloud_provider = [provider.strip() for provider in args.cloud_provider]
+        if any(not provider for provider in args.cloud_provider):
+            parser.error("--cloud-provider must not be empty")
+        if len(set(args.cloud_provider)) != len(args.cloud_provider):
+            parser.error("--cloud-provider entries must be unique")
+    cloud_openrouter_options = (
+        args.cloud_provider is not None
+        or args.cloud_no_fallbacks
+        or args.cloud_stop_after_first_token
+    )
+    if cloud_openrouter_options and (not needs_cloud or args.cloud != "real"):
+        parser.error("OpenRouter cloud provider/cancellation options require a "
+                     "cloud-using policy with --cloud real")
+    if args.cloud_stop_after_first_token:
+        if not args.cloud_provider or len(args.cloud_provider) != 1:
+            parser.error("--cloud-stop-after-first-token requires exactly one "
+                         "--cloud-provider")
+        if not args.cloud_no_fallbacks:
+            parser.error("--cloud-stop-after-first-token requires "
+                         "--cloud-no-fallbacks")
+        if not args.cloud_api_key_env:
+            parser.error("--cloud-stop-after-first-token requires "
+                         "--cloud-api-key-env")
+        if args.ignore_eos:
+            parser.error("--cloud-stop-after-first-token cannot be combined "
+                         "with --ignore-eos")
     if (args.policy == "nimbus" and args.nimbus_trigger == "kv_gap"
             and (args.kv_capacity_tokens is None
                  or args.kv_capacity_tokens <= 0)):
@@ -1092,6 +1136,9 @@ async def main() -> None:
         "kv_hysteresis_fraction": args.kv_hysteresis_fraction,
         "cloud": args.cloud,
         "cloud_max_concurrency": args.cloud_max_concurrency,
+        "cloud_provider_order": args.cloud_provider,
+        "cloud_no_fallbacks": args.cloud_no_fallbacks,
+        "cloud_stop_after_first_token": args.cloud_stop_after_first_token,
         "local_url": args.local_url,
         "local_model": args.local_model,
         "in_price": args.in_price,

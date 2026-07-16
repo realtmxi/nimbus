@@ -32,10 +32,16 @@ REQ = {"request_id": 0, "arrived_at": 123, "relative_arrival_s": 0.0,
 
 
 class FakeResp:
-    def __init__(self, status: int, sse_lines: list[str], text: str = ""):
+    def __init__(self, status: int, sse_lines: list[str], text: str = "",
+                 headers: dict[str, str] | None = None):
         self.status = status
         self._chunks = [line.encode() for line in sse_lines]
         self._text = text
+        self.headers = headers or {}
+        self.close_count = 0
+
+    def close(self) -> None:
+        self.close_count += 1
 
     async def text(self) -> str:
         return self._text
@@ -154,8 +160,12 @@ class TestOneRequest(unittest.TestCase):
         return res, session
 
     def test_success_parses_stream_and_usage(self):
-        res, session = self.run_req(LOCAL, FakeResp(200, sse_ok()))
+        resp = FakeResp(200, sse_ok())
+        res, session = self.run_req(LOCAL, resp)
         self.assertTrue(res["success"])
+        self.assertTrue(res["response_completed"])
+        self.assertFalse(res["stream_abort_requested"])
+        self.assertEqual(resp.close_count, 0)
         self.assertEqual(res["chunks"], 2)
         self.assertEqual(res["prompt_tokens"], 10)
         self.assertEqual(res["completion_tokens"], 2)
@@ -205,6 +215,74 @@ class TestOneRequest(unittest.TestCase):
         self.assertEqual(payload["temperature"], 0.0)
         self.assertIs(payload["ignore_eos"], True)
 
+    def test_openrouter_provider_preferences_are_opt_in(self):
+        payload = make_payload(
+            CLOUD,
+            REQ,
+            None,
+            provider_order=["deepinfra", "groq"],
+            allow_fallbacks=False,
+        )
+        self.assertEqual(payload["provider"], {
+            "order": ["deepinfra", "groq"],
+            "allow_fallbacks": False,
+        })
+
+    def test_ttft_probe_aborts_after_first_generated_token(self):
+        # Put content and usage after reasoning in the same transport chunk:
+        # once TTFT is observed, cancellation must not consume the rest.
+        # observed, cancellation must not accidentally consume the rest.
+        stream = [
+            'data: {"id":"gen-123","model":"qwen/qwen3-32b",'
+            '"provider":"DeepInfra","choices":[{"delta":'
+            '{"reasoning":"thinking"}}]}\n'
+            'data: {"id":"gen-123","model":"qwen/qwen3-32b",'
+            '"provider":"DeepInfra","choices":[{"delta":'
+            '{"content":"Hello"}}]}\n'
+            'data: {"usage":{"prompt_tokens":10,"completion_tokens":50},'
+            '"choices":[]}\n'
+            'data: [DONE]\n'
+        ]
+        resp = FakeResp(
+            200,
+            stream,
+            headers={"X-Generation-Id": "gen-123"},
+        )
+        session = FakeSession(resp)
+        result = asyncio.run(one_request(
+            session,
+            CLOUD,
+            REQ,
+            time.perf_counter(),
+            provider_order=["deepinfra"],
+            allow_fallbacks=False,
+            stop_after_first_token=True,
+        ))
+
+        self.assertTrue(result["success"])
+        self.assertIsNotNone(result["ttft_ms"])
+        self.assertFalse(result["response_completed"])
+        self.assertTrue(result["stream_abort_requested"])
+        self.assertEqual(result["probe_mode"], "ttft_cancel")
+        self.assertIsNone(result["e2e_ms"])
+        self.assertIsNone(result["tpot_ms"])
+        self.assertIsNone(result["cost_usd"])
+        self.assertTrue(result["cost_pending"])
+        self.assertEqual(result["chunks"], 1)
+        self.assertEqual(result["output_chars"], len("thinking"))
+        self.assertIsNone(result["prompt_tokens"])
+        self.assertIsNone(result["completion_tokens"])
+        self.assertEqual(result["generation_id"], "gen-123")
+        self.assertEqual(result["provider"], "DeepInfra")
+        self.assertEqual(result["response_model"], "qwen/qwen3-32b")
+        self.assertEqual(result["first_token_kind"], "reasoning")
+        self.assertIsNone(result["first_content_ttft_ms"])
+        self.assertEqual(result["requested_provider_order"], ["deepinfra"])
+        self.assertEqual(resp.close_count, 1)
+        self.assertEqual(session.calls[0]["json"]["provider"], {
+            "order": ["deepinfra"], "allow_fallbacks": False,
+        })
+
     def test_output_progress_uses_exact_continuous_usage_not_chunk_count(self):
         mtp_stream = [
             'data: {"usage":{"prompt_tokens":10,"completion_tokens":3},'
@@ -253,14 +331,15 @@ class TestOneRequest(unittest.TestCase):
 
 
 class TestCost(unittest.TestCase):
-    def test_missing_usage_bills_zero(self):
+    def test_missing_cloud_usage_is_unknown_but_local_is_free(self):
         res = {"success": True, "prompt_tokens": None, "completion_tokens": None}
-        self.assertEqual(compute_cost_usd(CLOUD, res), 0.0)
+        self.assertIsNone(compute_cost_usd(CLOUD, res))
+        self.assertEqual(compute_cost_usd(LOCAL, res), 0.0)
 
 
 class TestSummarize(unittest.TestCase):
     def mk(self, endpoint: str, ttft: float | None, success: bool = True,
-           cost: float = 0.0, error_type: str | None = None) -> dict:
+           cost: float | None = 0.0, error_type: str | None = None) -> dict:
         return {"endpoint": endpoint, "success": success, "ttft_ms": ttft,
                 "tpot_ms": 20.0 if success else None, "cost_usd": cost,
                 "error_type": error_type}
@@ -294,6 +373,26 @@ class TestSummarize(unittest.TestCase):
         self.assertEqual(s["cloud"]["n"], 0)
         self.assertIsNone(s["cloud"]["ttft_p50_ms"])
         self.assertEqual(s["cloud"]["slo_violation_pct"], 0.0)
+
+    def test_pending_probe_cost_never_looks_like_zero_total(self):
+        results = [
+            self.mk("local", 100.0, cost=0.0),
+            self.mk("cloud", 200.0, cost=None),
+        ]
+        results[1]["cost_pending"] = True
+        p = Policy("random", 0.5, seed=0)
+        p.n_total, p.n_outsourced = 2, 1
+        summary = summarize(results, p, slo_s=5.0)
+
+        self.assertEqual(summary["overall"]["slo_violations"], 0)
+        self.assertIsNone(summary["overall"]["cost_usd"])
+        self.assertEqual(summary["overall"]["known_cost_usd"], 0.0)
+        self.assertEqual(summary["overall"]["cost_measured_n"], 1)
+        self.assertEqual(summary["overall"]["cost_pending_n"], 1)
+        self.assertIsNone(summary["cloud"]["cost_usd"])
+        self.assertEqual(summary["cloud"]["cost_pending_n"], 1)
+        self.assertIsNone(summary["pessimistic_combined"]["cost_usd"])
+        self.assertEqual(summary["pessimistic_combined"]["cost_pending_n"], 1)
 
 
 class TestNullCloud(unittest.TestCase):

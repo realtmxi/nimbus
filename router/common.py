@@ -203,6 +203,8 @@ def make_payload(
     continuous_usage: bool = False,
     temperature: float | None = None,
     ignore_eos: bool = False,
+    provider_order: list[str] | None = None,
+    allow_fallbacks: bool | None = None,
 ) -> dict[str, Any]:
     payload = {
         "model": endpoint.model,
@@ -219,6 +221,15 @@ def make_payload(
         payload["temperature"] = float(temperature)
     if ignore_eos:
         payload["ignore_eos"] = True
+    if provider_order or allow_fallbacks is not None:
+        # OpenRouter-specific preferences are opt-in so the default payload
+        # remains byte-for-byte compatible with ordinary OpenAI endpoints.
+        provider: dict[str, Any] = {}
+        if provider_order:
+            provider["order"] = list(provider_order)
+        if allow_fallbacks is not None:
+            provider["allow_fallbacks"] = bool(allow_fallbacks)
+        payload["provider"] = provider
     return payload
 
 
@@ -261,12 +272,22 @@ class NullCloud:
         return result
 
 
-def compute_cost_usd(endpoint: Endpoint, result: dict[str, Any]) -> float:
-    """Bill a completed request from its returned usage. Failed requests cost $0."""
+def compute_cost_usd(endpoint: Endpoint,
+                     result: dict[str, Any]) -> float | None:
+    """Bill a request from returned usage, preserving unknown cloud costs.
+
+    A TTFT-only probe deliberately aborts before the final usage SSE event, so
+    treating absent usage as zero would under-report spend.  Local requests are
+    still exactly free even when their endpoint omits usage.
+    """
     if not result["success"]:
         return 0.0
-    prompt_tokens = result["prompt_tokens"] or 0
-    completion_tokens = result["completion_tokens"] or 0
+    if endpoint.input_price_per_mtok == endpoint.output_price_per_mtok == 0.0:
+        return 0.0
+    prompt_tokens = result.get("prompt_tokens")
+    completion_tokens = result.get("completion_tokens")
+    if prompt_tokens is None or completion_tokens is None:
+        return None
     return token_cost_usd(
         prompt_tokens,
         completion_tokens,
@@ -286,6 +307,9 @@ async def one_request(
     on_output_progress: Callable[[int], None] | None = None,
     temperature: float | None = None,
     ignore_eos: bool = False,
+    provider_order: list[str] | None = None,
+    allow_fallbacks: bool | None = None,
+    stop_after_first_token: bool = False,
 ) -> dict[str, Any]:
     """Send one streaming chat-completion and measure TTFT/TPOT/e2e.
 
@@ -301,6 +325,7 @@ async def one_request(
     chunks = 0
     usage: dict[str, Any] = {}
     output_chars = 0
+    probe_stopped = False
 
     result = {
         "request_id": req["request_id"],
@@ -321,6 +346,16 @@ async def one_request(
         "completion_tokens": None,
         "output_chars": 0,
         "cost_usd": 0.0,
+        "cost_pending": False,
+        "response_completed": False,
+        "stream_abort_requested": False,
+        "probe_mode": "ttft_cancel" if stop_after_first_token else None,
+        "first_token_kind": None,
+        "first_content_ttft_ms": None,
+        "generation_id": None,
+        "provider": None,
+        "response_model": None,
+        "requested_provider_order": list(provider_order or []),
     }
 
     timeout = aiohttp.ClientTimeout(total=timeout_s) if aiohttp is not None else None
@@ -345,10 +380,15 @@ async def one_request(
                 continuous_usage=on_output_progress is not None,
                 temperature=temperature,
                 ignore_eos=ignore_eos,
+                provider_order=provider_order,
+                allow_fallbacks=allow_fallbacks,
             ),
             timeout=timeout,
         ) as resp:
             result["http_status"] = resp.status
+            headers = getattr(resp, "headers", None)
+            if headers is not None:
+                result["generation_id"] = headers.get("X-Generation-Id")
 
             if resp.status >= 400:
                 error_text = (await resp.text())[:500]
@@ -377,6 +417,16 @@ async def one_request(
 
                     obj = json.loads(data)
 
+                    # OpenRouter exposes the generation id in a response
+                    # header and may repeat id/provider/model on SSE chunks.
+                    # Keep both paths: the header survives a first-token abort.
+                    if obj.get("id"):
+                        result["generation_id"] = obj["id"]
+                    if obj.get("provider"):
+                        result["provider"] = obj["provider"]
+                    if obj.get("model"):
+                        result["response_model"] = obj["model"]
+
                     if obj.get("error"):
                         error = obj["error"]
                         message = error.get("message") if isinstance(error, dict) else str(error)
@@ -390,7 +440,22 @@ async def one_request(
 
                     choices = obj.get("choices") or []
                     delta = choices[0].get("delta") if choices else {}
-                    token = delta.get("content") if isinstance(delta, dict) else ""
+                    if isinstance(delta, dict):
+                        content = delta.get("content") or ""
+                        # OpenRouter separates Qwen reasoning from visible
+                        # content, while our vLLM deployment (no reasoning
+                        # parser) streams the same <think> tokens in content.
+                        # Count either as the first generated token so local
+                        # and cloud TTFT use the same semantic boundary.
+                        reasoning = (
+                            delta.get("reasoning")
+                            or delta.get("reasoning_content")
+                            or ""
+                        )
+                    else:
+                        content = ""
+                        reasoning = ""
+                    token = content or reasoning
 
                     if (
                         on_output_progress is not None
@@ -405,22 +470,35 @@ async def one_request(
                         return result
                     if token:
                         now = time.perf_counter()
-                        first_token_time = first_token_time or now
+                        if first_token_time is None:
+                            first_token_time = now
+                            result["first_token_kind"] = (
+                                "content" if content else "reasoning"
+                            )
+                        if content and result["first_content_ttft_ms"] is None:
+                            result["first_content_ttft_ms"] = (now - start) * 1000
                         chunks += 1
                         output_chars += len(token)
+                        if stop_after_first_token:
+                            # Abort the HTTP stream, not the asyncio task.  The
+                            # latter can escape callers as CancelledError and
+                            # lose the result row/semaphore release entirely.
+                            result["stream_abort_requested"] = True
+                            probe_stopped = True
+                            close = getattr(resp, "close", None)
+                            if close is not None:
+                                close()
+                            break
                     if (
                         on_output_progress is not None
                         and completion_progress is not None
                     ):
                         on_output_progress(int(completion_progress))
 
-                if done:
+                if done or probe_stopped:
                     break
 
-        end_time = end_time or time.perf_counter()
-
         result["success"] = True
-        result["e2e_ms"] = (end_time - start) * 1000
         result["chunks"] = chunks
 
         if first_token_time is not None:
@@ -429,9 +507,22 @@ async def one_request(
         result["prompt_tokens"] = usage.get("prompt_tokens")
         result["completion_tokens"] = usage.get("completion_tokens")
         result["output_chars"] = output_chars
-        gen_count = result["completion_tokens"] or chunks
-        if gen_count and gen_count > 1 and result["ttft_ms"] is not None:
-            result["tpot_ms"] = (result["e2e_ms"] - result["ttft_ms"]) / (gen_count - 1)
+        if probe_stopped:
+            # TTFT was measured successfully, but completion/cost must be
+            # enriched later through OpenRouter's generation endpoint.
+            result["e2e_ms"] = None
+            result["tpot_ms"] = None
+            result["cost_usd"] = None
+            result["cost_pending"] = True
+        else:
+            end_time = end_time or time.perf_counter()
+            result["response_completed"] = done
+            result["e2e_ms"] = (end_time - start) * 1000
+            gen_count = result["completion_tokens"] or chunks
+            if gen_count and gen_count > 1 and result["ttft_ms"] is not None:
+                result["tpot_ms"] = (
+                    (result["e2e_ms"] - result["ttft_ms"]) / (gen_count - 1)
+                )
 
     except asyncio.TimeoutError:
         record_error("TimeoutError", f"timeout after {timeout_s}s")
@@ -440,7 +531,9 @@ async def one_request(
     except Exception as exc:
         record_error(type(exc).__name__, str(exc) or repr(exc))
 
-    result["cost_usd"] = compute_cost_usd(endpoint, result)
+    if not probe_stopped:
+        result["cost_usd"] = compute_cost_usd(endpoint, result)
+        result["cost_pending"] = result["cost_usd"] is None
     return result
 
 
@@ -483,6 +576,14 @@ def summarize(results: list[dict[str, Any]], policy: Policy, slo_s: float) -> di
         for r in rows:
             if r["error_type"]:
                 errors[r["error_type"]] = errors.get(r["error_type"], 0) + 1
+        measured_costs = [
+            float(r["cost_usd"])
+            for r in rows
+            if isinstance(r.get("cost_usd"), (int, float))
+            and not isinstance(r.get("cost_usd"), bool)
+        ]
+        pending_cost_n = len(rows) - len(measured_costs)
+        known_cost = sum(measured_costs)
         return {
             "n": len(rows),
             "success": len(ok),
@@ -495,7 +596,12 @@ def summarize(results: list[dict[str, Any]], policy: Policy, slo_s: float) -> di
             "slo_violations": viol,
             "slo_measured_n": len(measured),   # SLO denominator (routed_only excluded)
             "slo_violation_pct": 100.0 * viol / max(len(measured), 1),
-            "cost_usd": sum(r["cost_usd"] for r in rows),
+            # Never present a known subtotal as the total when probe rows await
+            # generation-metadata enrichment.
+            "cost_usd": known_cost if pending_cost_n == 0 else None,
+            "known_cost_usd": known_cost,
+            "cost_measured_n": len(measured_costs),
+            "cost_pending_n": pending_cost_n,
         }
 
     local_rows = [r for r in results if r["endpoint"] == "local"]
@@ -525,6 +631,9 @@ def summarize(results: list[dict[str, Any]], policy: Policy, slo_s: float) -> di
             ),
             "cloud_assumed_violations": len(cloud_rows),
             "cost_usd": overall["cost_usd"],
+            "known_cost_usd": overall["known_cost_usd"],
+            "cost_measured_n": overall["cost_measured_n"],
+            "cost_pending_n": overall["cost_pending_n"],
         },
     }
 
