@@ -6,7 +6,7 @@ assumptions, and the exact queue of next experiments. Written so a person or age
 shipped-v3 (`kv_gap`) design baseline:
 [`notion_algorithm_design_v3.md`](notion_algorithm_design_v3.md); the current
 July-14–16 TTFT experiment contract and results are authoritative in Sections
-5b–5h below. Framework usage: [`../router/README.md`](../router/README.md).
+5b–5j below. Framework usage: [`../router/README.md`](../router/README.md).
 Chinese chronological ledger:
 [`nimbus_experiment_ledger_2026-07.zh-CN.md`](nimbus_experiment_ledger_2026-07.zh-CN.md).
 
@@ -21,8 +21,8 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
 
 1. The `router/` framework (external FIFO + work-conserving dispatcher + policies)
    remains validated against the trusted open-loop harness (parity 1.003; queue
-   neutrality 110 vs 111 ms). The July-16 tree passes **117/117** offline
-   tests: 81 router tests plus 36 experiment-evidence tests.
+   neutrality 110 vs 111 ms). The current July-16 tree passes **136/136** offline
+   tests: 83 router tests plus 53 experiment-evidence tests.
 2. The July-14 rerun explicitly uses **predicted TTFT violation as the trigger**;
    KV is neither its objective nor its trigger. The repository default remains
    the shipped `kv_gap + cost_disp_current` baseline until a separate design
@@ -78,6 +78,19 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
    the explicitly temporary assumption that cancellation does not change cloud
    load, the next headline metric can be observed local+cloud TTFT rather than
    the NullCloud pessimistic bound.
+8. A second, explicitly separate ShareGPT current-turn leg is now materialized
+   and pre-registered (Section 5j). Audit of the teammate's historical sender
+   confirmed that it sent each row's original `prompt_text` as one user message,
+   not reconstructed conversation history. Retokenizing that exact payload with
+   the Qwen3-32B chat template changes the selected workload from 8.05M
+   cumulative metadata tokens to 1.51M actual prompt tokens; one 221,051-token
+   outlier is dropped rather than truncated, leaving 11,604 requests and 1.289M
+   prompt tokens. This is not a correction to, replacement for, or average with
+   the synthetic token-aligned leg: the synthetic leg tests target pressure;
+   the current-turn leg tests real-text external validity. It will first run a
+   no-export, full local `all_local → old-v2 → current` gate. No original
+   ShareGPT text may be sent to a third party without a separate explicit
+   authorization after that gate.
 
 ---
 
@@ -88,10 +101,11 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
 | `router/run.py` | Single entry point: external FIFO, work-conserving dispatcher, KV monitor, inflight-KV tracker, CLI |
 | `router/common.py` | Trace loading (BurstGPT windows byte-identical to the trusted `vllm/run.py`; `--scenario full` for arbitrary traces), payloads, SSE client, NullCloud sink, billing, summaries |
 | `router/nimbus.py` | Shipped KV-gap baseline plus orthogonal `kv_gap` / `ttft_pred` triggers and selector ablations |
-| `router/test_*.py` | 81 unit tests, no network/GPU (`python3 -m unittest router.test_common router.test_run router.test_nimbus`) |
+| `router/test_*.py` | 83 unit tests, no network/GPU (`python3 -m unittest router.test_common router.test_run router.test_nimbus`) |
 | `tools/kv_gauge_probe.py` | Live probe that established the Section-4 finding (stdlib only) |
 | `tools/analyze_eb1200.py` | Timeline reconstruction that flagged the anomaly from a result JSONL |
 | `tools/materialize_token_aligned_trace.py` | Atomic, tokenizer-fingerprinted no-cache trace materializer |
+| `tools/materialize_sharegpt_current_turn_trace.py` | Verbatim current-turn retokenizer with source/decode provenance, overflow policy, and text-free manifest |
 | `tools/profile_ttft_batch.py` | Same-payload warmup/profile with a held-out shared-prefill-lane calibration artifact |
 | `tools/analyze_ttft_repeatability.py` | Parameterized block-level validator/aggregator; no request-level pseudo-replication |
 | `tools/analyze_ttft_full_cell.py` | Exact five-marker/full-cell integrity audit and frozen-gate scorer |
@@ -166,6 +180,13 @@ Honest caveat: with kicked requests *counted as violations* (real cloud TTFT p50
 — a wash. Aggressive shedding does not automatically win the *combined* metric
 when the cloud is slow; this is precisely the cost/SLO-frontier question
 (Section 7, item 5).
+
+A July-16 source/runner audit clarifies what those 14,537 rows mean. The sender
+read `prompt_text` and issued exactly one user message per trace row; it did not
+reconstruct cumulative conversation history. Therefore that dataset is evidence
+about original ShareGPT **current-turn payloads**, not the long cumulative token
+metadata stored beside them. Section 5j adopts that same payload semantic while
+recomputing scheduler-visible tokens from the bytes actually sent.
 
 ### 3.3 v3 on the hardest cell (`extreme_burst_1200`, n=11,605) — headline + audit
 
@@ -290,6 +311,11 @@ using the SAME team workload (ShareGPT + BurstGPT timestamps); the rednote
 slice is dropped from the near-term plan. Executed same day; all results under
 `$MSCRATCH/router_v32b/`, scripts `v32b_accept.sh` / `v32b_eb.sh` /
 `v32b_rand.sh` in `$MSCRATCH`.
+
+“Same workload” here means the same source rows/timestamps, not necessarily the
+same HTTP bytes: the historical sender used only each row's current-turn
+`prompt_text`, while later token-aligned cells synthesize payloads matching the
+cumulative token metadata. Section 5j makes that distinction explicit.
 
 **Server**: Qwen3-32B on physical GPU2, FLASH_ATTN, `--max-num-seqs 128`,
 `gpu-memory-utilization 0.95` → `GPU KV cache size: 112,064 tokens`,
@@ -1056,6 +1082,143 @@ and re-profile rather than reuse this artifact. Evidence is under
 repo-sibling mirror outside git at
 `artifacts/realcloud_full_prerun_2026-07-16/`.
 
+### 5j. PRE-REGISTERED 2026-07-16 — ShareGPT current-turn external-validity leg
+
+**Status: TRACE MATERIALIZED / LOCAL ARMS NOT RUN / NO ORIGINAL TEXT
+EXPORTED.** This cell was defined and hashed before starting any inference arm.
+It does not retroactively relabel E6–E11 or merge their outcomes.
+
+**Why there are two legs.** The source trace contains two properties that the
+available payload cannot preserve simultaneously:
+
+- `prompt_text` is the original ShareGPT current user turn;
+- `num_prefill_tokens` is historical cumulative-conversation metadata.
+
+The source file does not carry the exact cumulative chat payload that produced
+that metadata. E6/E9/E11 therefore replace text with deterministic unique
+filler so HTTP payload tokens match the cumulative sizes; those cells answer
+whether the scheduling mechanism works under the target pressure distribution.
+E12 instead preserves each original current-turn string byte-for-byte and
+recomputes its tokens; it answers whether the policy generalizes to real
+current-turn text and the different pressure mix that text induces. These are
+two different estimands, not two standards for accepting the same result, and
+their outcomes must never be averaged.
+
+An audit of the teammate's historical workload and sender fixed the payload
+contract before materialization: the sender selected `prompt_text` and wrapped
+it as `messages=[{"role":"user","content": prompt_text}]`. It did not replay a
+full conversation. “Current-turn-payload compatible” in this section refers
+only to that semantic; the visible sender postdates the historical results and
+its decode/runtime behavior differs, so E12 is not an exact reproduction.
+
+**Frozen transformation and provenance.** Implementation commit `6054b32`
+adds `tools/materialize_sharegpt_current_turn_trace.py` (tool SHA256
+`39315185886e993bdf8b6fd6b0456017a3b6c7d50c926cb35bec953996227f4a`)
+and extends matrix preflight to bind both current-turn and historical synthetic
+materializers. The source ShareGPT+BurstGPT file has SHA256
+`bf790b87eb61ba486a21155d0b6a417ad7ba6fb6abe0ff33a60ca155ace1ad0f`.
+Selection reuses the inclusive `extreme_burst_1200` window and stable
+`(arrived_at, source_index)` order. For each selected row:
+
+```text
+messages = [{"role": "user", "content": source.prompt_text}]
+P = len(Qwen3-32B_tokenizer.apply_chat_template(
+          messages, tokenize=True, add_generation_prompt=True))
+
+prompt_text             = source.prompt_text       # verbatim
+num_prefill_tokens      = P
+uncached_prompt_tokens  = P
+num_cached_tokens       = 0
+num_decode_tokens       = min(source.num_decode_tokens, 1024)
+```
+
+No prompt is truncated. A row is dropped only when `P + D > 40,960`, and the
+drop is recorded by source index and token counts in the text-free manifest.
+The pre-arm audit found exactly one such row: zero-based source index 15,944 has
+`P=221,051`, `D=17`, total 221,068. It was discovered before any policy outcome
+and is dropped for every arm. Five emitted rows have source decode length above
+1,024 and use the frozen cap while retaining `trace_num_decode_tokens`.
+
+The final restricted trace is under
+`$MSCRATCH/sharegpt_current_turn_6054b32_20260716/`; it is not committed or
+copied into a general artifact mirror because it contains original text.
+
+| Frozen trace check | Value |
+|---|---:|
+| Selected / emitted rows | 11,605 / **11,604** |
+| Arrival range / span | 1,260,532–1,261,731 / 1,199 s |
+| Actual `P` min / p50 / p95 / p99 / max | 9 / 26 / 463 / 1,699 / 10,795 |
+| Actual emitted prompt-token sum | **1,289,405** |
+| Historical cumulative prompt-token sum on emitted rows | 7,887,915 |
+| Emitted decode-token p50 / p95 / max / sum | 238 / 630 / 1,024 / 3,038,796 |
+| Decode-cap / context-drop affected rows | 5 / 1 |
+| Trace SHA256 | `e838016a8e55660c565dadb1ad019770f6b88f878d8ca29f165c30887d2cb410` |
+| Manifest SHA256 | `698bb94a82d133b0c54aa87d8badd4f181140c352cb29c1e726cfe2b291bf9a8` |
+
+The manifest binds the materializer, `router/common.py`, shared tokenizer
+helpers, source/output hashes, tokenizer vocab SHA, and Qwen chat-template SHA.
+All 11,604 emitted rows passed preservation/alignment checks; the full tree
+passed 83 router plus 53 tools tests (**136/136**), `py_compile`, `bash -n`, and
+`git diff --check` before this registration.
+
+**Frozen local-only gate.** Before any third-party POST, start one fresh
+Qwen3-32B lifecycle with bfloat16, no prefix cache, `max_model_len=40960`, and
+`max_num_seqs=128`. Generate a fresh schema-v2 profile bound to that PID, log,
+endpoint, tokenizer, and checkout. The target profile cells are:
+
+```text
+1x16,1x32,1x512,1x4096,1x32768,
+8x16,8x32,8x512,8x4096,
+16x512,16x4096,32x2048,64x1024,128x32,128x512
+```
+
+Use five repeats, decode 256, seed 0, the profile's held-out zero-FN gate, and
+the same 250 ms Nimbus tick. Then run the complete trace as three staged runner
+invocations in frozen order:
+
+1. L — exact arm `anchor:all_local:0`;
+2. A — exact arm `ttft_pred:cost_cachedisp_old:0`;
+3. C — exact arm `ttft_pred:cost_disp_current:0`.
+
+Each invocation has its own `OUT_DIR`, matrix manifest, and fingerprint because
+the runner binds the exact arm list. All three nevertheless share the same
+lifecycle/profile/trace and identical `time_scale=1.0`, 5 s TTFT SLO,
+temperature 0, `local_ignore_eos=true`, `CLOUD=null`, `timeout_s=7200`, and
+prices `$0.08/M` input plus `$0.28/M` output. Validate the completed stage and
+wait at least 20 s before starting the next. NullCloud is only a non-network
+sink for selected victims; no HTTP request leaves the team machine.
+
+Each arm must have 11,604 unique rows and a valid marker/hash binding. L must
+have 11,604 successful local rows with exact prompt and decode usage. A/C
+successful local rows must be token-exact, and their applied victim IDs must
+exactly equal their NullCloud row IDs. L is the observed pressure anchor: the
+pre-arm queueing calculation suggests pressure remains sequence/decode-bound,
+but that calculation is not accepted as an outcome. If L has zero 5 s TTFT
+violations, report that this deployment needs no offload for this workload and
+do not start A or C. Otherwise start A after its cooldown; if A retains any
+local violation, report that the safety gate failed and do not start C.
+Otherwise run C; any retained-local C violation fails the final safety gate.
+Do not tune the guard after seeing outcomes under this registration.
+
+**Claim and export boundary.** A passing local gate shows only that the
+TTFT-triggered selectors safely shed this real current-turn workload on one
+deployment. It does not validate full-conversation replay, the cached-token
+term, prefix-cache displacement, answer quality, cloud TTFT, or a selector
+winner from one ordered A/C pair. The single 221k drop must remain explicit in
+all denominators and comparisons.
+
+A later live A/C requires a new lifecycle/profile, a separately frozen live
+contract, and this explicit authorization before the first POST:
+
+> I confirm that I have the right to send the selected 11,604 original
+> ShareGPT current-turn texts and their request timing to OpenRouter/DeepInfra,
+> understand that they may contain personal or sensitive content, and authorize
+> the registered first-token-cancel experiment.
+
+Agreement with the two-leg methodology is not that export authorization. Until
+it is received, original prompts remain on restricted scratch and only the
+local-only L/A/C gate is permitted.
+
 ---
 
 ## 6. Cloud-side accounting (headline-metric decision)
@@ -1103,7 +1266,7 @@ whole-run diagnostics even after observed cloud TTFT becomes the headline.
 
 ---
 
-## 7. Experiment queue (REVISED 2026-07-16 after the real-cloud probe)
+## 7. Experiment queue (REVISED 2026-07-16 after current-turn decision)
 
 1. **COMPLETED — audit contract.** Atomic token-aligned materializer,
    complete-cohort/stale-arrival protection, local usage telemetry, no-cache
@@ -1175,13 +1338,21 @@ whole-run diagnostics even after observed cloud TTFT becomes the headline.
     coverage. If the single-pair A/C difference is below about 1 percentage
     point, run a reverse-order pair before claiming a winner. Cancel-mode
     provider cost is probe expenditure, not the selector's projected
-    full-response deployment cost.
-12. **THEN harden the TTFT trigger outside the calibration support envelope.**
+    full-response deployment cost. This synthetic live leg remains validly
+    registered but is not started by the E12 methodology decision.
+12. **NEXT — E12 local-only current-turn L/A/C.** Section 5j freezes the
+    11,604-row verbatim current-turn trace, fresh short-prompt-aware profile,
+    full `all_local → old-v2 → current` order, and stop rules. This stage uses
+    NullCloud and must make zero third-party POSTs. It determines whether the
+    retokenized workload actually has local pressure and whether A/C preserve
+    retained-local TTFT safety. A passing result permits only a separately
+    pre-registered live proposal; it does not authorize original-text export.
+13. **THEN harden the TTFT trigger outside the calibration support envelope.**
     Profile deployment binding resources, log full decision snapshots/scores,
     and add a conservative fallback when live state leaves calibrated support.
     Engine cache gauge may enter only as a deployment-profiled resource feature,
     never as a universally token-denominated TTFT trigger.
-13. **Restore remaining semantics:** cache-aware trace for the cached-token
+14. **Restore remaining semantics:** cache-aware trace for the cached-token
     term; estimated-vs-oracle decode; historical exact 0/1-DP/offline oracle;
     load/guard sweeps; and at least one full-drain cloud sensitivity leg for
     E2E/mid-stream reliability. The hybrid binding-resource result remains a
@@ -1231,7 +1402,8 @@ whole-run diagnostics even after observed cloud TTFT becomes the headline.
 | `$MSCRATCH/router_ttft_full_c6de62a_20260715/full11605_bkcal/` | Completed pre-registered B/K/C/A/L matrix: raw/decision/summary/markers, frozen manifest, full-cell gate audit, and bound B violation-context audit |
 | `$MSCRATCH/openrouter_ttft_cancel_20260716/` | July-16 fixed-DeepInfra TTFT-cancel smokes and 16-row burst; raw/summary plus delayed generation/billing audit (Section 5h) |
 | `$MSCRATCH/router_realcloud_full_2b53ff3_20260716T1435Z/` | E11 pre-arm lifecycle: valid fresh profile, server log, non-secret OpenRouter baseline, and blocked-launch zero-usage audit; no formal A/C rows |
+| `$MSCRATCH/sharegpt_current_turn_6054b32_20260716/` | Restricted E12 original-current-turn trace and text-free manifest; 11,604 emitted rows, output SHA `e838016a…cb410`, manifest SHA `698bb94a…bf9a8`; no matrix arms yet |
 | repo-sibling `artifacts/realcloud_full_prerun_2026-07-16/` | Verified local mirror of the six E11 pre-arm evidence files; outside git |
 | `$JSCRATCH/workloads/…` | ShareGPT+BurstGPT trace (leg-1 `$DATA`) |
-| `$JSCRATCH/initial_result/` | 14,537-row real OpenRouter measurements (cloud-latency calibration) |
+| `$JSCRATCH/initial_result/` | 14,537 successful historical provider observations using single-current-turn `prompt_text`; not token-aligned long-context calibration or an exact E12 reproduction |
 | `$JSCRATCH/vllmresult/` | teammate's open-loop sweep on the same model (parity reference) |

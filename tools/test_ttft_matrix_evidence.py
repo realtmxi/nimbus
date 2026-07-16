@@ -34,6 +34,7 @@ class TestTTFTMatrixEvidence(unittest.TestCase):
             in_price=0.15,
             out_price=1.20,
             slo_s=5.0,
+            timeout_s=600.0,
             nimbus_tick_ms=250.0,
             max_inflight=128,
             temperature=0.0,
@@ -161,6 +162,7 @@ class TestTTFTMatrixEvidence(unittest.TestCase):
                 "tpot_ms": self.expected.tpot_ms,
                 "first_token_overhead_ms": self.expected.first_token_overhead_ms,
                 "slo_s": self.expected.slo_s,
+                "timeout_s": self.expected.timeout_s,
                 "ttft_guard_ms": self.expected.ttft_guard_ms,
                 "nimbus_tick_ms": self.expected.nimbus_tick_ms,
                 "kv_capacity_tokens": self.expected.kv_capacity_tokens,
@@ -325,6 +327,13 @@ class TestTTFTMatrixEvidence(unittest.TestCase):
         marker = self._validate(paths, ANCHOR_ARM, write=True)
         self.assertEqual(marker["artifacts"]["decisions"]["nonempty_line_n"], 0)
         self.assertEqual(self._validate(paths, ANCHOR_ARM, write=False), marker)
+
+    def test_marker_binds_request_timeout(self) -> None:
+        payload = self._summary("all_local")
+        payload["config"]["timeout_s"] = self.expected.timeout_s + 1
+        paths = self._paths(payload)
+        with self.assertRaisesRegex(MatrixEvidenceError, "timeout_s"):
+            self._validate(paths, ANCHOR_ARM, write=True)
 
     def test_anchor_requires_every_trace_row_to_align_and_empty_decisions(self) -> None:
         partial = self._summary("all_local")

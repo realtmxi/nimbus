@@ -25,6 +25,7 @@ PYBIN=${PYBIN:-python3}
 CHAT_URL=${CHAT_URL:-${BASE_URL%/}/v1/chat/completions}
 MAX_INFLIGHT=${MAX_INFLIGHT:-128}
 SLO_S=${SLO_S:-5}
+TIMEOUT_S=${TIMEOUT_S:-600}
 NIMBUS_TICK_MS=${NIMBUS_TICK_MS:-250}
 COOLDOWN_S=${COOLDOWN_S:-20}
 TEMPERATURE=${TEMPERATURE:-0}
@@ -321,14 +322,16 @@ if [[ "$SCENARIO" != "$TRACE_SCENARIO" ]]; then
     "$SCENARIO" "$TRACE_SCENARIO" >&2
   exit 4
 fi
-if ! "$PYBIN" - "$TTFT_GUARD_MS" "$SLO_S" <<'PY'
+if ! "$PYBIN" - "$TTFT_GUARD_MS" "$SLO_S" "$TIMEOUT_S" <<'PY'
 import sys
-guard_ms, slo_s = map(float, sys.argv[1:])
-raise SystemExit(0 if 0 <= guard_ms < slo_s * 1000 else 1)
+guard_ms, slo_s, timeout_s = map(float, sys.argv[1:])
+raise SystemExit(
+    0 if 0 <= guard_ms < slo_s * 1000 and timeout_s > 0 else 1
+)
 PY
 then
-  printf 'profile-recommended guard %s ms is incompatible with SLO %s s\n' \
-    "$TTFT_GUARD_MS" "$SLO_S" >&2
+  printf 'guard=%s ms, SLO=%s s, or timeout=%s s is invalid\n' \
+    "$TTFT_GUARD_MS" "$SLO_S" "$TIMEOUT_S" >&2
   exit 4
 fi
 
@@ -393,7 +396,7 @@ RUN_FINGERPRINT="$($PYBIN - "$TRACE_SHA" "$TRACE_MANIFEST_SHA" "$PROFILE_SHA" \
   "$ENDPOINT_MODELS_IDENTITY_SHA" "$BASE_URL" "$CHAT_URL" "$COMMIT" "$SCENARIO" \
   "$MAX_INFLIGHT" "$KV_CAP" \
   "$PREFILL_TPUT" "$TPOT_MS" "$FIRST_TOKEN_OVERHEAD_MS" \
-  "$SLO_S" "$TTFT_GUARD_MS" \
+  "$SLO_S" "$TIMEOUT_S" "$TTFT_GUARD_MS" \
   "$NIMBUS_TICK_MS" "$TEMPERATURE" "$IGNORE_EOS" "$IN_PRICE" \
   "$OUT_PRICE" "$CLOUD" "$CLOUD_URL" "$CLOUD_MODEL" \
   "$CLOUD_API_KEY_ENV" "$CLOUD_MAX_CONCURRENCY" "$CLOUD_PROVIDER" \
@@ -434,9 +437,9 @@ else
     printf 'python=%s\n' "$($PYBIN --version 2>&1)"
     printf 'scenario=%s max_inflight=%s kv_cap=%s\n' \
       "$SCENARIO" "$MAX_INFLIGHT" "$KV_CAP"
-    printf 'prefill_tput=%s tpot_ms=%s first_token_overhead_ms=%s slo_s=%s guard_ms=%s tick_ms=%s\n' \
+    printf 'prefill_tput=%s tpot_ms=%s first_token_overhead_ms=%s slo_s=%s timeout_s=%s guard_ms=%s tick_ms=%s\n' \
       "$PREFILL_TPUT" "$TPOT_MS" "$FIRST_TOKEN_OVERHEAD_MS" \
-      "$SLO_S" "$TTFT_GUARD_MS" "$NIMBUS_TICK_MS"
+      "$SLO_S" "$TIMEOUT_S" "$TTFT_GUARD_MS" "$NIMBUS_TICK_MS"
     printf 'temperature=%s ignore_eos=%s in_price=%s out_price=%s\n' \
       "$TEMPERATURE" "$IGNORE_EOS" "$IN_PRICE" "$OUT_PRICE"
     printf 'local_ignore_eos=%s cloud_ignore_eos=%s\n' \
@@ -477,7 +480,8 @@ for arm in "$@"; do
     --first-token-overhead-ms "$FIRST_TOKEN_OVERHEAD_MS"
     --ttft-guard-ms "$TTFT_GUARD_MS"
     --in-price "$IN_PRICE" --out-price "$OUT_PRICE"
-    --slo-s "$SLO_S" --nimbus-tick-ms "$NIMBUS_TICK_MS"
+    --slo-s "$SLO_S" --timeout-s "$TIMEOUT_S" \
+    --nimbus-tick-ms "$NIMBUS_TICK_MS"
     --max-inflight "$MAX_INFLIGHT" --temperature "$TEMPERATURE"
     --ignore-eos "$IGNORE_EOS" --kv-capacity-tokens "$KV_CAP"
     --model "$MODEL" --chat-url "$CHAT_URL" --scenario "$SCENARIO"
@@ -516,7 +520,8 @@ for arm in "$@"; do
     --kv-capacity-tokens "$KV_CAP"
     --prefill-tput "$PREFILL_TPUT" --tpot-ms "$TPOT_MS"
     --first-token-overhead-ms "$FIRST_TOKEN_OVERHEAD_MS"
-    --slo-s "$SLO_S" --ttft-guard-ms "$TTFT_GUARD_MS"
+    --slo-s "$SLO_S" --timeout-s "$TIMEOUT_S" \
+    --ttft-guard-ms "$TTFT_GUARD_MS"
     --nimbus-tick-ms "$NIMBUS_TICK_MS"
     --in-price "$IN_PRICE" --out-price "$OUT_PRICE"
     --temperature "$TEMPERATURE"

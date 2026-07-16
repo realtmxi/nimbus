@@ -1172,6 +1172,7 @@ async def main() -> None:
         "tpot_ms": args.tpot_ms,
         "first_token_overhead_ms": args.first_token_overhead_ms,
         "slo_s": args.slo_s,
+        "timeout_s": args.timeout_s,
         "ttft_guard_ms": args.ttft_guard_ms,
         "nimbus_tick_ms": args.nimbus_tick_ms,
         "kv_capacity_tokens": args.kv_capacity_tokens,

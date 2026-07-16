@@ -9,10 +9,11 @@
 完整英文实验细节、命令和产物路径仍以
 [`v3_experiments_2026-07.md`](v3_experiments_2026-07.md) 为准；本账本负责把
 时间线和因果关系讲清楚。当前 real-cloud 执行实现对应 `4c18ae6`，E11
-预注册/checkpoint 对应其后的文档提交。
+预注册/checkpoint 对应其后的文档提交；E12 current-turn 物化实现对应
+`6054b32`。
 
 **数据保存边界：**repo 里提交的是实现、分析器、审计逻辑和文档，GPU 实验产生的
-大体积 JSONL/日志仍保存在 `$MSCRATCH`，不在 git 中。第 6 节逐项登记 E0–E11 的
+大体积 JSONL/日志仍保存在 `$MSCRATCH`，不在 git 中。第 6 节逐项登记 E0–E12 的
 输入、原始输出、summary、decision log、marker、复算命令和缺失项。路径“已登记”
 不等于本机已验证文件仍存在；正式引用前必须在 GPU 箱上核对文件、行数和 SHA256。
 
@@ -97,6 +98,7 @@ ttft_pred + cost_cachedisp_old + support-envelope fallback
 | E9 | 7 月 15 日 | 在完整 11,605 请求上做预注册泛化 gate | A/C 0 本地违约；K 严重失败；总 gate 因 B=39 而 FAIL | VALIDATED |
 | E10 | 7 月 16 日 | 验证固定 OpenRouter provider 的首 token cancel/TTFT 路径 | DeepInfra burst 16/16 客户端断流；TTFT p50/p95/p99=467/929/1,167 ms，0/16 超 5s | MECHANISM ONLY / EXPLORATORY |
 | E11 | 7 月 16 日 | 完整 11,605 请求真实云 live-hybrid A/C | fresh profile 已通过；正式 arm 在外发安全门前停止，0 请求/0 费用 | PROFILE VALIDATED / ARMS NOT RUN |
+| E12 | 7 月 16 日 | 用原始 ShareGPT current-turn 文本做 token/payload 对齐的外部有效性实验 | 11,605 中物化 11,604；先跑完全本地 L→A→C，尚无 arm 结果、无原文出网 | TRACE MATERIALIZED / PRE-REGISTERED / ARMS NOT RUN |
 
 ---
 
@@ -113,7 +115,7 @@ ttft_pred + cost_cachedisp_old + support-envelope fallback
 - 与可信 open-loop harness 的 TTFT p50 比值：`1.003`；
 - queue neutrality：p50 `110 ms vs 111 ms`；
 - 无压力时 Nimbus 0 kick，延迟与 all-local 一致；
-- 当前离线测试：router 81 项 + evidence 36 项 = **117/117**。
+- 当前离线测试：router 83 项 + evidence 53 项 = **136/136**。
 
 **结论**
 
@@ -154,6 +156,10 @@ ttft_pred + cost_cachedisp_old + support-envelope fallback
 直接 ShareGPT replay 的 controller token metadata 与实际 HTTP payload 不一致，
 同一时间到达的请求也常被逐条决策。因此它只能作为早期选择信号，不能证明具体
 displacement selector 的因果优势。
+
+7 月 16 日对历史 sender 的审计进一步确认：它读取每行 `prompt_text`，作为单条
+`user` message 发送；没有重建完整 conversation。因此历史 provider 结果属于
+current-turn payload 观测，不是累计 `num_prefill_tokens` 所代表的长上下文标定。
 
 此外，两份历史汇总对 random 外发比例的记录曾有轻微"冲突"：本 handoff 主表记
 `25.6%`，旧 `router/README{,.zh-CN}.md` 记 `25.3%`。**2026-07-15 已依据箱上
@@ -731,6 +737,105 @@ formal inference requests=0、key usage delta=`$0`、account usage delta=`$0`。
 随后全部退出，8010 无监听，GPU memory 回到启动前水平。由于 profile 绑定 PID/log，
 获批后必须重启新 lifecycle 并重跑 profile，不能复用本次 profile。
 
+### E12 — 原始 ShareGPT current-turn 外部有效性 leg（预注册）
+
+**状态：TRACE MATERIALIZED / LOCAL ARMS NOT RUN / 原文未出网。** 本节和 trace
+hash 都在任何推理 arm 启动前冻结。
+
+**为什么要双轨，而不是只留一份 trace？** 源数据同时有两种信息：`prompt_text`
+是当前 user turn 的原文，`num_prefill_tokens` 却是历史累计 conversation 长度；源文件
+没有保存能精确复现该累计长度的完整 chat payload。因此一份请求不可能同时保留
+“原始 current-turn 语义”和“旧累计长上下文压力”：
+
+- E6/E9/E11 synthetic token-aligned leg 用唯一 filler 保留累计 token 压力，回答
+  调度机制在目标压力下是否成立；
+- E12 原样保留 `prompt_text`，再按真实 HTTP payload 重算 token，回答算法能否泛化到
+  原始 current-turn 文本及其新的压力分布。
+
+两个 leg 的 estimand 不同，互不替代，也不能把结果混在一起平均。对历史 sender 的
+审计确认它也是把 `prompt_text` 包成单条 `user` message，并未重建完整 conversation。
+这里只能称“current-turn payload 语义兼容”；可见 sender 文件晚于历史结果，decode/
+runtime 行为也不同，因此不是历史实验的精确复现。
+
+**固定物化规则与证据**
+
+实现 commit 为 `6054b32`；工具 `tools/materialize_sharegpt_current_turn_trace.py`
+SHA256 为
+`39315185886e993bdf8b6fd6b0456017a3b6c7d50c926cb35bec953996227f4a`；源 trace
+SHA256 为
+`bf790b87eb61ba486a21155d0b6a417ad7ba6fb6abe0ff33a60ca155ace1ad0f`。
+用 Qwen3-32B tokenizer 与相同 chat template 逐条计算：
+
+```text
+messages = [{"role": "user", "content": source.prompt_text}]
+P = tokens(chat_template(messages, add_generation_prompt=true))
+
+prompt_text            = source.prompt_text       # 原样
+num_prefill_tokens     = P
+uncached_prompt_tokens = P
+num_cached_tokens      = 0
+num_decode_tokens      = min(source.num_decode_tokens, 1024)
+```
+
+不截断 prompt；仅当 `P + D > 40,960` 时对所有 arm 一致 drop，并在不含原文的 manifest
+中登记。`extreme_burst_1200` 窗口选中 11,605 条、最终发出 **11,604** 条，arrival
+仍为 1,260,532–1,261,731（1,199s）。唯一 drop 是零起始 source index 15,944：
+`P=221,051`、`D=17`、总 221,068；这是看结果前发现的输入异常，不是按 policy outcome
+删样本。另有 5 条 decode 被 cap 到 1,024，同时保留源 decode provenance。
+
+| 物化检查 | 数值 |
+|---|---:|
+| 实际 P min / p50 / p95 / p99 / max | 9 / 26 / 463 / 1,699 / 10,795 |
+| 实际 P 总量 | **1,289,405** |
+| 同批旧累计 P 总量 | 7,887,915 |
+| cap 后 D p50 / p95 / max / 总量 | 238 / 630 / 1,024 / 3,038,796 |
+| output SHA256 | `e838016a8e55660c565dadb1ad019770f6b88f878d8ca29f165c30887d2cb410` |
+| manifest SHA256 | `698bb94a82d133b0c54aa87d8badd4f181140c352cb29c1e726cfe2b291bf9a8` |
+
+受限 trace 只放在 `$MSCRATCH/sharegpt_current_turn_6054b32_20260716/`，不进 git、
+不复制进通用本机 artifact mirror。Manifest/stdout 不含 prompt。当前树 83 个 router
+tests 加 53 个 tools tests，共 **136/136** 全绿。
+
+**固定 local-only L→A→C**
+
+先启动 fresh Qwen3-32B lifecycle：bfloat16、no prefix cache、
+`max_model_len=40960`、`max_num_seqs=128`。Fresh schema-v2 profile 必须绑定本次
+PID/log/endpoint/tokenizer/code，并覆盖短 prompt 和满 sequence 并发；冻结 target cells：
+
+```text
+1x16,1x32,1x512,1x4096,1x32768,
+8x16,8x32,8x512,8x4096,
+16x512,16x4096,32x2048,64x1024,128x32,128x512
+```
+
+Profile 使用五次重复、decode 256、seed 0、250ms tick 与 held-out FN=0 gate。随后在
+同一 lifecycle/profile 上分三次 runner invocation、按冻结顺序跑完整 11,604 条：
+
+1. L：精确 arm `anchor:all_local:0`；
+2. A：精确 arm `ttft_pred:cost_cachedisp_old:0`；
+3. C：精确 arm `ttft_pred:cost_disp_current:0`。
+
+每次 invocation 使用独立 `OUT_DIR`、matrix manifest 和 fingerprint，因为 runner 会
+绑定精确 arm list；三阶段仍共用同一个 lifecycle/profile/trace 和完全相同的
+`time_scale=1.0`、SLO=5s、temperature=0、`local_ignore_eos=true`、
+`timeout_s=7200`。每阶段完成审计后至少 cooldown 20s，再决定是否启动下一阶段。
+Selector/cost 输入仍用 `$0.08/M input + $0.28/M output`。但本阶段只用
+`CLOUD=null`，NullCloud 只是本机的非网络 sink：**第三方 POST=0，云费用=$0，原文不出
+服务机。**
+
+每臂必须 11,604 个唯一 raw rows 并通过 marker/hash binding。L 必须 11,604 条均在
+本地成功且 prompt/decode usage 精确；A/C 的成功 local rows 同样 token exact，applied
+victim IDs 必须与 NullCloud rows 完全一致。L 是观测压力锚点：如果 L 的 5s 本地违约
+为 0，就报告此 deployment 下无需 offload，且不启动 A/C。否则 cooldown 后启动 A；
+如果 A 仍保留任何本地违约，就报告 safety gate 失败且不启动 C。只有 A 通过才启动
+C，C 的任何 retained-local 违约使最终 safety gate 失败。不能看完结果再调 guard 仍
+冒充本预注册。
+
+即使 local gate 全过，也不会自动启动 live。E12 live 必须另写并提交预注册，并取得
+针对“向指定 provider 发送 11,604 条 ShareGPT current-turn 原文及到达时序”的单独
+明确知情授权。E11 synthetic filler 的授权不能代替 E12 原文授权；同意本次双轨方法
+也不等于同意原文出网。
+
 ---
 
 ## 4. 算法是怎样一步步演化的？
@@ -778,13 +883,16 @@ Shipped v3: kv_gap trigger + current displacement selector
 5. **Cache-aware trace**：当前 no-cache 实验不能验证 `U=P−cached_tokens` 项。
 6. **真实 cloud latency**：E10 已验证固定 DeepInfra 的首-token transport/TTFT
    路径；E11 已预注册直接完整 11,605 A/C，两个 512 pilot 由用户明确跳过而非完成。
-   Cancel 模式也不能替代 E2E/TPOT/mid-stream 的 full-drain sensitivity。
+   E12 先增加原始 current-turn 的 local-only 外部有效性 gate。Cancel 模式也不能
+   替代 E2E/TPOT/mid-stream 的 full-drain sensitivity。
 7. **负载/guard sweep 与 offline oracle**：确定性能前沿，并与历史 0/1 DP 或
    clairvoyant oracle 比较。
 
-当前执行顺序（7 月 16 日决策后）：取得 bulk synthetic-trace 外发的明确知情批准，
-再以新 lifecycle/profile 完成 E11 full A/C；随后
-1 → 2 → 3 → 4/5 → 7。任何默认切换仍必须等 support-envelope hardening 完成。
+当前执行顺序（7 月 16 日 current-turn 决策后）：先完成 E12 的 local-only L→A→C，
+审计真实压力和 A/C 本地安全性。E11 synthetic live 仍有效，但等待它自己的 export
+consent；E12 即使通过 local gate，也必须另写 live 预注册并取得原文外发的单独明确
+授权。之后才进入 1 → 2 → 3 → 4/5 → 7。任何默认切换仍必须等
+support-envelope hardening 完成。
 
 ---
 
@@ -1116,6 +1224,25 @@ python3 tools/analyze_ttft_violation_context.py \
   `artifacts/realcloud_full_prerun_2026-07-16/`，六文件 SHA 与远端逐一一致；
 - 明确不存在：`matrix.pid`、`full11605_real_ac/`、任何 formal A/C raw rows。
 
+### 6.16 E12 数据索引 — current-turn trace materialization
+
+- 受限远端根目录：`$MSCRATCH/sharegpt_current_turn_6054b32_20260716/`；
+- 实现 commit：`6054b32`；materializer SHA256
+  `39315185886e993bdf8b6fd6b0456017a3b6c7d50c926cb35bec953996227f4a`；
+- source SHA256：
+  `bf790b87eb61ba486a21155d0b6a417ad7ba6fb6abe0ff33a60ca155ace1ad0f`；
+- output `extreme_current_turn_qwen3_token_aligned.jsonl`：11,604 行，SHA256
+  `e838016a8e55660c565dadb1ad019770f6b88f878d8ca29f165c30887d2cb410`；
+- manifest SHA256：
+  `698bb94a82d133b0c54aa87d8badd4f181140c352cb29c1e726cfe2b291bf9a8`；
+- selected/emitted=`11,605/11,604`；唯一 overflow/drop 为 source index 15,944，
+  `221,051+17>40,960`；decode cap 1,024 影响 5 条；
+- emitted P min/p50/p95/p99/max/sum=`9/26/463/1,699/10,795/1,289,405`；
+  emitted D p50/p95/max/sum=`238/630/1,024/3,038,796`；
+- manifest/stdout 不含原文；JSONL 含原始 current-turn 文本，不得进 git 或通用
+  mirror；
+- 明确不存在：L/A/C raw、summary、decision、marker 或任何 E12 inference outcome。
+
 ---
 
 ## 7. 证据与复现入口
@@ -1127,6 +1254,7 @@ python3 tools/analyze_ttft_violation_context.py \
 | `tools/kv_gauge_probe.py` | 验证部署 gauge 随 token/并发如何变化 |
 | `tools/analyze_eb1200.py` | 重建早期 leg-1 时间线与 kick 时资源上界 |
 | `tools/materialize_token_aligned_trace.py` | 物化 token-aligned no-cache trace |
+| `tools/materialize_sharegpt_current_turn_trace.py` | 原样保留 current-turn prompt 并按实际 chat payload 重算 no-cache tokens |
 | `tools/profile_ttft_batch.py` | 生成绑定部署的 TTFT profile |
 | `tools/analyze_ttft_repeatability.py` | 审计六 block / 24 arms 重复实验 |
 | `tools/analyze_ttft_full_cell.py` | 验证五 marker 并计算冻结 gates |
@@ -1144,6 +1272,8 @@ python3 tools/analyze_ttft_violation_context.py \
 - `$MSCRATCH/openrouter_ttft_cancel_20260716/`：E10 real-cloud cancel probes。
 - `$MSCRATCH/router_realcloud_full_2b53ff3_20260716T1435Z/`：E11 pre-arm
   profile、server lifecycle 与 blocked-launch zero-usage audit；没有 A/C raw rows。
+- `$MSCRATCH/sharegpt_current_turn_6054b32_20260716/`：E12 受限原文 trace 与
+  text-free manifest；尚无 L/A/C 结果，不做通用镜像。
 
 完整 SHA、运行命令和 server 注意事项见
 [`v3_experiments_2026-07.md`](v3_experiments_2026-07.md) 第 5g、8、9 节。

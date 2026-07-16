@@ -127,6 +127,7 @@ class MatrixExpectations:
     in_price: float
     out_price: float
     slo_s: float
+    timeout_s: float
     nimbus_tick_ms: float
     max_inflight: int
     temperature: float
@@ -447,6 +448,7 @@ def _validate_summary(
         "in_price": expected.in_price,
         "out_price": expected.out_price,
         "slo_s": expected.slo_s,
+        "timeout_s": expected.timeout_s,
         "nimbus_tick_ms": expected.nimbus_tick_ms,
         "temperature": expected.temperature,
         "kv_capacity_tokens": expected.kv_capacity_tokens,
@@ -590,6 +592,7 @@ def _parser() -> argparse.ArgumentParser:
     validate.add_argument("--in-price", type=float, required=True)
     validate.add_argument("--out-price", type=float, required=True)
     validate.add_argument("--slo-s", type=float, required=True)
+    validate.add_argument("--timeout-s", type=float, required=True)
     validate.add_argument("--nimbus-tick-ms", type=float, required=True)
     validate.add_argument("--max-inflight", type=int, required=True)
     validate.add_argument("--temperature", type=float, required=True)
@@ -635,6 +638,7 @@ def main(argv: list[str] | None = None) -> int:
             in_price=args.in_price,
             out_price=args.out_price,
             slo_s=args.slo_s,
+            timeout_s=args.timeout_s,
             nimbus_tick_ms=args.nimbus_tick_ms,
             max_inflight=args.max_inflight,
             temperature=args.temperature,
