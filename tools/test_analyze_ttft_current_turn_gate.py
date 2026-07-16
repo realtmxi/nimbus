@@ -32,6 +32,11 @@ IDENTITIES = {
     "C": ("nimbus", "ttft_pred", "cost_disp_current"),
 }
 ROUTES = {"L": set(), "A": {0, 1}, "C": {1, 2, 3}}
+EVENT_TIMES = {
+    "L": ("2026-07-17T00:00:00Z", "2026-07-17T00:00:10Z", "2026-07-17T00:00:11Z"),
+    "A": ("2026-07-17T00:00:31Z", "2026-07-17T00:00:40Z", "2026-07-17T00:00:41Z"),
+    "C": ("2026-07-17T00:01:01Z", "2026-07-17T00:01:10Z", "2026-07-17T00:01:11Z"),
+}
 IN_PRICE = 0.08
 OUT_PRICE = 0.28
 
@@ -249,6 +254,13 @@ class GateFixture(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        start, finish, matrix_finish = EVENT_TIMES[label]
+        (directory / "matrix_events.log").write_text(
+            f"arm_started_at={start} arm={ARMS[label]} command=python -m router.run\n"
+            f"arm_finished_at={finish} arm={ARMS[label]}\n"
+            f"matrix_finished_at={matrix_finish} run_fingerprint={fingerprint}\n",
+            encoding="utf-8",
+        )
         self.rewrite_marker(directory, label)
         return directory
 
@@ -275,13 +287,16 @@ class GateFixture(unittest.TestCase):
             for label in ("L", "A", "C")
         )  # type: ignore[return-value]
 
-    def analyze_gate(self, dirs: tuple[Path, Path, Path]) -> dict:
+    def analyze_gate(
+        self, dirs: tuple[Path, Path, Path], *, min_cooldown_s: float = 20.0,
+    ) -> dict:
         return analyze(
             *dirs,
             expected_n=N,
             expected_trace_sha256=TRACE_SHA,
             expected_trace_manifest_sha256=TRACE_MANIFEST_SHA,
             expected_profile_sha256=PROFILE_SHA,
+            min_cooldown_s=min_cooldown_s,
         )
 
     def test_passing_gate_reports_text_free_aggregates(self) -> None:
@@ -295,6 +310,20 @@ class GateFixture(unittest.TestCase):
         self.assertEqual(result["victim_overlap"]["union_n"], 4)
         self.assertEqual(result["victim_overlap"]["jaccard"], 0.25)
         self.assertEqual(result["deltas_c_minus_a"]["routed_n"], 1)
+        timing = result["evidence"]["stage_timing"]
+        self.assertEqual(timing["L"]["arm_started_at"], EVENT_TIMES["L"][0])
+        self.assertEqual(timing["C"]["matrix_finished_at"], EVENT_TIMES["C"][2])
+        self.assertEqual(
+            timing["A"]["matrix_events_sha256"],
+            hashlib.sha256((self.root / "A" / "matrix_events.log").read_bytes()).hexdigest(),
+        )
+        self.assertEqual(
+            result["evidence"]["cooldowns_s"],
+            {
+                "l_matrix_finish_to_a_start": 20.0,
+                "a_matrix_finish_to_c_start": 20.0,
+            },
+        )
         self.assertFalse(result["text_payload_in_output"])
         self.assertNotIn("prompt_text", render_json(result))
         self.assertIn("Victim intersection/union", render_markdown(result))
@@ -436,6 +465,42 @@ class GateFixture(unittest.TestCase):
         result = self.analyze_gate(dirs)
         self.assertTrue(result["gate_pass"])
         self.assertEqual(result["arms"]["A"]["applied_victim_n"], 2)
+
+    def test_matrix_events_tamper_is_rejected(self) -> None:
+        dirs = self.make_gate()
+        events = dirs[1] / "matrix_events.log"
+        events.write_text(
+            events.read_text().replace(
+                f"arm={ARMS['A']}", f"arm={ARMS['C']}", 1
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(EvidenceError, "arm does not match"):
+            self.analyze_gate(dirs)
+
+        self.root = self.root / "extra_line"
+        self.root.mkdir()
+        dirs = self.make_gate()
+        events = dirs[2] / "matrix_events.log"
+        events.write_text(events.read_text() + "unexpected=extra\n", encoding="utf-8")
+        with self.assertRaisesRegex(EvidenceError, "exactly three"):
+            self.analyze_gate(dirs)
+
+    def test_stage_cooldown_is_enforced_and_parameterized(self) -> None:
+        dirs = self.make_gate()
+        events = dirs[1] / "matrix_events.log"
+        events.write_text(
+            events.read_text().replace(
+                "arm_started_at=2026-07-17T00:00:31Z",
+                "arm_started_at=2026-07-17T00:00:30Z",
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(EvidenceError, "require >= 20.0s"):
+            self.analyze_gate(dirs)
+        self.assertTrue(self.analyze_gate(dirs, min_cooldown_s=19)["gate_pass"])
+        with self.assertRaisesRegex(EvidenceError, "finite and nonnegative"):
+            self.analyze_gate(dirs, min_cooldown_s=-1)
 
     def test_raw_model_payload_mode_and_nonnegative_tokens_are_bound(self) -> None:
         mutations = (

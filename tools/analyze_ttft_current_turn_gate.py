@@ -13,9 +13,11 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -85,6 +87,10 @@ class StageAudit:
     ttft_max_ms: float | None
     decision_n: int
     applied_victim_n: int
+    events_sha256: str
+    arm_started_at: datetime
+    arm_finished_at: datetime
+    matrix_finished_at: datetime
 
 
 def _integer(value: Any, field: str, source: str) -> int:
@@ -186,6 +192,66 @@ def _parse_manifest(path: Path) -> dict[str, Any]:
     if missing:
         raise EvidenceError(f"{path}: missing manifest fields: {', '.join(missing)}")
     return result
+
+
+def _parse_iso_z(value: str, source: str) -> datetime:
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError) as exc:
+        raise EvidenceError(
+            f"{source}: timestamp must be exact UTC ISO second form"
+        ) from exc
+    return parsed.replace(tzinfo=timezone.utc)
+
+
+def _iso_z(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_matrix_events(
+    path: Path, label: str, expected_arm: str, expected_fingerprint: str,
+) -> tuple[str, datetime, datetime, datetime]:
+    source = f"{label} matrix_events.log"
+    try:
+        raw = path.read_bytes()
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise EvidenceError(f"{source}: unreadable: {exc}") from exc
+    lines = text.splitlines()
+    if len(lines) != 3 or any(not line for line in lines):
+        raise EvidenceError(
+            f"{source}: expected exactly three nonempty start/finish/matrix-finish lines"
+        )
+    start_match = re.fullmatch(
+        r"arm_started_at=(\S+) arm=(\S+) command=(.+)", lines[0]
+    )
+    finish_match = re.fullmatch(
+        r"arm_finished_at=(\S+) arm=(\S+)", lines[1]
+    )
+    matrix_match = re.fullmatch(
+        r"matrix_finished_at=(\S+) run_fingerprint=(\S+)", lines[2]
+    )
+    if not start_match or not finish_match or not matrix_match:
+        raise EvidenceError(f"{source}: lines do not match the runner event schema")
+    if start_match.group(2) != expected_arm or finish_match.group(2) != expected_arm:
+        raise EvidenceError(f"{source}: start/finish arm does not match stage arm")
+    if matrix_match.group(2) != expected_fingerprint:
+        raise EvidenceError(
+            f"{source}: matrix-finish fingerprint does not match stage manifest"
+        )
+    started_at = _parse_iso_z(start_match.group(1), source)
+    arm_finished_at = _parse_iso_z(finish_match.group(1), source)
+    matrix_finished_at = _parse_iso_z(matrix_match.group(1), source)
+    if not started_at <= arm_finished_at <= matrix_finished_at:
+        raise EvidenceError(
+            f"{source}: require start <= arm finish <= matrix finish"
+        )
+    return (
+        hashlib.sha256(raw).hexdigest(),
+        started_at,
+        arm_finished_at,
+        matrix_finished_at,
+    )
 
 
 def _manifest_number(manifest: dict[str, Any], key: str, source: str) -> float:
@@ -381,6 +447,12 @@ def _audit_stage(
     _validate_stage_manifest(
         manifest, label, expected_n, expected_trace_sha256,
         expected_trace_manifest_sha256, expected_profile_sha256,
+    )
+    (
+        events_sha256, arm_started_at, arm_finished_at, matrix_finished_at,
+    ) = _parse_matrix_events(
+        directory / "matrix_events.log", label, EXPECTED_ARMS[label],
+        str(manifest["run_fingerprint"]),
     )
     expected_marker = {
         "schema_version": 2,
@@ -635,6 +707,8 @@ def _audit_stage(
         ttft_p99_ms=percentiles["ttft_p99_ms"],
         ttft_max_ms=max(local_ttfts) if local_ttfts else None,
         decision_n=len(decisions), applied_victim_n=len(applied),
+        events_sha256=events_sha256, arm_started_at=arm_started_at,
+        arm_finished_at=arm_finished_at, matrix_finished_at=matrix_finished_at,
     )
 
 
@@ -662,9 +736,16 @@ def analyze(
     expected_trace_sha256: str | None = DEFAULT_TRACE_SHA256,
     expected_trace_manifest_sha256: str | None = DEFAULT_TRACE_MANIFEST_SHA256,
     expected_profile_sha256: str | None = None,
+    min_cooldown_s: float = 20.0,
 ) -> dict[str, Any]:
     if expected_n <= 0:
         raise EvidenceError("expected_n must be positive")
+    if (isinstance(min_cooldown_s, bool)
+            or not isinstance(min_cooldown_s, (int, float))
+            or not math.isfinite(float(min_cooldown_s))
+            or float(min_cooldown_s) < 0):
+        raise EvidenceError("min_cooldown_s must be finite and nonnegative")
+    min_cooldown_s = float(min_cooldown_s)
     directories = {"L": Path(l_dir), "A": Path(a_dir), "C": Path(c_dir)}
     stages = {
         label: _audit_stage(
@@ -676,6 +757,22 @@ def analyze(
     _validate_common_manifests(stages)
     if len({frozenset(stage.request_ids) for stage in stages.values()}) != 1:
         raise EvidenceError("L/A/C raw request-ID sets differ")
+    l_to_a_cooldown_s = (
+        stages["A"].arm_started_at - stages["L"].matrix_finished_at
+    ).total_seconds()
+    a_to_c_cooldown_s = (
+        stages["C"].arm_started_at - stages["A"].matrix_finished_at
+    ).total_seconds()
+    if l_to_a_cooldown_s + EPSILON < min_cooldown_s:
+        raise EvidenceError(
+            f"stage order/cooldown invalid: A start is {l_to_a_cooldown_s}s "
+            f"after L matrix finish, require >= {min_cooldown_s}s"
+        )
+    if a_to_c_cooldown_s + EPSILON < min_cooldown_s:
+        raise EvidenceError(
+            f"stage order/cooldown invalid: C start is {a_to_c_cooldown_s}s "
+            f"after A matrix finish, require >= {min_cooldown_s}s"
+        )
 
     a_ids, c_ids = stages["A"].cloud_ids, stages["C"].cloud_ids
     intersection_n = len(a_ids & c_ids)
@@ -709,6 +806,23 @@ def analyze(
             "completion_markers_valid": True,
             "request_id_sets_equal": True,
             "common_manifest_fields_equal": True,
+            "stage_order": ["L", "A", "C"],
+            "min_cooldown_s": min_cooldown_s,
+            "stage_timing": {
+                label: {
+                    "arm_started_at": _iso_z(stages[label].arm_started_at),
+                    "arm_finished_at": _iso_z(stages[label].arm_finished_at),
+                    "matrix_finished_at": _iso_z(
+                        stages[label].matrix_finished_at
+                    ),
+                    "matrix_events_sha256": stages[label].events_sha256,
+                }
+                for label in ("L", "A", "C")
+            },
+            "cooldowns_s": {
+                "l_matrix_finish_to_a_start": l_to_a_cooldown_s,
+                "a_matrix_finish_to_c_start": a_to_c_cooldown_s,
+            },
         },
         "arms": {label: _arm_output(stages[label], expected_n) for label in ("L", "A", "C")},
         "victim_overlap": {
@@ -768,7 +882,24 @@ def render_markdown(result: dict[str, Any]) -> str:
             f"{ttft['p50']}/{ttft['p95']}/{ttft['p99']} |"
         )
     overlap = result["victim_overlap"]
+    evidence = result["evidence"]
+    timing = evidence["stage_timing"]
     lines.extend([
+        "", "## Stage timing", "",
+        "| Stage | Arm start | Arm finish | Matrix finish | Events SHA-256 |",
+        "|---|---|---|---|---|",
+        *[
+            f"| {label} | {timing[label]['arm_started_at']} | "
+            f"{timing[label]['arm_finished_at']} | "
+            f"{timing[label]['matrix_finished_at']} | "
+            f"`{timing[label]['matrix_events_sha256']}` |"
+            for label in ("L", "A", "C")
+        ],
+        "",
+        f"- L matrix finish to A start: "
+        f"{evidence['cooldowns_s']['l_matrix_finish_to_a_start']} s",
+        f"- A matrix finish to C start: "
+        f"{evidence['cooldowns_s']['a_matrix_finish_to_c_start']} s",
         "", "## A/C aggregate comparison", "",
         f"- Victim intersection/union: {overlap['intersection_n']}/{overlap['union_n']}",
         f"- Jaccard: {overlap['jaccard']:.6f}",
@@ -802,6 +933,7 @@ def _parser() -> argparse.ArgumentParser:
         "--expected-trace-manifest-sha256", default=DEFAULT_TRACE_MANIFEST_SHA256,
     )
     parser.add_argument("--expected-profile-sha256")
+    parser.add_argument("--min-cooldown-s", type=float, default=20.0)
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--markdown-out", type=Path)
     return parser
@@ -816,6 +948,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_trace_sha256=args.expected_trace_sha256,
             expected_trace_manifest_sha256=args.expected_trace_manifest_sha256,
             expected_profile_sha256=args.expected_profile_sha256,
+            min_cooldown_s=args.min_cooldown_s,
         )
         rendered = render_json(result)
         if args.json_out:
