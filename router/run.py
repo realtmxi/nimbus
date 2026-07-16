@@ -285,14 +285,14 @@ async def replay_queued(
                                          timeout_s=args.timeout_s,
                                          on_output_progress=progress,
                                          temperature=args.temperature,
-                                         ignore_eos=args.ignore_eos)
+                                         ignore_eos=args.local_ignore_eos)
         if send_cloud is None:
             async def send_cloud(req, due):  # noqa: F811 - default sender
                 return await one_request(session, cloud, req, due,
                                          max_tokens_override=args.max_tokens,
                                          timeout_s=args.timeout_s,
                                          temperature=args.temperature,
-                                         ignore_eos=args.ignore_eos,
+                                         ignore_eos=args.cloud_ignore_eos,
                                          provider_order=args.cloud_provider,
                                          allow_fallbacks=(
                                              False
@@ -420,23 +420,35 @@ async def replay_queued(
                 req, due = queue.pop(0)
                 spawn_local(req, due)
 
-        def _finalize_cloud(res: dict[str, Any], queue_delay_ms: float) -> None:
-            # same from-arrival accounting as the local path: a kicked request
-            # carries the time it waited in our queue before being shed
+        def _finalize_cloud(
+            res: dict[str, Any],
+            pre_route_queue_ms: float,
+            cloud_gate_wait_ms: float,
+        ) -> None:
+            # Keep the two pre-service waits separate.  ``queue_delay_ms`` is
+            # retained as their aggregate for old result consumers, while the
+            # explicit fields make it possible to distinguish time spent in
+            # Nimbus's local queue from throttling at the cloud concurrency
+            # gate.  Both are part of arrival-to-first-token latency.
             service = res.get("ttft_ms")
-            res["queue_delay_ms"] = queue_delay_ms
+            pre_route_queue_ms = max(0.0, pre_route_queue_ms)
+            cloud_gate_wait_ms = max(0.0, cloud_gate_wait_ms)
+            total_wait_ms = pre_route_queue_ms + cloud_gate_wait_ms
+            res["pre_route_queue_ms"] = pre_route_queue_ms
+            res["cloud_gate_wait_ms"] = cloud_gate_wait_ms
+            res["queue_delay_ms"] = total_wait_ms
             res["service_ttft_ms"] = service
             if service is not None:
-                res["ttft_ms"] = queue_delay_ms + service
+                res["ttft_ms"] = total_wait_ms + service
             if res.get("e2e_ms") is not None:
-                res["e2e_ms"] = queue_delay_ms + res["e2e_ms"]
+                res["e2e_ms"] = total_wait_ms + res["e2e_ms"]
 
         def route_cloud(req: dict[str, Any], due: float,
-                        queue_delay_ms: float = 0.0) -> None:
+                        pre_route_queue_ms: float = 0.0) -> None:
             if sink is not None:
                 res = sink.serve(req, due, max_tokens_override=args.max_tokens)
                 annotate_scheduler_estimates(res, req)
-                _finalize_cloud(res, queue_delay_ms)
+                _finalize_cloud(res, pre_route_queue_ms, 0.0)
                 record(res)
             else:
                 cloud_queued_at = time.perf_counter()
@@ -465,7 +477,9 @@ async def replay_queued(
                         0.0, (send_started_at - cloud_queued_at) * 1000
                     )
                     annotate_scheduler_estimates(res, req)
-                    _finalize_cloud(res, queue_delay_ms + cloud_gate_wait_ms)
+                    _finalize_cloud(
+                        res, pre_route_queue_ms, cloud_gate_wait_ms
+                    )
                     record(res)
                 task = asyncio.create_task(cloud_task())
                 pending.add(task)
@@ -640,7 +654,7 @@ async def replay_queued(
                         waited_ms = max(0.0, (time.perf_counter() - due) * 1000)
                         policy.n_outsourced += 1
                         applied_ids.append(req["request_id"])
-                        route_cloud(req, due, queue_delay_ms=waited_ms)
+                        route_cloud(req, due, pre_route_queue_ms=waited_ms)
                     if applied_ids and hasattr(policy, "applied_kick_rounds"):
                         policy.applied_kick_rounds += 1
                     record_decision({
@@ -859,8 +873,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=None,
                         help="optional sampling override sent to real endpoints")
     parser.add_argument("--ignore-eos", action="store_true",
-                        help="force generation to the requested cap (controlled "
-                             "residence experiment; requires endpoint support)")
+                        help="legacy shorthand: force both local and cloud "
+                             "generation to the requested cap")
+    local_ignore_eos = parser.add_mutually_exclusive_group()
+    local_ignore_eos.add_argument(
+        "--local-ignore-eos", dest="local_ignore_eos", action="store_true",
+        default=None, help="force only local generation to the requested cap",
+    )
+    local_ignore_eos.add_argument(
+        "--no-local-ignore-eos", dest="local_ignore_eos", action="store_false",
+        help="allow local EOS (overrides legacy --ignore-eos)",
+    )
+    cloud_ignore_eos = parser.add_mutually_exclusive_group()
+    cloud_ignore_eos.add_argument(
+        "--cloud-ignore-eos", dest="cloud_ignore_eos", action="store_true",
+        default=None, help="force only cloud generation to the requested cap",
+    )
+    cloud_ignore_eos.add_argument(
+        "--no-cloud-ignore-eos", dest="cloud_ignore_eos", action="store_false",
+        help="allow cloud EOS (overrides legacy --ignore-eos)",
+    )
     parser.add_argument("--timeout-s", type=float, default=DEFAULT_TIMEOUT_S)
     parser.add_argument("--out-dir", type=Path, default=Path("results"))
     parser.add_argument("--output", type=Path, default=None)
@@ -868,6 +900,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="optional JSONL audit log for Nimbus decisions")
 
     args = parser.parse_args(argv)
+
+    # Preserve --ignore-eos exactly for existing commands, while allowing a
+    # full hybrid run to hold local requests to the cap and let cloud requests
+    # stop after their first token.  Explicit endpoint flags win over legacy.
+    if args.local_ignore_eos is None:
+        args.local_ignore_eos = args.ignore_eos
+    if args.cloud_ignore_eos is None:
+        args.cloud_ignore_eos = args.ignore_eos
 
     if args.slo_s <= 0 or args.timeout_s <= 0:
         parser.error("--slo-s and --timeout-s must be > 0")
@@ -942,9 +982,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if not args.cloud_api_key_env:
             parser.error("--cloud-stop-after-first-token requires "
                          "--cloud-api-key-env")
-        if args.ignore_eos:
+        if args.cloud_ignore_eos:
             parser.error("--cloud-stop-after-first-token cannot be combined "
-                         "with --ignore-eos")
+                         "with cloud ignore-EOS generation")
     if (args.policy == "nimbus" and args.nimbus_trigger == "kv_gap"
             and (args.kv_capacity_tokens is None
                  or args.kv_capacity_tokens <= 0)):
@@ -1124,6 +1164,8 @@ async def main() -> None:
         "max_tokens_override": args.max_tokens,
         "temperature": args.temperature,
         "ignore_eos": args.ignore_eos,
+        "local_ignore_eos": args.local_ignore_eos,
+        "cloud_ignore_eos": args.cloud_ignore_eos,
         "nimbus_trigger": args.nimbus_trigger,
         "nimbus_selector": args.nimbus_selector,
         "prefill_tput": args.prefill_tput,
@@ -1135,6 +1177,9 @@ async def main() -> None:
         "kv_capacity_tokens": args.kv_capacity_tokens,
         "kv_hysteresis_fraction": args.kv_hysteresis_fraction,
         "cloud": args.cloud,
+        "cloud_url": args.cloud_url,
+        "cloud_model": args.cloud_model or args.local_model,
+        "cloud_api_key_env": args.cloud_api_key_env,
         "cloud_max_concurrency": args.cloud_max_concurrency,
         "cloud_provider_order": args.cloud_provider,
         "cloud_no_fallbacks": args.cloud_no_fallbacks,

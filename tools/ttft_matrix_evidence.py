@@ -65,6 +65,32 @@ class MatrixExpectations:
     model: str
     chat_url: str
     scenario: str
+    cloud: str = "null"
+    cloud_url: str | None = None
+    cloud_model: str | None = None
+    cloud_api_key_env: str | None = None
+    cloud_max_concurrency: int = 32
+    cloud_provider_order: tuple[str, ...] = ()
+    cloud_no_fallbacks: bool = False
+    cloud_stop_after_first_token: bool = False
+    local_ignore_eos: bool | None = None
+    cloud_ignore_eos: bool | None = None
+
+    @property
+    def effective_local_ignore_eos(self) -> bool:
+        return (
+            self.ignore_eos
+            if self.local_ignore_eos is None
+            else self.local_ignore_eos
+        )
+
+    @property
+    def effective_cloud_ignore_eos(self) -> bool:
+        return (
+            self.ignore_eos
+            if self.cloud_ignore_eos is None
+            else self.cloud_ignore_eos
+        )
 
 
 def parse_arm(text: str) -> MatrixArm:
@@ -123,6 +149,185 @@ def _require_float(config: dict[str, Any], key: str, expected: float) -> None:
         raise MatrixEvidenceError(f"summary config {key}={actual!r} != {expected!r}")
 
 
+def _finite_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+
+
+def _parse_jsonl(content: bytes, label: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line_n, raw_line in enumerate(content.splitlines(), 1):
+        if not raw_line.strip():
+            continue
+        try:
+            row = json.loads(raw_line)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise MatrixEvidenceError(
+                f"{label} line {line_n} is not valid JSON: {exc}"
+            ) from exc
+        if not isinstance(row, dict):
+            raise MatrixEvidenceError(f"{label} line {line_n} is not an object")
+        rows.append(row)
+    return rows
+
+
+def _validate_real_cloud_rows(
+    rows: list[dict[str, Any]], summary: dict[str, Any],
+    decision_rows: list[dict[str, Any]], expected: MatrixExpectations,
+) -> None:
+    """Validate the row-level contract for an observed TTFT-cancel run.
+
+    Endpoint failures remain valid experimental observations: ``summarize``
+    counts them as TTFT-SLO violations.  Successful cloud rows, however, must
+    prove that a first token was observed and the stream was deliberately
+    aborted rather than silently treated as a completed response.
+    """
+    request_ids = [row.get("request_id") for row in rows]
+    try:
+        unique_ids = set(request_ids)
+    except TypeError as exc:
+        raise MatrixEvidenceError("raw request_id is not hashable") from exc
+    if any(request_id is None for request_id in request_ids):
+        raise MatrixEvidenceError("raw row lacks request_id")
+    if len(unique_ids) != len(request_ids):
+        raise MatrixEvidenceError("raw request_id values are not unique")
+
+    endpoints = {row.get("endpoint") for row in rows}
+    if not endpoints <= {"local", "cloud"}:
+        raise MatrixEvidenceError(f"raw contains unsupported endpoints: {endpoints}")
+    local_rows = [row for row in rows if row.get("endpoint") == "local"]
+    cloud_rows = [row for row in rows if row.get("endpoint") == "cloud"]
+    if not cloud_rows:
+        raise MatrixEvidenceError("real-cloud Nimbus arm routed no cloud rows")
+    for index, row in enumerate(rows, 1):
+        if not isinstance(row.get("success"), bool):
+            raise MatrixEvidenceError(f"raw row {index} success is not boolean")
+
+    for index, row in enumerate(local_rows, 1):
+        if not row.get("success"):
+            continue
+        for scheduler_key, measured_key in (
+            ("scheduler_prompt_tokens", "prompt_tokens"),
+            ("scheduler_decode_tokens", "completion_tokens"),
+        ):
+            scheduler_value = row.get(scheduler_key)
+            measured_value = row.get(measured_key)
+            if not isinstance(scheduler_value, int) or isinstance(
+                scheduler_value, bool
+            ):
+                raise MatrixEvidenceError(
+                    f"local success row {index} lacks integer {scheduler_key}"
+                )
+            if not isinstance(measured_value, int) or isinstance(
+                measured_value, bool
+            ):
+                raise MatrixEvidenceError(
+                    f"local success row {index} lacks integer {measured_key}"
+                )
+            if scheduler_value != measured_value:
+                raise MatrixEvidenceError(
+                    f"local success row {index} {measured_key} "
+                    f"{measured_value} != {scheduler_key} {scheduler_value}"
+                )
+
+    for index, row in enumerate(cloud_rows, 1):
+        if row.get("routed_only"):
+            raise MatrixEvidenceError(
+                f"cloud row {index} is routed_only in a real-cloud run"
+            )
+        if not row.get("success"):
+            continue
+        ttft_ms = row.get("ttft_ms")
+        if not _finite_number(ttft_ms) or float(ttft_ms) < 0:
+            raise MatrixEvidenceError(
+                f"cloud success row {index} lacks a finite nonnegative TTFT"
+            )
+        latency_parts: list[float] = []
+        for key in (
+            "pre_route_queue_ms", "cloud_gate_wait_ms", "service_ttft_ms",
+        ):
+            value = row.get(key)
+            if not _finite_number(value) or float(value) < 0:
+                raise MatrixEvidenceError(
+                    f"cloud success row {index} lacks finite nonnegative {key}"
+                )
+            latency_parts.append(float(value))
+        component_sum = sum(latency_parts)
+        if not math.isclose(
+            float(ttft_ms), component_sum, rel_tol=1e-9, abs_tol=1e-6,
+        ):
+            raise MatrixEvidenceError(
+                f"cloud success row {index} ttft_ms {ttft_ms} != latency "
+                f"component sum {component_sum}"
+            )
+        if row.get("response_completed") is not False:
+            raise MatrixEvidenceError(
+                f"cloud success row {index} response_completed="
+                f"{row.get('response_completed')!r} != False"
+            )
+        if row.get("stream_abort_requested") is not True:
+            raise MatrixEvidenceError(
+                f"cloud success row {index} stream_abort_requested="
+                f"{row.get('stream_abort_requested')!r} != True"
+            )
+        _require_equal(
+            row.get("probe_mode"), "ttft_cancel",
+            f"cloud success row {index} probe_mode",
+        )
+
+    applied_ids: list[Any] = []
+    for index, decision in enumerate(decision_rows, 1):
+        # Stale/discarded decision records intentionally have no applied list;
+        # only records that reached the apply phase carry this field.
+        victims = decision.get("applied_victim_ids", [])
+        if not isinstance(victims, list):
+            raise MatrixEvidenceError(
+                f"decision row {index} applied_victim_ids is not a list"
+            )
+        applied_ids.extend(victims)
+    try:
+        applied_set = set(applied_ids)
+        cloud_id_set = {row["request_id"] for row in cloud_rows}
+    except TypeError as exc:
+        raise MatrixEvidenceError("applied/cloud request_id is not hashable") from exc
+    if len(applied_ids) != len(applied_set):
+        raise MatrixEvidenceError("applied_victim_ids contain duplicate request IDs")
+    if len(applied_ids) != len(cloud_rows) or applied_set != cloud_id_set:
+        missing = sorted(cloud_id_set - applied_set, key=repr)
+        unexpected = sorted(applied_set - cloud_id_set, key=repr)
+        raise MatrixEvidenceError(
+            "applied_victim_ids do not match raw cloud request IDs: "
+            f"applied_n={len(applied_ids)} cloud_n={len(cloud_rows)} "
+            f"missing={missing[:5]} unexpected={unexpected[:5]}"
+        )
+
+    overall = summary.get("overall", {})
+    local = summary.get("local", {})
+    cloud = summary.get("cloud", {})
+    _require_equal(overall.get("slo_measured_n"), expected.trace_n,
+                   "overall measured SLO row count")
+    _require_equal(cloud.get("routed_only"), 0, "cloud routed_only count")
+    _require_equal(local.get("n"), len(local_rows), "local raw/summary row count")
+    _require_equal(cloud.get("n"), len(cloud_rows), "cloud raw/summary row count")
+    _require_equal(
+        overall.get("success"), sum(bool(row.get("success")) for row in rows),
+        "overall raw/summary success count",
+    )
+    _require_equal(
+        local.get("success"),
+        sum(bool(row.get("success")) for row in local_rows),
+        "local raw/summary success count",
+    )
+    _require_equal(
+        cloud.get("success"),
+        sum(bool(row.get("success")) for row in cloud_rows),
+        "cloud raw/summary success count",
+    )
+
+
 def _validate_summary(
     summary: dict[str, Any], arm: MatrixArm, expected: MatrixExpectations,
 ) -> None:
@@ -130,8 +335,10 @@ def _validate_summary(
     _require_equal(summary.get("policy"), expected_policy, "summary policy")
 
     overall = summary.get("overall", {})
-    _require_equal(overall.get("success"), overall.get("n"), "overall success")
     _require_equal(overall.get("n"), expected.trace_n, "overall row count")
+    if expected.cloud != "real":
+        _require_equal(overall.get("success"), overall.get("n"),
+                       "overall success")
 
     alignment = summary.get("token_alignment", {})
     measured_n = alignment.get("measured_n")
@@ -185,8 +392,19 @@ def _validate_summary(
         "ignore_eos": expected.ignore_eos,
         "local_model": expected.model,
         "local_url": expected.chat_url,
-        "cloud": "null",
-        "cloud_max_concurrency": 32,
+        "local_ignore_eos": expected.effective_local_ignore_eos,
+        "cloud_ignore_eos": expected.effective_cloud_ignore_eos,
+        "cloud": expected.cloud,
+        "cloud_url": expected.cloud_url,
+        "cloud_model": expected.cloud_model or expected.model,
+        "cloud_api_key_env": expected.cloud_api_key_env,
+        "cloud_max_concurrency": expected.cloud_max_concurrency,
+        "cloud_provider_order": (
+            list(expected.cloud_provider_order)
+            if expected.cloud_provider_order else None
+        ),
+        "cloud_no_fallbacks": expected.cloud_no_fallbacks,
+        "cloud_stop_after_first_token": expected.cloud_stop_after_first_token,
         "max_tokens_override": None,
     }
     for key, value in expected_exact.items():
@@ -227,6 +445,10 @@ def validate_or_write_marker(
     }
     if artifacts["raw"]["nonempty_line_n"] != expected.trace_n:
         raise MatrixEvidenceError("raw artifact line count does not equal trace n")
+    raw_rows = _parse_jsonl(contents_and_artifacts["raw"][0], "raw")
+    decision_rows = _parse_jsonl(
+        contents_and_artifacts["decisions"][0], "decisions"
+    )
     decision_n = artifacts["decisions"]["nonempty_line_n"]
     if arm.kind == "anchor":
         if decision_n != 0:
@@ -241,9 +463,11 @@ def validate_or_write_marker(
     if not isinstance(summary, dict):
         raise MatrixEvidenceError("summary JSON is not an object")
     _validate_summary(summary, arm, expected)
+    if expected.cloud == "real":
+        _validate_real_cloud_rows(raw_rows, summary, decision_rows, expected)
 
     marker = {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_fingerprint": fingerprint,
         "arm": arm_text,
         "artifacts": artifacts,
@@ -304,6 +528,18 @@ def _parser() -> argparse.ArgumentParser:
     validate.add_argument("--model", required=True)
     validate.add_argument("--chat-url", required=True)
     validate.add_argument("--scenario", required=True)
+    validate.add_argument("--cloud", choices=("null", "real"), default="null")
+    validate.add_argument("--cloud-url")
+    validate.add_argument("--cloud-model")
+    validate.add_argument("--cloud-api-key-env")
+    validate.add_argument("--cloud-max-concurrency", type=int, default=32)
+    validate.add_argument("--cloud-provider", action="append", default=[])
+    validate.add_argument("--cloud-no-fallbacks", choices=("0", "1"), default="0")
+    validate.add_argument(
+        "--cloud-stop-after-first-token", choices=("0", "1"), default="0",
+    )
+    validate.add_argument("--local-ignore-eos", choices=("0", "1"))
+    validate.add_argument("--cloud-ignore-eos", choices=("0", "1"))
     validate.add_argument("--write-marker", action="store_true")
     return parser
 
@@ -337,6 +573,24 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             chat_url=args.chat_url,
             scenario=args.scenario,
+            cloud=args.cloud,
+            cloud_url=args.cloud_url,
+            cloud_model=args.cloud_model,
+            cloud_api_key_env=args.cloud_api_key_env,
+            cloud_max_concurrency=args.cloud_max_concurrency,
+            cloud_provider_order=tuple(args.cloud_provider),
+            cloud_no_fallbacks=args.cloud_no_fallbacks == "1",
+            cloud_stop_after_first_token=(
+                args.cloud_stop_after_first_token == "1"
+            ),
+            local_ignore_eos=(
+                None if args.local_ignore_eos is None
+                else args.local_ignore_eos == "1"
+            ),
+            cloud_ignore_eos=(
+                None if args.cloud_ignore_eos is None
+                else args.cloud_ignore_eos == "1"
+            ),
         )
         validate_or_write_marker(
             raw_path=args.raw,

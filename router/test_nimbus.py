@@ -389,9 +389,18 @@ class TestReviewRegressions(unittest.TestCase):
         self.assertGreater(len(cloud), 0)
         for r in cloud:
             self.assertEqual(r["service_ttft_ms"], 300.0)
+            self.assertGreater(r["pre_route_queue_ms"], 0.0)
+            self.assertGreaterEqual(r["cloud_gate_wait_ms"], 0.0)
             self.assertAlmostEqual(
-                r["ttft_ms"], r["queue_delay_ms"] + 300.0, places=6)
-            self.assertGreater(r["queue_delay_ms"], 0.0)   # it actually waited
+                r["ttft_ms"],
+                r["pre_route_queue_ms"] + r["cloud_gate_wait_ms"] + 300.0,
+                places=6,
+            )
+            self.assertAlmostEqual(
+                r["queue_delay_ms"],
+                r["pre_route_queue_ms"] + r["cloud_gate_wait_ms"],
+                places=6,
+            )
 
 
 class TestCodexRegressions(unittest.TestCase):
@@ -803,6 +812,8 @@ class TestIntegration(unittest.TestCase):
         self.assertEqual(pol.n_outsourced, len(cloud))
         for r in cloud:
             self.assertTrue(r["routed_only"])                  # via null sink
+            self.assertGreaterEqual(r["pre_route_queue_ms"], 0.0)
+            self.assertEqual(r["cloud_gate_wait_ms"], 0.0)
             self.assertGreaterEqual(r["queue_delay_ms"], 0.0)  # waited-then-kicked
         # the survivors' footprint respects the budget at each decision point;
         # at least verify SOME requests stayed local under a 600-token budget

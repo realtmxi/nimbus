@@ -31,8 +31,90 @@ TEMPERATURE=${TEMPERATURE:-0}
 IGNORE_EOS=${IGNORE_EOS:-1}
 IN_PRICE=${IN_PRICE:-0.15}
 OUT_PRICE=${OUT_PRICE:-1.20}
-ARM_ORDER_SEED=${ARM_ORDER_SEED:-0}
+ARM_ORDER_SEED=${ARM_ORDER_SEED:-}
 DATA_MANIFEST="${DATA}.manifest.json"
+
+# The same runner supports the historical NullCloud matrix and an observed
+# OpenRouter TTFT-cancel matrix.  CLOUD_API_KEY_ENV is the *name* of the secret
+# environment variable.  Its value is checked for presence below, but is never
+# passed to fingerprint/manifest/evidence commands or printed.
+CLOUD=${CLOUD:-null}
+if [[ -z "${CLOUD_MAX_CONCURRENCY+x}" ]]; then
+  [[ "$CLOUD" == real ]] && CLOUD_MAX_CONCURRENCY=16 \
+    || CLOUD_MAX_CONCURRENCY=32
+fi
+if [[ -z "$ARM_ORDER_SEED" ]]; then
+  [[ "$CLOUD" == real ]] && ARM_ORDER_SEED=20260716 || ARM_ORDER_SEED=0
+fi
+if [[ -z "${CLOUD_NO_FALLBACKS+x}" ]]; then
+  [[ "$CLOUD" == real ]] && CLOUD_NO_FALLBACKS=1 || CLOUD_NO_FALLBACKS=0
+fi
+if [[ -z "${CLOUD_STOP_AFTER_FIRST_TOKEN+x}" ]]; then
+  [[ "$CLOUD" == real ]] && CLOUD_STOP_AFTER_FIRST_TOKEN=1 \
+    || CLOUD_STOP_AFTER_FIRST_TOKEN=0
+fi
+LOCAL_IGNORE_EOS=${LOCAL_IGNORE_EOS:-$IGNORE_EOS}
+if [[ -z "${CLOUD_IGNORE_EOS+x}" ]]; then
+  if [[ "$CLOUD" == real ]]; then
+    CLOUD_IGNORE_EOS=0
+  else
+    CLOUD_IGNORE_EOS=$IGNORE_EOS
+  fi
+fi
+CLOUD_URL=${CLOUD_URL:-}
+CLOUD_MODEL=${CLOUD_MODEL:-}
+CLOUD_API_KEY_ENV=${CLOUD_API_KEY_ENV:-}
+CLOUD_PROVIDER=${CLOUD_PROVIDER:-}
+REAL_CLOUD_EXPECT_N=${REAL_CLOUD_EXPECT_N:-11605}
+
+for bit_name in IGNORE_EOS LOCAL_IGNORE_EOS CLOUD_IGNORE_EOS \
+  CLOUD_NO_FALLBACKS CLOUD_STOP_AFTER_FIRST_TOKEN; do
+  bit_value=${!bit_name}
+  if [[ "$bit_value" != 0 && "$bit_value" != 1 ]]; then
+    printf '%s must be 0 or 1 (got %s)\n' "$bit_name" "$bit_value" >&2
+    exit 4
+  fi
+done
+if [[ "$CLOUD" == real ]]; then
+  CLOUD_URL=${CLOUD_URL:-https://openrouter.ai/api/v1/chat/completions}
+  CLOUD_MODEL=${CLOUD_MODEL:-qwen/qwen3-32b}
+  CLOUD_API_KEY_ENV=${CLOUD_API_KEY_ENV:-OPENROUTER_API_KEY}
+  CLOUD_PROVIDER=${CLOUD_PROVIDER:-deepinfra}
+  if [[ ! "$CLOUD_API_KEY_ENV" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    printf 'CLOUD_API_KEY_ENV must be an environment-variable name\n' >&2
+    exit 4
+  fi
+  if [[ -z "${!CLOUD_API_KEY_ENV:-}" ]]; then
+    printf 'real cloud requires nonempty secret env %s\n' \
+      "$CLOUD_API_KEY_ENV" >&2
+    exit 4
+  fi
+  if [[ "$CLOUD_URL" == *'?'* || "$CLOUD_URL" == *'#'* || \
+        "$CLOUD_URL" == *'@'* ]]; then
+    printf 'CLOUD_URL must not contain query, fragment, or userinfo secrets\n' >&2
+    exit 4
+  fi
+  if [[ "$CLOUD_NO_FALLBACKS" != 1 || \
+        "$CLOUD_STOP_AFTER_FIRST_TOKEN" != 1 ]]; then
+    printf 'real-cloud matrix requires no fallbacks and first-token abort\n' >&2
+    exit 4
+  fi
+  if [[ "$LOCAL_IGNORE_EOS" != 1 || "$CLOUD_IGNORE_EOS" != 0 ]]; then
+    printf 'real-cloud matrix requires local_ignore_eos=1 and cloud_ignore_eos=0\n' >&2
+    exit 4
+  fi
+  if [[ "$CLOUD_URL" != https://openrouter.ai/api/v1/chat/completions || \
+        "$CLOUD_MODEL" != qwen/qwen3-32b || \
+        "$CLOUD_PROVIDER" != deepinfra || \
+        "$CLOUD_MAX_CONCURRENCY" != 16 || \
+        "$ARM_ORDER_SEED" != 20260716 ]]; then
+    printf 'real-cloud E11 freezes OpenRouter/qwen3-32b/deepinfra, concurrency=16, arm-order-seed=20260716\n' >&2
+    exit 4
+  fi
+elif [[ "$CLOUD" != null ]]; then
+  printf 'CLOUD must be null or real (got %s)\n' "$CLOUD" >&2
+  exit 4
+fi
 
 if ! kill -0 "$SERVER_PID" 2>/dev/null; then
   printf 'recorded SERVER_PID is not alive: %s\n' "$SERVER_PID" >&2
@@ -49,7 +131,7 @@ fi
 # an unstable whole-file hash.
 PREFLIGHT="$($PYBIN - "$DATA" "$DATA_MANIFEST" "$PROFILE" "$SERVER_LOG" \
   "$SERVER_PID" "$BASE_URL" "$MODEL" "$MAX_INFLIGHT" "${KV_CAP:-}" \
-  "$NIMBUS_TICK_MS" "$SLO_S" "$TEMPERATURE" "$IGNORE_EOS" <<'PY'
+  "$NIMBUS_TICK_MS" "$SLO_S" "$TEMPERATURE" "$LOCAL_IGNORE_EOS" <<'PY'
 import hashlib
 import json
 import os
@@ -59,7 +141,7 @@ import urllib.request
 
 (
     data_path, manifest_path, profile_path, log_path, server_pid, url, model,
-    max_inflight, requested_kv, tick_ms, slo_s, temperature, ignore_eos,
+    max_inflight, requested_kv, tick_ms, slo_s, temperature, local_ignore_eos,
 ) = sys.argv[1:]
 
 def sha(path):
@@ -118,8 +200,8 @@ if profile_tick != float(tick_ms):
 sampling = profile.get("sampling", {})
 if float(temperature) != float(sampling.get("temperature", -1)):
     raise SystemExit("matrix temperature does not match PROFILE sampling")
-if (ignore_eos == "1") != bool(sampling.get("ignore_eos")):
-    raise SystemExit("matrix IGNORE_EOS does not match PROFILE sampling")
+if (local_ignore_eos == "1") != bool(sampling.get("ignore_eos")):
+    raise SystemExit("matrix LOCAL_IGNORE_EOS does not match PROFILE sampling")
 
 log = open(log_path, "rb").read()
 prefix_n = int(profile.get("server_log_bytes_at_start", -1))
@@ -221,6 +303,11 @@ IFS=$'\t' read -r TRACE_SHA TRACE_MANIFEST_SHA TRACE_N TRACE_SCENARIO PROFILE_SH
   PREFILL_TPUT TPOT_MS FIRST_TOKEN_OVERHEAD_MS TTFT_GUARD_MS \
   SERVER_LOG_PREFIX_SHA SERVER_LOG_SHA \
   ENDPOINT_VERSION_SHA ENDPOINT_MODELS_IDENTITY_SHA <<< "$PREFLIGHT"
+if [[ "$CLOUD" == real && "$TRACE_N" != "$REAL_CLOUD_EXPECT_N" ]]; then
+  printf 'real-cloud trace_n=%s, expected %s (set REAL_CLOUD_EXPECT_N intentionally to override)\n' \
+    "$TRACE_N" "$REAL_CLOUD_EXPECT_N" >&2
+  exit 4
+fi
 SCENARIO=${SCENARIO:-$TRACE_SCENARIO}
 if [[ "$SCENARIO" != "$TRACE_SCENARIO" ]]; then
   printf 'SCENARIO %s does not match trace manifest scenario %s\n' \
@@ -240,16 +327,26 @@ fi
 
 mkdir -p "$OUT_DIR"
 if (( $# == 0 )); then
-  default_arms=( \
-    kv_gap:cost_disp_current:0 \
-    ttft_pred:newest:0 \
-    ttft_pred:waiting_random:0 \
-    ttft_pred:waiting_random:1 \
-    ttft_pred:waiting_random:2 \
-    ttft_pred:max_cachedisp_old:0 \
-    ttft_pred:cost_cachedisp_old:0 \
-    ttft_pred:cost_disp_current:0 \
-  )
+  if [[ "$CLOUD" == real ]]; then
+    # Full real-cloud default is the frozen A/C comparison only.  Accidentally
+    # running every exploratory selector would spend credits and confound the
+    # paired comparison with a much longer wall-clock window.
+    default_arms=( \
+      ttft_pred:cost_cachedisp_old:0 \
+      ttft_pred:cost_disp_current:0 \
+    )
+  else
+    default_arms=( \
+      kv_gap:cost_disp_current:0 \
+      ttft_pred:newest:0 \
+      ttft_pred:waiting_random:0 \
+      ttft_pred:waiting_random:1 \
+      ttft_pred:waiting_random:2 \
+      ttft_pred:max_cachedisp_old:0 \
+      ttft_pred:cost_cachedisp_old:0 \
+      ttft_pred:cost_disp_current:0 \
+    )
+  fi
   ordered_arms=()
   while IFS= read -r arm; do
     ordered_arms+=("$arm")
@@ -274,6 +371,14 @@ fi
 for arm in "$@"; do
   "$PYBIN" -m tools.ttft_matrix_evidence describe-arm "$arm" >/dev/null
 done
+if [[ "$CLOUD" == real ]]; then
+  if (( $# != 2 )) \
+      || [[ "$1" != ttft_pred:cost_cachedisp_old:0 ]] \
+      || [[ "$2" != ttft_pred:cost_disp_current:0 ]]; then
+    printf 'real-cloud E11 requires exact A then C arms\n' >&2
+    exit 4
+  fi
+fi
 
 COMMIT=$(git rev-parse HEAD)
 RUN_FINGERPRINT="$($PYBIN - "$TRACE_SHA" "$TRACE_MANIFEST_SHA" "$PROFILE_SHA" \
@@ -283,7 +388,11 @@ RUN_FINGERPRINT="$($PYBIN - "$TRACE_SHA" "$TRACE_MANIFEST_SHA" "$PROFILE_SHA" \
   "$PREFILL_TPUT" "$TPOT_MS" "$FIRST_TOKEN_OVERHEAD_MS" \
   "$SLO_S" "$TTFT_GUARD_MS" \
   "$NIMBUS_TICK_MS" "$TEMPERATURE" "$IGNORE_EOS" "$IN_PRICE" \
-  "$OUT_PRICE" "$ARM_ORDER_MODE" "$ARM_ORDER_SEED" "$@" <<'PY'
+  "$OUT_PRICE" "$CLOUD" "$CLOUD_URL" "$CLOUD_MODEL" \
+  "$CLOUD_API_KEY_ENV" "$CLOUD_MAX_CONCURRENCY" "$CLOUD_PROVIDER" \
+  "$CLOUD_NO_FALLBACKS" "$CLOUD_STOP_AFTER_FIRST_TOKEN" \
+  "$LOCAL_IGNORE_EOS" "$CLOUD_IGNORE_EOS" "$REAL_CLOUD_EXPECT_N" \
+  "$ARM_ORDER_MODE" "$ARM_ORDER_SEED" "$@" <<'PY'
 import hashlib
 import json
 import sys
@@ -323,6 +432,15 @@ else
       "$SLO_S" "$TTFT_GUARD_MS" "$NIMBUS_TICK_MS"
     printf 'temperature=%s ignore_eos=%s in_price=%s out_price=%s\n' \
       "$TEMPERATURE" "$IGNORE_EOS" "$IN_PRICE" "$OUT_PRICE"
+    printf 'local_ignore_eos=%s cloud_ignore_eos=%s\n' \
+      "$LOCAL_IGNORE_EOS" "$CLOUD_IGNORE_EOS"
+    printf 'cloud=%s cloud_url=%s cloud_model=%s cloud_api_key_env=%s\n' \
+      "$CLOUD" "$CLOUD_URL" "$CLOUD_MODEL" "$CLOUD_API_KEY_ENV"
+    printf 'cloud_max_concurrency=%s cloud_provider=%s cloud_no_fallbacks=%s cloud_stop_after_first_token=%s\n' \
+      "$CLOUD_MAX_CONCURRENCY" "$CLOUD_PROVIDER" \
+      "$CLOUD_NO_FALLBACKS" "$CLOUD_STOP_AFTER_FIRST_TOKEN"
+    printf 'real_cloud_expected_trace_n=%s secret_value_recorded=false\n' \
+      "$REAL_CLOUD_EXPECT_N"
     printf 'arm_order_mode=%s arm_order_seed=%s\n' \
       "$ARM_ORDER_MODE" "$ARM_ORDER_SEED"
     printf 'arms='
@@ -356,7 +474,19 @@ for arm in "$@"; do
     --max-inflight "$MAX_INFLIGHT" --temperature "$TEMPERATURE"
     --ignore-eos "$IGNORE_EOS" --kv-capacity-tokens "$KV_CAP"
     --model "$MODEL" --chat-url "$CHAT_URL" --scenario "$SCENARIO"
+    --cloud "$CLOUD" --cloud-max-concurrency "$CLOUD_MAX_CONCURRENCY"
+    --cloud-no-fallbacks "$CLOUD_NO_FALLBACKS"
+    --cloud-stop-after-first-token "$CLOUD_STOP_AFTER_FIRST_TOKEN"
+    --local-ignore-eos "$LOCAL_IGNORE_EOS"
+    --cloud-ignore-eos "$CLOUD_IGNORE_EOS"
   )
+  if [[ "$CLOUD" == real ]]; then
+    evidence_cmd+=(
+      --cloud-url "$CLOUD_URL" --cloud-model "$CLOUD_MODEL"
+      --cloud-api-key-env "$CLOUD_API_KEY_ENV"
+      --cloud-provider "$CLOUD_PROVIDER"
+    )
+  fi
   if [[ -e "$marker" ]]; then
     "${evidence_cmd[@]}"
     printf 'skip completed arm: %s\n' "$arm"
@@ -383,11 +513,30 @@ for arm in "$@"; do
     --nimbus-tick-ms "$NIMBUS_TICK_MS"
     --in-price "$IN_PRICE" --out-price "$OUT_PRICE"
     --temperature "$TEMPERATURE"
+    --cloud "$CLOUD" --cloud-max-concurrency "$CLOUD_MAX_CONCURRENCY"
     --out-dir "$OUT_DIR" --output "${stem}.jsonl"
     --decision-log "${stem}.decisions.jsonl"
   )
   if [[ "$IGNORE_EOS" == 1 ]]; then
     cmd+=(--ignore-eos)
+  fi
+  if [[ "$LOCAL_IGNORE_EOS" == 1 ]]; then
+    cmd+=(--local-ignore-eos)
+  else
+    cmd+=(--no-local-ignore-eos)
+  fi
+  if [[ "$CLOUD_IGNORE_EOS" == 1 ]]; then
+    cmd+=(--cloud-ignore-eos)
+  else
+    cmd+=(--no-cloud-ignore-eos)
+  fi
+  if [[ "$CLOUD" == real ]]; then
+    cmd+=(
+      --cloud-url "$CLOUD_URL" --cloud-model "$CLOUD_MODEL"
+      --cloud-api-key-env "$CLOUD_API_KEY_ENV"
+      --cloud-provider "$CLOUD_PROVIDER"
+      --cloud-no-fallbacks --cloud-stop-after-first-token
+    )
   fi
   {
     printf 'arm_started_at=%s arm=%s command=' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$arm"

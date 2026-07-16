@@ -182,6 +182,8 @@ class TestCloudPath(unittest.TestCase):
         self.assertEqual(len(sender.dispatch_order), len(local))  # cloud never local
         for r in cloud:
             self.assertEqual(r["queue_delay_ms"], 0.0)            # cloud skips queue
+            self.assertEqual(r["pre_route_queue_ms"], 0.0)
+            self.assertEqual(r["cloud_gate_wait_ms"], 0.0)
             self.assertTrue(r["routed_only"])                     # fake sink: routed & counted
             self.assertIsNone(r["ttft_ms"])                       # no latency claim
             self.assertGreater(r["cost_usd"], 0.0)
@@ -236,10 +238,17 @@ class TestCloudConcurrencyGate(unittest.TestCase):
         self.assertEqual(len(results), 10)
         self.assertLessEqual(rec.peak, 2)                 # gate binds
         self.assertGreaterEqual(rec.peak, 2)              # and is actually exercised
-        self.assertGreater(max(r["queue_delay_ms"] for r in results), 40.0)
+        self.assertGreater(max(r["cloud_gate_wait_ms"] for r in results), 40.0)
         for r in results:
+            self.assertEqual(r["pre_route_queue_ms"], 0.0)
             self.assertAlmostEqual(
-                r["ttft_ms"], r["queue_delay_ms"] + r["service_ttft_ms"], places=5
+                r["queue_delay_ms"], r["cloud_gate_wait_ms"], places=5
+            )
+            self.assertAlmostEqual(
+                r["ttft_ms"],
+                r["pre_route_queue_ms"] + r["cloud_gate_wait_ms"]
+                + r["service_ttft_ms"],
+                places=5,
             )
 
     def test_ttft_probe_row_is_successful_and_keeps_arrival_accounting(self):
@@ -275,8 +284,12 @@ class TestCloudConcurrencyGate(unittest.TestCase):
         self.assertTrue(row["success"])
         self.assertFalse(row["response_completed"])
         self.assertIsNone(row["e2e_ms"])
+        self.assertEqual(row["pre_route_queue_ms"], 0.0)
+        self.assertGreaterEqual(row["cloud_gate_wait_ms"], 0.0)
         self.assertAlmostEqual(
-            row["ttft_ms"], row["queue_delay_ms"] + row["service_ttft_ms"],
+            row["ttft_ms"],
+            row["pre_route_queue_ms"] + row["cloud_gate_wait_ms"]
+            + row["service_ttft_ms"],
             places=5,
         )
         summary = summarize(results, policy, slo_s=5.0)
@@ -287,6 +300,85 @@ class TestCloudConcurrencyGate(unittest.TestCase):
 
 
 class TestParseArgsQueued(unittest.TestCase):
+    def test_ignore_eos_can_be_split_by_endpoint(self):
+        base = [
+            "--data", "t", "--scenario", "normal", "--policy", "random",
+            "--local-url", "http://l", "--local-model", "m",
+        ]
+        default = parse_args(base)
+        self.assertFalse(default.ignore_eos)
+        self.assertFalse(default.local_ignore_eos)
+        self.assertFalse(default.cloud_ignore_eos)
+
+        legacy = parse_args(base + ["--ignore-eos"])
+        self.assertTrue(legacy.ignore_eos)
+        self.assertTrue(legacy.local_ignore_eos)
+        self.assertTrue(legacy.cloud_ignore_eos)
+
+        split = parse_args(base + ["--local-ignore-eos"])
+        self.assertTrue(split.local_ignore_eos)
+        self.assertFalse(split.cloud_ignore_eos)
+
+        override = parse_args(base + ["--ignore-eos", "--no-cloud-ignore-eos"])
+        self.assertTrue(override.local_ignore_eos)
+        self.assertFalse(override.cloud_ignore_eos)
+
+    def test_default_senders_receive_endpoint_ignore_eos(self):
+        from unittest.mock import patch
+
+        seen = []
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class FakeAiohttp:
+            class TCPConnector:
+                def __init__(self, **kwargs):
+                    pass
+
+            @staticmethod
+            def ClientSession(**kwargs):
+                return FakeSession()
+
+        async def fake_one_request(session, endpoint, req, due, **kwargs):
+            seen.append((endpoint.name, kwargs["ignore_eos"]))
+            return {
+                "request_id": req["request_id"], "arrived_at": req["arrived_at"],
+                "relative_arrival_s": req["relative_arrival_s"],
+                "scheduled_lag_ms": 0.0, "endpoint": endpoint.name,
+                "model": endpoint.model, "success": True, "error": None,
+                "error_type": None, "http_status": 200, "ttft_ms": 5.0,
+                "e2e_ms": 10.0, "tpot_ms": 1.0, "chunks": 2,
+                "prompt_tokens": 10, "completion_tokens": 2,
+                "output_chars": 2, "cost_usd": 0.0,
+            }
+
+        local_args = mk_args(extra=["--local-ignore-eos"])
+        cloud_args = mk_args(
+            policy="all_cloud",
+            extra=[
+                "--cloud", "real", "--cloud-url", "http://c",
+                "--cloud-model", "m", "--local-ignore-eos",
+            ],
+        )
+        with (
+            patch("router.run.one_request", new=fake_one_request),
+            patch("router.run.aiohttp", new=FakeAiohttp),
+        ):
+            asyncio.run(replay_queued(
+                local_args, mk_trace(1), Policy("all_local", 0.0, 0),
+                LOCAL, None,
+            ))
+            asyncio.run(replay_queued(
+                cloud_args, mk_trace(1), Policy("all_cloud", 1.0, 0),
+                None, CLOUD,
+            ))
+        self.assertEqual(seen, [("local", True), ("cloud", False)])
+
     def test_random_default_cloud_is_null_sink(self):
         args = parse_args(["--data", "t", "--scenario", "normal", "--policy", "random",
                            "--local-url", "http://l", "--local-model", "m"])
@@ -336,14 +428,20 @@ class TestParseArgsQueued(unittest.TestCase):
             parse_args(base + ["--cloud-provider", "deepinfra",
                                "--cloud-no-fallbacks", "--cloud-api-key-env",
                                "OPENROUTER_KEY", "--ignore-eos"])
+        with self.assertRaises(SystemExit):
+            parse_args(base + ["--cloud-provider", "deepinfra",
+                               "--cloud-no-fallbacks", "--cloud-api-key-env",
+                               "OPENROUTER_KEY", "--cloud-ignore-eos"])
 
         args = parse_args(base + [
             "--cloud-provider", "deepinfra", "--cloud-no-fallbacks",
-            "--cloud-api-key-env", "OPENROUTER_KEY",
+            "--cloud-api-key-env", "OPENROUTER_KEY", "--local-ignore-eos",
         ])
         self.assertEqual(args.cloud_provider, ["deepinfra"])
         self.assertTrue(args.cloud_no_fallbacks)
         self.assertTrue(args.cloud_stop_after_first_token)
+        self.assertTrue(args.local_ignore_eos)
+        self.assertFalse(args.cloud_ignore_eos)
 
     def test_openrouter_options_rejected_for_null_cloud(self):
         base = [
