@@ -22,10 +22,80 @@ from router.nimbus import NIMBUS_SELECTORS, NIMBUS_TRIGGERS
 
 
 ANCHOR_ARM = "anchor:all_local:0"
+SYNTHETIC_TRACE_TOOL_PATH = "tools/materialize_token_aligned_trace.py"
+TRACE_SCENARIO_DEPENDENCY_PATH = "router/common.py"
+SHAREGPT_CURRENT_TURN_PAYLOAD_MODE = "sharegpt_current_turn_retokenized"
+SHAREGPT_CURRENT_TURN_TOOL_PATH = (
+    "tools/materialize_sharegpt_current_turn_trace.py"
+)
 
 
 class MatrixEvidenceError(ValueError):
     """The arm or its persisted evidence is not audit-valid."""
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_trace_materializer_manifest(
+    manifest: dict[str, Any],
+    checkout_root: Path | str,
+) -> None:
+    """Bind a trace manifest to its materializer(s) in this checkout.
+
+    Historical token-aligned synthetic manifests predate ``tool_path`` and
+    continue to use their original single-tool hash check.  A verbatim
+    current-turn trace is a second, explicit payload mode: its manifest must
+    bind both the new frontend and the old materializer module from which it
+    imports the shared chat-count/fingerprint implementation.
+    """
+    if not isinstance(manifest, dict):
+        raise MatrixEvidenceError("trace manifest is not a JSON object")
+    # The shell preflight passes ``os.curdir`` (a string), while Python callers
+    # commonly pass a Path.  Normalize both before resolving repo-relative
+    # materializer paths.
+    checkout_root = Path(checkout_root).resolve()
+    synthetic_sha = _file_sha256(checkout_root / SYNTHETIC_TRACE_TOOL_PATH)
+
+    if manifest.get("payload_mode") != SHAREGPT_CURRENT_TURN_PAYLOAD_MODE:
+        if manifest.get("tool_sha256") != synthetic_sha:
+            raise MatrixEvidenceError(
+                "trace was not materialized by the current checkout tool"
+            )
+        return
+
+    if manifest.get("tool_path") != SHAREGPT_CURRENT_TURN_TOOL_PATH:
+        raise MatrixEvidenceError(
+            "current-turn trace manifest tool_path is not the audited repo path"
+        )
+    current_turn_sha = _file_sha256(
+        checkout_root / SHAREGPT_CURRENT_TURN_TOOL_PATH
+    )
+    if manifest.get("tool_sha256") != current_turn_sha:
+        raise MatrixEvidenceError(
+            "current-turn trace was not materialized by the current checkout tool"
+        )
+    dependencies = manifest.get("dependency_sha256")
+    if not isinstance(dependencies, dict):
+        raise MatrixEvidenceError(
+            "current-turn trace manifest lacks dependency_sha256"
+        )
+    if dependencies.get(SYNTHETIC_TRACE_TOOL_PATH) != synthetic_sha:
+        raise MatrixEvidenceError(
+            "current-turn trace materializer dependency differs from checkout: "
+            f"{SYNTHETIC_TRACE_TOOL_PATH}"
+        )
+    common_sha = _file_sha256(checkout_root / TRACE_SCENARIO_DEPENDENCY_PATH)
+    if dependencies.get(TRACE_SCENARIO_DEPENDENCY_PATH) != common_sha:
+        raise MatrixEvidenceError(
+            "current-turn trace materializer dependency differs from checkout: "
+            f"{TRACE_SCENARIO_DEPENDENCY_PATH}"
+        )
 
 
 @dataclass(frozen=True)

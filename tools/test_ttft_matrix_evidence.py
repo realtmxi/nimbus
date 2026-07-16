@@ -1,6 +1,7 @@
 """Focused stdlib tests for the TTFT matrix arm/evidence contract."""
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import tempfile
@@ -15,6 +16,7 @@ from tools.ttft_matrix_evidence import (
     MatrixExpectations,
     main,
     parse_arm,
+    validate_trace_materializer_manifest,
     validate_or_write_marker,
 )
 
@@ -44,6 +46,88 @@ class TestTTFTMatrixEvidence(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    @staticmethod
+    def _repo_sha(relative_path: str) -> str:
+        root = Path(__file__).resolve().parents[1]
+        return hashlib.sha256((root / relative_path).read_bytes()).hexdigest()
+
+    def test_trace_preflight_accepts_legacy_synthetic_and_current_turn(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        synthetic_path = "tools/materialize_token_aligned_trace.py"
+        current_path = "tools/materialize_sharegpt_current_turn_trace.py"
+        common_path = "router/common.py"
+        synthetic_sha = self._repo_sha(synthetic_path)
+        current_sha = self._repo_sha(current_path)
+        common_sha = self._repo_sha(common_path)
+
+        # The historical manifest has no tool_path or top-level payload_mode.
+        validate_trace_materializer_manifest({
+            "tool_sha256": synthetic_sha,
+        }, root)
+        validate_trace_materializer_manifest({
+            "payload_mode": "sharegpt_current_turn_retokenized",
+            "tool_path": current_path,
+            "tool_sha256": current_sha,
+            "dependency_sha256": {
+                synthetic_path: synthetic_sha,
+                common_path: common_sha,
+            },
+        }, root)
+
+        # The embedded shell preflight calls this helper with ``os.curdir``.
+        # Exercise that path-like string contract, not only direct Path calls.
+        validate_trace_materializer_manifest({
+            "tool_sha256": synthetic_sha,
+        }, str(root))
+
+    def test_current_turn_trace_preflight_rejects_wrong_tool_binding(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        synthetic_path = "tools/materialize_token_aligned_trace.py"
+        current_path = "tools/materialize_sharegpt_current_turn_trace.py"
+        common_path = "router/common.py"
+        base = {
+            "payload_mode": "sharegpt_current_turn_retokenized",
+            "tool_path": current_path,
+            "tool_sha256": self._repo_sha(current_path),
+            "dependency_sha256": {
+                synthetic_path: self._repo_sha(synthetic_path),
+                common_path: self._repo_sha(common_path),
+            },
+        }
+        mutations = {
+            "tool_path": {**base, "tool_path": "/tmp/untrusted.py"},
+            "current checkout tool": {**base, "tool_sha256": "0" * 64},
+            "dependency differs": {
+                **base,
+                "dependency_sha256": {
+                    synthetic_path: "f" * 64,
+                    common_path: self._repo_sha(common_path),
+                },
+            },
+            "router/common.py": {
+                **base,
+                "dependency_sha256": {
+                    synthetic_path: self._repo_sha(synthetic_path),
+                    common_path: "e" * 64,
+                },
+            },
+            "lacks dependency": {**base, "dependency_sha256": None},
+        }
+        for message, manifest in mutations.items():
+            with self.subTest(message=message), self.assertRaisesRegex(
+                MatrixEvidenceError, message
+            ):
+                validate_trace_materializer_manifest(manifest, root)
+
+    def test_legacy_synthetic_preflight_keeps_original_tool_hash_check(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        with self.assertRaisesRegex(
+            MatrixEvidenceError, "trace was not materialized"
+        ):
+            validate_trace_materializer_manifest({
+                "tool_sha256": "0" * 64,
+            }, root)
 
     def _summary(self, policy: str, *, trigger: str = "ttft_pred",
                  selector: str = "cost_cachedisp_old") -> dict:

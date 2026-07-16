@@ -139,6 +139,11 @@ import re
 import sys
 import urllib.request
 
+from tools.ttft_matrix_evidence import (
+    MatrixEvidenceError,
+    validate_trace_materializer_manifest,
+)
+
 (
     data_path, manifest_path, profile_path, log_path, server_pid, url, model,
     max_inflight, requested_kv, tick_ms, slo_s, temperature, local_ignore_eos,
@@ -155,8 +160,10 @@ manifest = json.load(open(manifest_path, encoding="utf-8"))
 profile = json.load(open(profile_path, encoding="utf-8"))
 data_sha = sha(data_path)
 profile_sha = sha(profile_path)
-if manifest.get("tool_sha256") != sha(os.path.join("tools", "materialize_token_aligned_trace.py")):
-    raise SystemExit("trace was not materialized by the current checkout tool")
+try:
+    validate_trace_materializer_manifest(manifest, os.curdir)
+except MatrixEvidenceError as exc:
+    raise SystemExit(str(exc)) from None
 if profile.get("tool_sha256") != sha(os.path.join("tools", "profile_ttft_batch.py")):
     raise SystemExit("PROFILE was not produced by the current checkout tool")
 if profile.get("schema_version") != 2:
