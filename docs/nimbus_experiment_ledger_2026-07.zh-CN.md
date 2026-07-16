@@ -8,10 +8,11 @@
 
 完整英文实验细节、命令和产物路径仍以
 [`v3_experiments_2026-07.md`](v3_experiments_2026-07.md) 为准；本账本负责把
-时间线和因果关系讲清楚。当前代码结论对应仓库提交 `e0b6686`。
+时间线和因果关系讲清楚。当前 real-cloud 执行实现对应 `4c18ae6`，E11
+预注册/checkpoint 对应其后的文档提交。
 
 **数据保存边界：**repo 里提交的是实现、分析器、审计逻辑和文档，GPU 实验产生的
-大体积 JSONL/日志仍保存在 `$MSCRATCH`，不在 git 中。第 6 节逐项登记 E0–E10 的
+大体积 JSONL/日志仍保存在 `$MSCRATCH`，不在 git 中。第 6 节逐项登记 E0–E11 的
 输入、原始输出、summary、decision log、marker、复算命令和缺失项。路径“已登记”
 不等于本机已验证文件仍存在；正式引用前必须在 GPU 箱上核对文件、行数和 SHA256。
 
@@ -95,7 +96,7 @@ ttft_pred + cost_cachedisp_old + support-envelope fallback
 | E8 | 7 月 15 日 | 检查 selector 结果能否跨顺序/重复稳定 | old V2 6/6 胜 newest；与 current 路由数等价但更便宜 | VALIDATED |
 | E9 | 7 月 15 日 | 在完整 11,605 请求上做预注册泛化 gate | A/C 0 本地违约；K 严重失败；总 gate 因 B=39 而 FAIL | VALIDATED |
 | E10 | 7 月 16 日 | 验证固定 OpenRouter provider 的首 token cancel/TTFT 路径 | DeepInfra burst 16/16 客户端断流；TTFT p50/p95/p99=467/929/1,167 ms，0/16 超 5s | MECHANISM ONLY / EXPLORATORY |
-| E11 | 7 月 16 日 | 完整 11,605 请求真实云 live-hybrid A/C | 已冻结 A→C、5s observed TTFT 与完整性规则；尚未读取结果 | PRE-REGISTERED / NOT RUN |
+| E11 | 7 月 16 日 | 完整 11,605 请求真实云 live-hybrid A/C | fresh profile 已通过；正式 arm 在外发安全门前停止，0 请求/0 费用 | PROFILE VALIDATED / ARMS NOT RUN |
 
 ---
 
@@ -697,6 +698,39 @@ Pending generation record 不得填成 `$0`。
 - 不测完整响应 E2E、TPOT、答案质量、mid-stream reliability 或 full-response 成本；
 - 暂时采用“首 token cancel 不改变上游 cloud load”的用户授权假设，但它仍未验证。
 
+**执行 checkpoint（尚无 real-cloud outcome）**
+
+clean detached `2b53ff3` 在健康 GPU 上启动了新的 Qwen3-32B lifecycle：bfloat16、
+FlashAttention、no prefix cache、`max_model_len=40960`、`max_num_seqs=128`；启动日志
+实测 KV capacity 112,064 tokens。父 PID `1833193`，子 PID
+`1833493,1833494` 均已登记。Fresh schema-v2 profile 结果：
+
+| 检查 | 结果 |
+|---|---:|
+| profile SHA256 | `8a4c0057697112a21778365b8e00f00960953c94911db349fca3cd21b9d21c3e` |
+| blocks / measured requests | 60/60；1,420/1,420 success、prompt exact、decode exact |
+| shared prefill | 3,268.6112 tokens/s |
+| TPOT / first-token overhead | 151.7528 ms / 444.5446 ms |
+| weighted R² | 0.957901 |
+| guard | 1,448 ms residual p99 + 250 ms tick = **1,698 ms** |
+| held-out confusion | TP 195 / FN 0 / FP 19 / TN 70 |
+
+随后只做了 OpenRouter 非推理 metadata GET：DeepInfra live endpoint 仍为
+`$0.08/M input + $0.28/M output`、FP8、context 40,960；选定 key 自身 remaining
+limit 为 `$187.559401086`。
+
+正式 matrix 命令在远端执行前被 bulk third-party data-export 安全门停止。风险边界
+比“把 ShareGPT 原文发出去”小得多：token-aligned trace 已把每条源 prompt 替换成
+确定性的 12 位十六进制 nonce 加重复 `calibration`，HTTP payload 也不含
+`session_id`。但 11,605 条合成 prompt、token-size distribution 和 arrival schedule
+仍会整体交给 OpenRouter/DeepInfra，因此需要用户在知情后明确批准。
+
+阻断后的 usage audit：formal matrix 未启动、无 matrix PID、无 full output dir、
+formal inference requests=0、key usage delta=`$0`、account usage delta=`$0`。这不是
+失败 outcome，也不是 A/C 的任何结果；预注册规则未改。父 PID 及两个登记子 PID
+随后全部退出，8010 无监听，GPU memory 回到启动前水平。由于 profile 绑定 PID/log，
+获批后必须重启新 lifecycle 并重跑 profile，不能复用本次 profile。
+
 ---
 
 ## 4. 算法是怎样一步步演化的？
@@ -748,7 +782,8 @@ Shipped v3: kv_gap trigger + current displacement selector
 7. **负载/guard sweep 与 offline oracle**：确定性能前沿，并与历史 0/1 DP 或
    clairvoyant oracle 比较。
 
-当前执行顺序（7 月 16 日决策后）：直接完成 E11 full A/C；随后
+当前执行顺序（7 月 16 日决策后）：取得 bulk synthetic-trace 外发的明确知情批准，
+再以新 lifecycle/profile 完成 E11 full A/C；随后
 1 → 2 → 3 → 4/5 → 7。任何默认切换仍必须等 support-envelope hardening 完成。
 
 ---
@@ -1060,7 +1095,26 @@ python3 tools/analyze_ttft_violation_context.py \
   `artifacts/openrouter_ttft_cancel_2026-07-16/`，不进 git；
 - **复算**：TTFT 分位数和 `stream_abort_requested/response_completed/
   first_token_kind` 可直接从 burst16 raw 复算；费用只对查到的 generation 记录
-  有证据，15/16 缺记录必须保留 pending。
+有证据，15/16 缺记录必须保留 pending。
+
+### 6.15 E11 pre-arm 数据索引 — fresh profile 与 blocked launch
+
+- 远端根目录：`$MSCRATCH/router_realcloud_full_2b53ff3_20260716T1435Z/`；
+- profile：`ttft_profile_v2_2b53ff3_lifecycle1.json`，SHA256
+  `8a4c0057697112a21778365b8e00f00960953c94911db349fca3cd21b9d21c3e`；
+- profile stdout：`ttft_profile_v2_2b53ff3_lifecycle1.stdout.log`，SHA256
+  `cdd8047fe002e59241f5e40d695c259616d102fa349fe5d578a4030858eb6228`；
+- server log：`vllm_qwen32b_nocache.log`，SHA256
+  `2b7c5b3764a42749521d13124fc5e16ec8cf63d93c534a26a163e6da0f47ced1`；
+- lifecycle：`lifecycle.env`，SHA256
+  `d08388cbc26a93cc28b36a1e04e5feaacf4fc7ad307a7163351c7bb06cb78341`；
+- OpenRouter pre-run baseline：`openrouter_prerun_baseline.json`，SHA256
+  `66b33278fceb263c9550f051a9444154f5aac6b8b8c4d812bc04e8b6353b3ec7`；
+- blocked-launch usage audit：`blocked_launch_usage_audit.json`，SHA256
+  `9810e19bffa697a75131a2fa65d1690849d9b078ada3183f10ba34f19ff685b7`；
+- 本地镜像：repo-sibling
+  `artifacts/realcloud_full_prerun_2026-07-16/`，六文件 SHA 与远端逐一一致；
+- 明确不存在：`matrix.pid`、`full11605_real_ac/`、任何 formal A/C raw rows。
 
 ---
 
@@ -1088,6 +1142,8 @@ python3 tools/analyze_ttft_violation_context.py \
   matrix、markers、gate audit 和 B diagnosis；
 - `$MSCRATCH/router_ttft_nocache_78846da/`：token-aligned trace 与早期 profile。
 - `$MSCRATCH/openrouter_ttft_cancel_20260716/`：E10 real-cloud cancel probes。
+- `$MSCRATCH/router_realcloud_full_2b53ff3_20260716T1435Z/`：E11 pre-arm
+  profile、server lifecycle 与 blocked-launch zero-usage audit；没有 A/C raw rows。
 
 完整 SHA、运行命令和 server 注意事项见
 [`v3_experiments_2026-07.md`](v3_experiments_2026-07.md) 第 5g、8、9 节。

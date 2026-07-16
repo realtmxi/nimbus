@@ -1013,6 +1013,49 @@ reliability, or full-response deployment cost. It adopts the user-authorized
 temporary assumption that first-token cancellation does not change upstream
 cloud load; that assumption remains unvalidated.
 
+**Execution checkpoint — profile complete; formal arms not started.** A clean
+detached `2b53ff3` checkout started a fresh Qwen3-32B lifecycle on the selected
+healthy GPU. The bound server used bfloat16, FlashAttention, no prefix cache,
+`max_model_len=40960`, `max_num_seqs=128`, and a startup-log KV capacity of
+112,064 tokens. Parent PID `1833193` and children `1833493,1833494` were
+recorded. The fresh schema-v2 profile passed all local gates:
+
+| Profile check | 2026-07-16 lifecycle result |
+|---|---:|
+| Profile SHA256 | `8a4c0057697112a21778365b8e00f00960953c94911db349fca3cd21b9d21c3e` |
+| Structural/token audit | 60/60 blocks; 1,420/1,420 success, prompt exact, and decode exact |
+| Effective shared prefill | 3,268.6112 tokens/s |
+| Decode TPOT / first-token overhead | 151.7528 ms / 444.5446 ms |
+| Fit | weighted R² = 0.957901 |
+| Guard | calibration p99 residual 1,448 ms + one 250 ms tick = **1,698 ms** |
+| Final held-out classifier | TP 195, FN 0, FP 19, TN 70 |
+
+The live OpenRouter endpoint inventory still showed DeepInfra at `$0.08/M`
+input and `$0.28/M` output, FP8, context 40,960. The selected API key had
+`$187.559401086` of its own limit remaining. These were non-inference metadata
+GETs only.
+
+The formal matrix launch was then stopped by the external-data-export safety
+gate **before its remote command executed**. The aligned trace does not contain
+the source ShareGPT dialogue: `tools/materialize_token_aligned_trace.py`
+replaced every prompt with a deterministic 12-hex nonce plus repeated
+`calibration` filler, and the HTTP payload does not include `session_id`.
+Nevertheless, sending 11,605 synthetic prompts, token-size distribution and
+arrival schedule to OpenRouter/DeepInfra is still a bulk third-party transfer
+and now requires explicit informed user approval. Post-block usage audit proved
+key usage delta `$0`, account usage delta `$0`, no matrix PID/output directory,
+and **zero formal inference requests**.
+
+Because the matrix did not start, the registered A/C gates and status remain
+unchanged and there is no real-cloud outcome to interpret. The server was
+terminated immediately by its recorded PID; both recorded children and port
+8010 were verified gone and GPU memory returned to the pre-launch level. The
+profile is PID/log-bound, so a later approved run must start a new lifecycle
+and re-profile rather than reuse this artifact. Evidence is under
+`$MSCRATCH/router_realcloud_full_2b53ff3_20260716T1435Z/` with a verified local
+repo-sibling mirror outside git at
+`artifacts/realcloud_full_prerun_2026-07-16/`.
+
 ---
 
 ## 6. Cloud-side accounting (headline-metric decision)
@@ -1120,9 +1163,13 @@ whole-run diagnostics even after observed cloud TTFT becomes the headline.
     has measured first-generated-token TTFT; and `overall.slo_measured_n=512`.
     The headline is `overall.slo_violation_pct`; never the real-run
     `pessimistic_combined` field.
-11. **PRE-REGISTERED / NEXT — direct full 11,605 live hybrid A/C.** Section 5i
-    freezes A-then-C order and the complete integrity/outcome contract. Use the
-    same provider/concurrency/first-token definition, and retain
+11. **PROFILE COMPLETE / WAITING FOR EXPLICIT EXPORT CONSENT — direct full
+    11,605 live hybrid A/C.** Section 5i freezes A-then-C order and the complete
+    integrity/outcome contract. The first lifecycle completed its fresh profile
+    but sent zero formal cloud requests; it was shut down when the bulk
+    third-party-transfer gate required informed approval. After approval, start
+    a new bound lifecycle/profile, use the same provider/concurrency/first-token
+    definition, and retain
     complete raw/decision/marker evidence. Report overall combined TTFT plus
     local/cloud splits, route fraction, gate wait, 429/error rate, and cost
     coverage. If the single-pair A/C difference is below about 1 percentage
@@ -1183,6 +1230,8 @@ whole-run diagnostics even after observed cloud TTFT becomes the headline.
 | `$MSCRATCH/router_ttft_repeat_cac4a5d_20260715/ttft_profile_v2_cac4a5d_lifecycle1.json` | Repeatability profile, SHA256 `ab703ddc…c819` |
 | `$MSCRATCH/router_ttft_full_c6de62a_20260715/full11605_bkcal/` | Completed pre-registered B/K/C/A/L matrix: raw/decision/summary/markers, frozen manifest, full-cell gate audit, and bound B violation-context audit |
 | `$MSCRATCH/openrouter_ttft_cancel_20260716/` | July-16 fixed-DeepInfra TTFT-cancel smokes and 16-row burst; raw/summary plus delayed generation/billing audit (Section 5h) |
+| `$MSCRATCH/router_realcloud_full_2b53ff3_20260716T1435Z/` | E11 pre-arm lifecycle: valid fresh profile, server log, non-secret OpenRouter baseline, and blocked-launch zero-usage audit; no formal A/C rows |
+| repo-sibling `artifacts/realcloud_full_prerun_2026-07-16/` | Verified local mirror of the six E11 pre-arm evidence files; outside git |
 | `$JSCRATCH/workloads/…` | ShareGPT+BurstGPT trace (leg-1 `$DATA`) |
 | `$JSCRATCH/initial_result/` | 14,537-row real OpenRouter measurements (cloud-latency calibration) |
 | `$JSCRATCH/vllmresult/` | teammate's open-loop sweep on the same model (parity reference) |
