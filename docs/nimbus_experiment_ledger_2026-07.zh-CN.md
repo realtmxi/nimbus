@@ -10,7 +10,7 @@
 [`v3_experiments_2026-07.md`](v3_experiments_2026-07.md) 为准；本账本负责把
 时间线和因果关系讲清楚。当前 real-cloud 执行实现对应 `4c18ae6`，E11
 预注册/checkpoint 对应其后的文档提交；E12 current-turn 物化实现对应
-`6054b32`。
+`6054b32`，local-gate 预注册对应 `78da644`，权威事后证据分析器对应 `cdf7f16`。
 
 **数据保存边界：**repo 里提交的是实现、分析器、审计逻辑和文档，GPU 实验产生的
 大体积 JSONL/日志仍保存在 `$MSCRATCH`，不在 git 中。第 6 节逐项登记 E0–E12 的
@@ -65,6 +65,13 @@ ttft_pred + cost_cachedisp_old + support-envelope fallback
 
 这仍是实验候选，不是已经切换的生产默认。
 
+E12 又补了一层外部有效性证据：把原始 ShareGPT current-turn 文本按真实 payload
+重新计 token 后，all-local 仍有 11,400/11,604 个 5 秒 TTFT 违约；同一个
+`ttft_pred` 触发器配 old-v2 或 current selector，都把 retained-local 违约降到 0。
+这说明安全性结果不是 synthetic filler 独有。但本轮只有一次固定 A→C 顺序且云端
+是 NullCloud，所以只能说“本地保留安全 gate 通过”，不能说 old-v2 已普遍胜出，也
+不能说 11,604 条请求的真实端到端 TTFT 已通过。
+
 ---
 
 ## 1. 如何阅读证据等级
@@ -98,7 +105,7 @@ ttft_pred + cost_cachedisp_old + support-envelope fallback
 | E9 | 7 月 15 日 | 在完整 11,605 请求上做预注册泛化 gate | A/C 0 本地违约；K 严重失败；总 gate 因 B=39 而 FAIL | VALIDATED |
 | E10 | 7 月 16 日 | 验证固定 OpenRouter provider 的首 token cancel/TTFT 路径 | DeepInfra burst 16/16 客户端断流；TTFT p50/p95/p99=467/929/1,167 ms，0/16 超 5s | MECHANISM ONLY / EXPLORATORY |
 | E11 | 7 月 16 日 | 完整 11,605 请求真实云 live-hybrid A/C | fresh profile 已通过；正式 arm 在外发安全门前停止，0 请求/0 费用 | PROFILE VALIDATED / ARMS NOT RUN |
-| E12 | 7 月 16 日 | 用原始 ShareGPT current-turn 文本做 token/payload 对齐的外部有效性实验 | 11,605 中物化 11,604；先跑完全本地 L→A→C，尚无 arm 结果、无原文出网 | TRACE MATERIALIZED / PRE-REGISTERED / ARMS NOT RUN |
+| E12 | 7 月 16 日 UTC / 北京时间 7 月 17 日完成 | 用原始 ShareGPT current-turn 文本做 token/payload 对齐的外部有效性实验 | 11,604/11,604 成功；L 有 11,400 个本地违约，A/C retained-local 均 0，分别路由 5,109/4,099；0 出网 | VALIDATED — LOCAL-ONLY GATE / CLOUD NOT MEASURED |
 
 ---
 
@@ -115,7 +122,7 @@ ttft_pred + cost_cachedisp_old + support-envelope fallback
 - 与可信 open-loop harness 的 TTFT p50 比值：`1.003`；
 - queue neutrality：p50 `110 ms vs 111 ms`；
 - 无压力时 Nimbus 0 kick，延迟与 all-local 一致；
-- 当前离线测试：router 83 项 + evidence 53 项 = **136/136**。
+- 当前离线测试：router 83 项 + evidence 64 项 = **147/147**。
 
 **结论**
 
@@ -737,7 +744,11 @@ formal inference requests=0、key usage delta=`$0`、account usage delta=`$0`。
 随后全部退出，8010 无监听，GPU memory 回到启动前水平。由于 profile 绑定 PID/log，
 获批后必须重启新 lifecycle 并重跑 profile，不能复用本次 profile。
 
-### E12 — 原始 ShareGPT current-turn 外部有效性 leg（预注册）
+### E12 — 原始 ShareGPT current-turn 外部有效性 leg（事后状态标签：预注册并已执行 local gate）
+
+*事后注：从下面的状态行到原文外发授权边界，是 commit `78da644` 中逐字保留的预注册
+正文；执行结果只追加在这段未改正文之后。Artifact/event 日期使用 UTC；三个正式
+stage 在 2026-07-16 17:10–18:38 UTC、即北京时间 7 月 17 日 01:10–02:38 完成。*
 
 **状态：TRACE MATERIALIZED / LOCAL ARMS NOT RUN / 原文未出网。** 本节和 trace
 hash 都在任何推理 arm 启动前冻结。
@@ -836,6 +847,72 @@ C，C 的任何 retained-local 违约使最终 safety gate 失败。不能看完
 明确知情授权。E11 synthetic filler 的授权不能代替 E12 原文授权；同意本次双轨方法
 也不等于同意原文出网。
 
+#### Local gate 事后结果
+
+上面是冻结的事前合同；下面只在三个正式 stage 全部结束后追加。Formal profile 与
+L/A/C 使用的是 clean execution commit
+`78da6448af18159cb0a755626f3dbee42a90361e`；分析器是运行结束后才加入。事后分析器
+commit `cdf7f16` 重算三个 runner fingerprint，逐字节绑定 raw/summary/decision/marker，检查
+共同 trace/profile/lifecycle、current-turn/no-cache payload 身份、token exactness，
+并验证 applied victim IDs 与 NullCloud rows 完全一致。其不含原文的 JSON/Markdown
+SHA256 分别为
+`7bdeb256372f62f5cd8fdca10a1b91d2a7877c9546ce0f0e30f26b90f5fc7548` 和
+`dfa916eceea3c4c59a6194e127299bfb49bfeb6b231233842ea6b3aae38b5dee`，gate verdict
+为 **PASS**。
+
+**Lifecycle 与 profile。** 第一次 launch 意外沿用了 vLLM 默认 prefix cache；我们在
+profile/arm 前从日志发现并停止，保留为 aborted lifecycle，不把它藏掉。第二次明确
+使用 `--no-enable-prefix-caching`：Qwen3-32B、bfloat16、
+`max_model_len=40960`、`max_num_seqs=128`、FLASH_ATTN、KV capacity 112,656
+tokens。15 个冻结 cells、75 个 blocks、2,105/2,105 measured requests 全成功且 token
+exact。Fresh profile 为：
+
+| Profile 项 | 结果 |
+|---|---:|
+| prefill throughput | 3,242.2097 tokens/s |
+| TPOT | 151.6079 ms |
+| first-token overhead | 353.0143 ms |
+| weighted R² / guard | 0.963029 / 1,735 ms |
+| held-out n / TP-FN-FP-TN | 421 / 188-0-26-207 |
+
+有 1 条 held-out 的 underprediction 超过 recommended guard，所以只能主张 5 秒分类
+FN=0，不能主张 guard 对每个 held-out 样本逐点覆盖。
+
+**L→A→C 正式结果。** 三阶段均为 11,604/11,604 unique success；所有 retained-local
+prompt/decode usage 精确。费用按冻结的 `$0.08/M input + $0.28/M output` 和完整 capped
+decode 建模，不是实际消费。Analyzer 同时绑定三份 stage-event log，确认顺序确为
+L→A→C，cross-matrix cooldown 为 94 秒和 62 秒，均超过预注册的 20 秒。
+
+| Arm | NullCloud 路由 | 留在本地 | 本地 5s 违约 | 本地 TTFT p50 / p95 / p99 | peak waiting | 建模费用 |
+|---|---:|---:|---:|---:|---:|---:|
+| L `all_local` | 0 | 11,604 | **11,400 / 11,604** | 644,578 / 1,304,490 / 1,363,365 ms | 6,149 | $0 |
+| A `old-v2` | 5,109 (44.028%) | 6,495 | **0 / 6,495** | 1,393 / 2,003 / 2,176 ms | 26 | $0.500634 |
+| C `current` | 4,099 (35.324%) | 7,505 | **0 / 7,505** | 1,490 / 2,165 / 2,490 ms | 28 | $0.51621328 |
+
+因此，预注册的压力锚点和 A/C retained-local safety gate 全通过。A 比 C 多路由
+1,010 条（+8.704 个百分点；相对 C 多 24.64%），但因为选择了更多且更便宜的
+victims，建模费用反而少 `$0.01557928`（3.018%）。反过来，C 的 NullCloud selected
+route count 比 A 少 19.77%；只有未来逐条映射到 live cloud 时，它才意味着潜在 API
+calls/原文暴露更少。两组 victims 的 intersection=2,574、A-only=2,535、C-only=1,525、
+union=6,634、Jaccard=0.3880，说明它们确实选择了不同请求。
+
+不能据此宣布 selector winner：只有一次固定 A→C 顺序。A 的 observed local p99 比 C
+低 314.177 ms，也可能包含顺序或运行漂移。下一轮若要比较 selector，应事前注册 fresh
+lifecycle 的反序/平衡 block 重复，并可按问题加入 `newest`/waiting-random 对照。
+
+**严格口径：**E12 证明 `ttft_pred` 配两种 selector 都能让本 cell 中**留在本地**的
+请求满足 5 秒 TTFT；不能说全体 11,604 条满足真实端到端 SLO，因为 A/C 的
+5,109/4,099 条外发记录只是 NullCloud，没有 cloud TTFT。`$0.500634/$0.51621328`
+是 modeled full-response cost，实际云消费 `$0`。本轮 `U=P`、cached=0，未验证缓存项；
+也未验证 full conversation、221k outlier、答案质量、真实 provider 或 shipped
+`kv_gap`。decode 仍来自 trace 并 cap，保留 oracle-estimate 边界。第三方 POST=0，原文
+没有离开团队主机。
+
+实验目录为 `$MSCRATCH/sharegpt_current_turn_local_78da644_20260716/`。所有 server、
+profile、stage PID 已退出，8010 空闲，GPU 内存已释放。当前事后树通过 router 83 +
+tools 64 = **147/147**，其中 analyzer focused tests 11/11，另有 `py_compile` 与
+`git diff --check`。
+
 ---
 
 ## 4. 算法是怎样一步步演化的？
@@ -878,21 +955,22 @@ Shipped v3: kv_gap trigger + current displacement selector
    workload mix 等标定 predictor；超出支持域时保守 fallback。
 2. **完整 decision replay schema**：保存 snapshot IDs、waiting age、每请求
    prediction、selector score/order、in-flight release state。
-3. **第二个完整 server lifecycle**：确认 E9 不是单次运行/顺序漂移。
+3. **反序/平衡 block 重复**：E12 已完成第二个独立 workload/lifecycle，但本轮仍只有
+   一次固定 A→C；要比较 old-v2/current，必须在 fresh lifecycle 反序或平衡重复。
 4. **在线 decode estimate**：当前实验使用 trace/oracle decode 长度。
 5. **Cache-aware trace**：当前 no-cache 实验不能验证 `U=P−cached_tokens` 项。
 6. **真实 cloud latency**：E10 已验证固定 DeepInfra 的首-token transport/TTFT
    路径；E11 已预注册直接完整 11,605 A/C，两个 512 pilot 由用户明确跳过而非完成。
-   E12 先增加原始 current-turn 的 local-only 外部有效性 gate。Cancel 模式也不能
+   E12 原始 current-turn 的 local-only 外部有效性 gate 已通过。Cancel 模式也不能
    替代 E2E/TPOT/mid-stream 的 full-drain sensitivity。
 7. **负载/guard sweep 与 offline oracle**：确定性能前沿，并与历史 0/1 DP 或
    clairvoyant oracle 比较。
 
-当前执行顺序（7 月 16 日 current-turn 决策后）：先完成 E12 的 local-only L→A→C，
-审计真实压力和 A/C 本地安全性。E11 synthetic live 仍有效，但等待它自己的 export
-consent；E12 即使通过 local gate，也必须另写 live 预注册并取得原文外发的单独明确
-授权。之后才进入 1 → 2 → 3 → 4/5 → 7。任何默认切换仍必须等
-support-envelope hardening 完成。
+当前执行顺序（E12 local gate 完成后）：下一项无出网工作应先预注册 fresh-lifecycle
+反序/平衡 block 重复，确认 A/C 的 route/cost/local-TTFT tradeoff 是否稳定；随后进入
+support-envelope hardening。E11 synthetic live 仍等待它自己的 export consent；E12
+live 必须另写 live 预注册，并取得 11,604 条原文及到达时序外发的单独明确授权。
+任何默认切换仍必须等 support-envelope hardening 完成。
 
 ---
 
@@ -940,11 +1018,14 @@ support-envelope hardening 完成。
 | E8 | 24 arms、profile、server log、analyzer 均登记，**已镜像** | **是** | 决策 schema 不能完整 replay selector |
 | E9 | 五 arms、两份 audit、trace/profile/server 全绑定，**已镜像** | **是** | 同样缺完整 selector replay state |
 | E10 | 代码在 `e0b6686`；burst16 raw/summary/billing audit 已登记并做 repo 外本地镜像 | **部分（TTFT 可复算）** | 15/16 generation metadata 未找到，完整费用 pending；只是单-provider probe |
+| E11 | fresh profile/server/pre-run/zero-usage audit 已登记并镜像；正式 arm 未启动 | **profile 可复算，无 outcome** | 等 synthetic bulk export consent；下次必须新 lifecycle/profile |
+| E12 | 受限原文 trace、fresh profile、L/A/C raw/decision/summary/marker 与 text-free audit 均登记 | **local gate 可独立复算** | 无 cloud TTFT；单次 A→C；no-cache；oracle/capped decode；未做通用镜像 |
 
 **E0–E9 于 2026-07-15 在 GPU 箱上逐文件核验存在性与 SHA256，并完成双站点镜像**（全量
 清单与镜像位置见 §6.13）。上表"已镜像" = 文件同时存在于 `$MSCRATCH` 与本地
 Mac 镜像，且 232/232 哈希校验通过。E10 是 2026-07-16 单独新增的小型镜像，见
-§6.14，不属于前述 232 文件清单。
+§6.14；E11 的六文件 pre-arm mirror 见 §6.15；二者都不属于前述 232 文件清单。
+E12 原文与大体积 local outcome 没有通用本机镜像。
 
 ### 6.3 E0 数据索引 — Router/harness 基础验证
 
@@ -956,11 +1037,8 @@ Mac 镜像，且 232/232 哈希校验通过。E10 是 2026-07-16 单独新增的
 
 ```bash
 python3 -m unittest \
-  router.test_common router.test_run router.test_nimbus \
-  tools.test_analyze_ttft_full_cell \
-  tools.test_analyze_ttft_repeatability \
-  tools.test_analyze_ttft_violation_context \
-  tools.test_ttft_matrix_evidence
+  router.test_common router.test_run router.test_nimbus
+python3 -m unittest discover -s tools -p 'test_*.py'
 ```
 
 - **原 GPU 数据状态**：parity `1.003`、queue neutrality `110 vs 111 ms`、
@@ -1224,7 +1302,7 @@ python3 tools/analyze_ttft_violation_context.py \
   `artifacts/realcloud_full_prerun_2026-07-16/`，六文件 SHA 与远端逐一一致；
 - 明确不存在：`matrix.pid`、`full11605_real_ac/`、任何 formal A/C raw rows。
 
-### 6.16 E12 数据索引 — current-turn trace materialization
+### 6.16 E12 数据索引 — current-turn trace 与 local L/A/C gate
 
 - 受限远端根目录：`$MSCRATCH/sharegpt_current_turn_6054b32_20260716/`；
 - 实现 commit：`6054b32`；materializer SHA256
@@ -1240,8 +1318,43 @@ python3 tools/analyze_ttft_violation_context.py \
 - emitted P min/p50/p95/p99/max/sum=`9/26/463/1,699/10,795/1,289,405`；
   emitted D p50/p95/max/sum=`238/630/1,024/3,038,796`；
 - manifest/stdout 不含原文；JSONL 含原始 current-turn 文本，不得进 git 或通用
-  mirror；
-- 明确不存在：L/A/C raw、summary、decision、marker 或任何 E12 inference outcome。
+  mirror。
+
+Local gate 根目录：`$MSCRATCH/sharegpt_current_turn_local_78da644_20260716/`。
+
+| Artifact | SHA256 |
+|---|---|
+| lifecycle env | `de4d3a75e88a542aae3b00b4131ba8ff8c846aad8e08485bd58452225abe0b54` |
+| aborted lifecycle-1 log | `aa578bd3d43383f76a579f66c17c7d327b5ac60cb9b78b98e4a38a1af1e577f0` |
+| lifecycle-2 server log | `46e9c68eabb61a39d4791005b5c810b882e9507db3a6d66849c792032e974bc9` |
+| profile / stdout | `bb35dcc01fd661e8b9a1b428cdcd898dbed2f84f041a30bd30c444098d81e4cb` / `ee295077c12e724b935025935248b8d78339a84df2619327282dfc1ffab40a99` |
+| L raw / summary / marker | `d182eeb2468273a0de0a7a93b33af9ac0ac26d920ff42f6844da4b7f76c32ce2` / `71e3ff1364dfb4a2d9a2ce2588281c48dab633d7d1fe5abb6bca4dac7c5fcf1a` / `63cec2778f1a17728fbd15b4c26a3f53e82b55b4d03eb078c77cdefa53166301` |
+| A raw / summary / decisions / marker | `ee26d46dbe3023d7cd64ef8c6f83cc20ea7af0877469f9d34d256056661f2c1b` / `7721c91cfce7af8e078e3e71b47659aca4624167a621e0c63a3cd172a538bf67` / `5d5ecac2784f2456828162d74302601fab2b6b132325aabb21bb8c32449505c8` / `42846a87186366605f036eb8b0d4d3b48aea2fa8b42ed8a11c05274778571d32` |
+| C raw / summary / decisions / marker | `c965c02470151b6960bd52fa4cd9457a4e306905cc219501d0761c973f11cbf` / `d5b1b0e9cf8b855a7cc62026edeb13b73e26ed258f9b05b4029debace0cfd2d4` / `7ab9b533d41e3fcd6e73c0665cbc0f11ae412b417b2b90ed83198957e5562dde` / `7f0a789d485fc0407fbb9d8a321a647c8c73ae2fba79e89d3c1556f253d4c713` |
+| L / A / C matrix events | `371dec09ba42053cf6516ec82e9faf51b3509eee47c6ce772b075057e10216bb` / `439b46169af6f126568f23f20726705bc2482193500ad93cf76a7c5e43f16ff7` / `135c4fc75788869881bf67707bdcfeecad944cd9290d0fe224b56098a47fd11f` |
+| gate audit JSON / Markdown | `7bdeb256372f62f5cd8fdca10a1b91d2a7877c9546ce0f0e30f26b90f5fc7548` / `dfa916eceea3c4c59a6194e127299bfb49bfeb6b231233842ea6b3aae38b5dee` |
+
+聚合审计复算命令（输出不含 prompt）：
+
+```bash
+RUN="$MSCRATCH/sharegpt_current_turn_local_78da644_20260716"
+python3 tools/analyze_ttft_current_turn_gate.py \
+  --l-dir "$RUN/stage_L_all_local" \
+  --a-dir "$RUN/stage_A_old_v2" \
+  --c-dir "$RUN/stage_C_current" \
+  --expected-n 11604 \
+  --expected-trace-sha256 e838016a8e55660c565dadb1ad019770f6b88f878d8ca29f165c30887d2cb410 \
+  --expected-trace-manifest-sha256 698bb94a82d133b0c54aa87d8badd4f181140c352cb29c1e726cfe2b291bf9a8 \
+  --expected-profile-sha256 bb35dcc01fd661e8b9a1b428cdcd898dbed2f84f041a30bd30c444098d81e4cb \
+  --min-cooldown-s 20 \
+  --json-out "$RUN/e12_current_turn_local_gate.audit.json" \
+  --markdown-out "$RUN/e12_current_turn_local_gate.audit.md"
+```
+
+Audit JSON 不含 prompt 或 request-level victim IDs。三个 stage 的 applied victims 与
+NullCloud rows 完全一致，marker/fingerprint 通过。第三方 POST=0、实际云费用 `$0`；
+所有 PID、port 8010 和 GPU 占用已清理。原文 trace 与大体积 outcome 仍只在受限 scratch，
+没有复制进 repo 或通用镜像。
 
 ---
 
@@ -1259,6 +1372,7 @@ python3 tools/analyze_ttft_violation_context.py \
 | `tools/analyze_ttft_repeatability.py` | 审计六 block / 24 arms 重复实验 |
 | `tools/analyze_ttft_full_cell.py` | 验证五 marker 并计算冻结 gates |
 | `tools/analyze_ttft_violation_context.py` | 诊断 B 的 39 个 TTFT 违约上下文 |
+| `tools/analyze_ttft_current_turn_gate.py` | 重算 E12 三阶段 fingerprint，绑定 raw/summary/decision/marker/events，校验顺序/cooldown 并输出 text-free audit |
 | `experiments/run_ttft_selector_matrix.sh` | 运行 server/trace/profile-bound matrix |
 
 ### 关键证据目录约定
@@ -1273,7 +1387,9 @@ python3 tools/analyze_ttft_violation_context.py \
 - `$MSCRATCH/router_realcloud_full_2b53ff3_20260716T1435Z/`：E11 pre-arm
   profile、server lifecycle 与 blocked-launch zero-usage audit；没有 A/C raw rows。
 - `$MSCRATCH/sharegpt_current_turn_6054b32_20260716/`：E12 受限原文 trace 与
-  text-free manifest；尚无 L/A/C 结果，不做通用镜像。
+  text-free manifest，不做通用镜像。
+- `$MSCRATCH/sharegpt_current_turn_local_78da644_20260716/`：E12 完整 no-export
+  profile、L/A/C raw/decision/summary/marker 与 text-free gate audit；0 external POST。
 
 完整 SHA、运行命令和 server 注意事项见
 [`v3_experiments_2026-07.md`](v3_experiments_2026-07.md) 第 5g、8、9 节。
