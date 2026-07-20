@@ -66,7 +66,170 @@ CLOUD_URL=${CLOUD_URL:-}
 CLOUD_MODEL=${CLOUD_MODEL:-}
 CLOUD_API_KEY_ENV=${CLOUD_API_KEY_ENV:-}
 CLOUD_PROVIDER=${CLOUD_PROVIDER:-}
+REAL_CLOUD_EXPECT_N_WAS_SET=${REAL_CLOUD_EXPECT_N+x}
 REAL_CLOUD_EXPECT_N=${REAL_CLOUD_EXPECT_N:-11605}
+
+# E11 remains the default real-cloud contract.  E12 is deliberately opt-in and
+# stage-scoped: setting any E12 contract variable requires the complete
+# contract, and one invocation can run only its exact A or C arm.  The frozen
+# values are environment-visible so an operator can state them explicitly,
+# but cannot silently change them and still call the run E12.
+E12_LIVE_CONTRACT_ID_WAS_SET=${E12_LIVE_CONTRACT_ID+x}
+E12_LIVE_STAGE_WAS_SET=${E12_LIVE_STAGE+x}
+E12_LIVE_EXPECT_N_WAS_SET=${E12_LIVE_EXPECT_N+x}
+E12_LIVE_ARM_ORDER_SEED_WAS_SET=${E12_LIVE_ARM_ORDER_SEED+x}
+E12_LIVE_AUTHORIZED_BUDGET_USD_WAS_SET=${E12_LIVE_AUTHORIZED_BUDGET_USD+x}
+E12_LIVE_BUDGET_ATTESTATION_SHA256_WAS_SET=${E12_LIVE_BUDGET_ATTESTATION_SHA256+x}
+E12_LIVE_KEY_LIMIT_MAX_USD_WAS_SET=${E12_LIVE_KEY_LIMIT_MAX_USD+x}
+E12_LIVE_STAGE_LAUNCH_ATTESTATION_WAS_SET=${E12_LIVE_STAGE_LAUNCH_ATTESTATION+x}
+E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256_WAS_SET=${E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256+x}
+E12_LIVE_PRICE_SNAPSHOT_WAS_SET=${E12_LIVE_PRICE_SNAPSHOT+x}
+E12_LIVE_BUDGET_ATTESTATION_WAS_SET=${E12_LIVE_BUDGET_ATTESTATION+x}
+E12_LIVE_CANARY_ATTESTATION_WAS_SET=${E12_LIVE_CANARY_ATTESTATION+x}
+E12_LIVE_BASELINE_USAGE_WAS_SET=${E12_LIVE_BASELINE_USAGE+x}
+E12_LIVE_SETTLEMENT_PREVIOUS_USAGE_WAS_SET=${E12_LIVE_SETTLEMENT_PREVIOUS_USAGE+x}
+E12_LIVE_SETTLEMENT_CURRENT_USAGE_WAS_SET=${E12_LIVE_SETTLEMENT_CURRENT_USAGE+x}
+E12_LIVE_STAGE_BUDGET_GATE_WAS_SET=${E12_LIVE_STAGE_BUDGET_GATE+x}
+E12_LIVE_A_DIR_WAS_SET=${E12_LIVE_A_DIR+x}
+E12_LIVE_A_STAGE_LAUNCH_ATTESTATION_WAS_SET=${E12_LIVE_A_STAGE_LAUNCH_ATTESTATION+x}
+E12_LIVE_CONTRACT_ID=${E12_LIVE_CONTRACT_ID:-}
+E12_LIVE_STAGE=${E12_LIVE_STAGE:-}
+E12_LIVE_EXPECT_N=${E12_LIVE_EXPECT_N:-11604}
+E12_LIVE_ARM_ORDER_SEED=${E12_LIVE_ARM_ORDER_SEED:-20260716}
+E12_LIVE_AUTHORIZED_BUDGET_USD=${E12_LIVE_AUTHORIZED_BUDGET_USD:-}
+E12_LIVE_BUDGET_ATTESTATION_SHA256=${E12_LIVE_BUDGET_ATTESTATION_SHA256:-}
+E12_LIVE_KEY_LIMIT_MAX_USD=${E12_LIVE_KEY_LIMIT_MAX_USD:-}
+E12_LIVE_STAGE_LAUNCH_ATTESTATION=${E12_LIVE_STAGE_LAUNCH_ATTESTATION:-}
+E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256=${E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256:-}
+E12_LIVE_PRICE_SNAPSHOT=${E12_LIVE_PRICE_SNAPSHOT:-}
+E12_LIVE_BUDGET_ATTESTATION=${E12_LIVE_BUDGET_ATTESTATION:-}
+E12_LIVE_CANARY_ATTESTATION=${E12_LIVE_CANARY_ATTESTATION:-}
+E12_LIVE_BASELINE_USAGE=${E12_LIVE_BASELINE_USAGE:-}
+E12_LIVE_SETTLEMENT_PREVIOUS_USAGE=${E12_LIVE_SETTLEMENT_PREVIOUS_USAGE:-}
+E12_LIVE_SETTLEMENT_CURRENT_USAGE=${E12_LIVE_SETTLEMENT_CURRENT_USAGE:-}
+E12_LIVE_STAGE_BUDGET_GATE=${E12_LIVE_STAGE_BUDGET_GATE:-}
+E12_LIVE_A_DIR=${E12_LIVE_A_DIR:-}
+E12_LIVE_A_STAGE_LAUNCH_ATTESTATION=${E12_LIVE_A_STAGE_LAUNCH_ATTESTATION:-}
+E12_LIVE_CONTRACT=e12_current_turn_v1
+E12_LIVE_COOLDOWN_S=20
+E12_LIVE_ACTIVE=0
+if [[ -n "$E12_LIVE_CONTRACT_ID_WAS_SET" || \
+      -n "$E12_LIVE_STAGE_WAS_SET" || \
+      -n "$E12_LIVE_EXPECT_N_WAS_SET" || \
+      -n "$E12_LIVE_ARM_ORDER_SEED_WAS_SET" || \
+      -n "$E12_LIVE_AUTHORIZED_BUDGET_USD_WAS_SET" || \
+      -n "$E12_LIVE_BUDGET_ATTESTATION_SHA256_WAS_SET" || \
+      -n "$E12_LIVE_KEY_LIMIT_MAX_USD_WAS_SET" || \
+      -n "$E12_LIVE_STAGE_LAUNCH_ATTESTATION_WAS_SET" || \
+      -n "$E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256_WAS_SET" || \
+      -n "$E12_LIVE_PRICE_SNAPSHOT_WAS_SET" || \
+      -n "$E12_LIVE_BUDGET_ATTESTATION_WAS_SET" || \
+      -n "$E12_LIVE_CANARY_ATTESTATION_WAS_SET" || \
+      -n "$E12_LIVE_BASELINE_USAGE_WAS_SET" || \
+      -n "$E12_LIVE_SETTLEMENT_PREVIOUS_USAGE_WAS_SET" || \
+      -n "$E12_LIVE_SETTLEMENT_CURRENT_USAGE_WAS_SET" || \
+      -n "$E12_LIVE_STAGE_BUDGET_GATE_WAS_SET" || \
+      -n "$E12_LIVE_A_DIR_WAS_SET" || \
+      -n "$E12_LIVE_A_STAGE_LAUNCH_ATTESTATION_WAS_SET" ]]; then
+  E12_LIVE_ACTIVE=1
+  if [[ -z "$E12_LIVE_CONTRACT_ID_WAS_SET" || \
+        -z "$E12_LIVE_STAGE_WAS_SET" || \
+        -z "$E12_LIVE_AUTHORIZED_BUDGET_USD_WAS_SET" || \
+        -z "$E12_LIVE_BUDGET_ATTESTATION_SHA256_WAS_SET" || \
+        -z "$E12_LIVE_KEY_LIMIT_MAX_USD_WAS_SET" || \
+        -z "$E12_LIVE_STAGE_LAUNCH_ATTESTATION_WAS_SET" || \
+        -z "$E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256_WAS_SET" || \
+        -z "$E12_LIVE_PRICE_SNAPSHOT_WAS_SET" || \
+        -z "$E12_LIVE_BUDGET_ATTESTATION_WAS_SET" || \
+        -z "$E12_LIVE_CANARY_ATTESTATION_WAS_SET" || \
+        -z "$E12_LIVE_BASELINE_USAGE_WAS_SET" || \
+        -z "$E12_LIVE_SETTLEMENT_PREVIOUS_USAGE_WAS_SET" || \
+        -z "$E12_LIVE_SETTLEMENT_CURRENT_USAGE_WAS_SET" || \
+        -z "$E12_LIVE_STAGE_BUDGET_GATE_WAS_SET" || \
+        -z "$E12_LIVE_CONTRACT_ID" || -z "$E12_LIVE_STAGE" || \
+        -z "$E12_LIVE_BUDGET_ATTESTATION_SHA256" || \
+        -z "$E12_LIVE_STAGE_LAUNCH_ATTESTATION" || \
+        -z "$E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256" || \
+        -z "$E12_LIVE_PRICE_SNAPSHOT" || \
+        -z "$E12_LIVE_BUDGET_ATTESTATION" || \
+        -z "$E12_LIVE_CANARY_ATTESTATION" || \
+        -z "$E12_LIVE_BASELINE_USAGE" || \
+        -z "$E12_LIVE_SETTLEMENT_PREVIOUS_USAGE" || \
+        -z "$E12_LIVE_SETTLEMENT_CURRENT_USAGE" || \
+        -z "$E12_LIVE_STAGE_BUDGET_GATE" ]]; then
+    printf 'E12 live requires explicit contract, budget, and stage-launch attestations\n' >&2
+    exit 4
+  fi
+  if [[ "$CLOUD" != real ]]; then
+    printf 'E12 live contract is valid only with CLOUD=real\n' >&2
+    exit 4
+  fi
+  if [[ ! "$E12_LIVE_CONTRACT_ID" =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
+    printf 'E12_LIVE_CONTRACT_ID must be a safe one-line identifier\n' >&2
+    exit 4
+  fi
+  if [[ "$E12_LIVE_EXPECT_N" != 11604 ]]; then
+    printf 'E12 live freezes E12_LIVE_EXPECT_N=11604\n' >&2
+    exit 4
+  fi
+  if [[ "$E12_LIVE_ARM_ORDER_SEED" != 20260716 ]]; then
+    printf 'E12 live freezes E12_LIVE_ARM_ORDER_SEED=20260716\n' >&2
+    exit 4
+  fi
+  if [[ "$E12_LIVE_AUTHORIZED_BUDGET_USD" != 3 ]]; then
+    printf 'E12 live freezes E12_LIVE_AUTHORIZED_BUDGET_USD=3\n' >&2
+    exit 4
+  fi
+  if [[ ! "$E12_LIVE_BUDGET_ATTESTATION_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    printf 'E12_LIVE_BUDGET_ATTESTATION_SHA256 must be exactly 64 lowercase hex characters\n' >&2
+    exit 4
+  fi
+  if [[ "$E12_LIVE_KEY_LIMIT_MAX_USD" != 3 ]]; then
+    printf 'E12 live freezes E12_LIVE_KEY_LIMIT_MAX_USD=3\n' >&2
+    exit 4
+  fi
+  if [[ ! "$E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    printf 'E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256 must be exactly 64 lowercase hex characters\n' >&2
+    exit 4
+  fi
+  case "$E12_LIVE_STAGE" in
+    A)
+      E12_LIVE_EXACT_ARM=ttft_pred:cost_cachedisp_old:0
+      if [[ -n "$E12_LIVE_A_DIR_WAS_SET" || \
+            -n "$E12_LIVE_A_STAGE_LAUNCH_ATTESTATION_WAS_SET" ]]; then
+        printf 'E12 stage A must not accept prior-A evidence paths\n' >&2
+        exit 4
+      fi
+      ;;
+    C)
+      E12_LIVE_EXACT_ARM=ttft_pred:cost_disp_current:0
+      if [[ -z "$E12_LIVE_A_DIR_WAS_SET" || \
+            -z "$E12_LIVE_A_STAGE_LAUNCH_ATTESTATION_WAS_SET" || \
+            -z "$E12_LIVE_A_DIR" || \
+            -z "$E12_LIVE_A_STAGE_LAUNCH_ATTESTATION" ]]; then
+        printf 'E12 stage C requires completed stage-A directory and launch attestation\n' >&2
+        exit 4
+      fi
+      ;;
+    *)
+      printf 'E12_LIVE_STAGE must be exactly A or C (got %s)\n' \
+        "$E12_LIVE_STAGE" >&2
+      exit 4
+      ;;
+  esac
+  if [[ -n "$REAL_CLOUD_EXPECT_N_WAS_SET" && \
+        "$REAL_CLOUD_EXPECT_N" != "$E12_LIVE_EXPECT_N" ]]; then
+    printf 'REAL_CLOUD_EXPECT_N conflicts with frozen E12 expected n=11604\n' >&2
+    exit 4
+  fi
+  REAL_CLOUD_EXPECT_N=$E12_LIVE_EXPECT_N
+fi
+
+if [[ "$E12_LIVE_ACTIVE" == 0 && "$CLOUD" == real && \
+      "$REAL_CLOUD_EXPECT_N" == 11604 ]]; then
+  printf 'REAL_CLOUD_EXPECT_N=11604 is reserved for the explicit E12 live contract\n' >&2
+  exit 4
+fi
 
 for bit_name in IGNORE_EOS LOCAL_IGNORE_EOS CLOUD_IGNORE_EOS \
   CLOUD_NO_FALLBACKS CLOUD_STOP_AFTER_FIRST_TOKEN; do
@@ -109,7 +272,17 @@ if [[ "$CLOUD" == real ]]; then
         "$CLOUD_PROVIDER" != deepinfra || \
         "$CLOUD_MAX_CONCURRENCY" != 16 || \
         "$ARM_ORDER_SEED" != 20260716 ]]; then
-    printf 'real-cloud E11 freezes OpenRouter/qwen3-32b/deepinfra, concurrency=16, arm-order-seed=20260716\n' >&2
+    printf 'real-cloud freezes OpenRouter/qwen3-32b/deepinfra, concurrency=16, arm-order-seed=20260716\n' >&2
+    exit 4
+  fi
+  if [[ "$E12_LIVE_ACTIVE" == 1 ]] && \
+      { [[ "$IN_PRICE" != 0.08 ]] || [[ "$OUT_PRICE" != 0.28 ]] || \
+        [[ "$SLO_S" != 5 ]] || [[ "$TIMEOUT_S" != 600 ]] || \
+        [[ "$NIMBUS_TICK_MS" != 250 ]] || [[ "$COOLDOWN_S" != 20 ]] || \
+        [[ "$MAX_INFLIGHT" != 128 ]] || [[ "$TEMPERATURE" != 0 ]] || \
+        [[ "$IGNORE_EOS" != 1 ]] || \
+        [[ "$CLOUD_API_KEY_ENV" != OPENROUTER_API_KEY ]]; }; then
+    printf 'E12 live freezes prices=0.08/0.28, SLO=5, timeout=600, tick=250, cooldown=20, max-inflight=128, temperature=0, ignore-eos=1, and secret env name OPENROUTER_API_KEY\n' >&2
     exit 4
   fi
 elif [[ "$CLOUD" != null ]]; then
@@ -293,6 +466,7 @@ fields = [
     sha(manifest_path),
     str(line_n),
     str(manifest.get("scenario")),
+    str(manifest.get("payload_mode")),
     profile_sha,
     str(profile_kv),
     repr(prefill),
@@ -307,13 +481,19 @@ fields = [
 print("\t".join(fields))
 PY
 )"
-IFS=$'\t' read -r TRACE_SHA TRACE_MANIFEST_SHA TRACE_N TRACE_SCENARIO PROFILE_SHA KV_CAP \
+IFS=$'\t' read -r TRACE_SHA TRACE_MANIFEST_SHA TRACE_N TRACE_SCENARIO TRACE_PAYLOAD_MODE PROFILE_SHA KV_CAP \
   PREFILL_TPUT TPOT_MS FIRST_TOKEN_OVERHEAD_MS TTFT_GUARD_MS \
   SERVER_LOG_PREFIX_SHA SERVER_LOG_SHA \
   ENDPOINT_VERSION_SHA ENDPOINT_MODELS_IDENTITY_SHA <<< "$PREFLIGHT"
 if [[ "$CLOUD" == real && "$TRACE_N" != "$REAL_CLOUD_EXPECT_N" ]]; then
   printf 'real-cloud trace_n=%s, expected %s (set REAL_CLOUD_EXPECT_N intentionally to override)\n' \
     "$TRACE_N" "$REAL_CLOUD_EXPECT_N" >&2
+  exit 4
+fi
+if [[ "$E12_LIVE_ACTIVE" == 0 ]] && \
+    { [[ "$TRACE_SHA" == e838016a8e55660c565dadb1ad019770f6b88f878d8ca29f165c30887d2cb410 ]] || \
+      [[ "$TRACE_PAYLOAD_MODE" == sharegpt_current_turn_retokenized ]]; }; then
+  printf 'the E12 current-turn trace/payload requires the explicit E12 live contract\n' >&2
   exit 4
 fi
 SCENARIO=${SCENARIO:-$TRACE_SCENARIO}
@@ -336,7 +516,16 @@ then
 fi
 
 mkdir -p "$OUT_DIR"
-if (( $# == 0 )); then
+if [[ "$E12_LIVE_ACTIVE" == 1 ]]; then
+  if (( $# == 0 )); then
+    set -- "$E12_LIVE_EXACT_ARM"
+  elif (( $# != 1 )) || [[ "$1" != "$E12_LIVE_EXACT_ARM" ]]; then
+    printf 'E12 live stage %s requires the single exact arm %s\n' \
+      "$E12_LIVE_STAGE" "$E12_LIVE_EXACT_ARM" >&2
+    exit 4
+  fi
+  ARM_ORDER_MODE=e12_contract_stage
+elif (( $# == 0 )); then
   if [[ "$CLOUD" == real ]]; then
     # Full real-cloud default is the frozen A/C comparison only.  Accidentally
     # running every exploratory selector would spend credits and confound the
@@ -381,7 +570,13 @@ fi
 for arm in "$@"; do
   "$PYBIN" -m tools.ttft_matrix_evidence describe-arm "$arm" >/dev/null
 done
-if [[ "$CLOUD" == real ]]; then
+if [[ "$E12_LIVE_ACTIVE" == 1 ]]; then
+  if (( $# != 1 )) || [[ "$1" != "$E12_LIVE_EXACT_ARM" ]]; then
+    printf 'E12 live stage %s requires the single exact arm %s\n' \
+      "$E12_LIVE_STAGE" "$E12_LIVE_EXACT_ARM" >&2
+    exit 4
+  fi
+elif [[ "$CLOUD" == real ]]; then
   if (( $# != 2 )) \
       || [[ "$1" != ttft_pred:cost_cachedisp_old:0 ]] \
       || [[ "$2" != ttft_pred:cost_disp_current:0 ]]; then
@@ -391,6 +586,100 @@ if [[ "$CLOUD" == real ]]; then
 fi
 
 COMMIT=$(git rev-parse HEAD)
+if [[ "$E12_LIVE_ACTIVE" == 1 ]]; then
+  if [[ ! -f "$E12_LIVE_STAGE_LAUNCH_ATTESTATION" ]]; then
+    printf 'E12 stage-launch attestation is not a regular file\n' >&2
+    exit 4
+  fi
+  E12_LIVE_CURRENT_USAGE_ARTIFACT="$OUT_DIR/e12_live_current_usage.json"
+  E12_LIVE_VERIFY_RECEIPT_ARTIFACT="$OUT_DIR/e12_stage_launch_verify_receipt.json"
+  if [[ -e "$E12_LIVE_CURRENT_USAGE_ARTIFACT" || \
+        -e "$E12_LIVE_VERIFY_RECEIPT_ARTIFACT" ]]; then
+    printf 'E12 launch usage/receipt artifact already exists; refusing overwrite\n' >&2
+    exit 4
+  fi
+  (
+    umask 077
+    "$PYBIN" -m tools.openrouter_usage_snapshot \
+      --api-key-env "$CLOUD_API_KEY_ENV" \
+      --output "$E12_LIVE_CURRENT_USAGE_ARTIFACT" \
+      --no-overwrite
+  )
+  chmod 600 "$E12_LIVE_CURRENT_USAGE_ARTIFACT"
+  E12_LIVE_VERIFY_A_ARGS=()
+  if [[ "$E12_LIVE_STAGE" == C ]]; then
+    E12_LIVE_VERIFY_A_ARGS=(
+      --a-dir "$E12_LIVE_A_DIR"
+      --a-launch-attestation "$E12_LIVE_A_STAGE_LAUNCH_ATTESTATION"
+    )
+  fi
+  "$PYBIN" -m tools.check_e12_stage_launch verify \
+    --attestation "$E12_LIVE_STAGE_LAUNCH_ATTESTATION" \
+    --expected-sha256 "$E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256" \
+    --stage "$E12_LIVE_STAGE" \
+    --contract-id "$E12_LIVE_CONTRACT_ID" \
+    --trace-manifest-sha256 "$TRACE_MANIFEST_SHA" \
+    --profile-sha256 "$PROFILE_SHA" \
+    --budget-attestation-sha256 "$E12_LIVE_BUDGET_ATTESTATION_SHA256" \
+    --trace-manifest "$DATA_MANIFEST" \
+    --profile "$PROFILE" \
+    --price-snapshot "$E12_LIVE_PRICE_SNAPSHOT" \
+    --budget-attestation "$E12_LIVE_BUDGET_ATTESTATION" \
+    --canary "$E12_LIVE_CANARY_ATTESTATION" \
+    --baseline-usage "$E12_LIVE_BASELINE_USAGE" \
+    --settlement-previous "$E12_LIVE_SETTLEMENT_PREVIOUS_USAGE" \
+    --settlement-current "$E12_LIVE_SETTLEMENT_CURRENT_USAGE" \
+    --stage-budget-gate "$E12_LIVE_STAGE_BUDGET_GATE" \
+    --commit "$COMMIT" \
+    --server-pid "$SERVER_PID" \
+    --server-log-prefix-sha256 "$SERVER_LOG_PREFIX_SHA" \
+    --endpoint-version-sha256 "$ENDPOINT_VERSION_SHA" \
+    --endpoint-models-identity-sha256 "$ENDPOINT_MODELS_IDENTITY_SHA" \
+    --base-url "$BASE_URL" \
+    --chat-url "$CHAT_URL" \
+    --model "$MODEL" \
+    "${E12_LIVE_VERIFY_A_ARGS[@]}" \
+    --live-current-usage "$E12_LIVE_CURRENT_USAGE_ARTIFACT" \
+    --output "$E12_LIVE_VERIFY_RECEIPT_ARTIFACT"
+  chmod 600 "$E12_LIVE_VERIFY_RECEIPT_ARTIFACT"
+  E12_LIVE_ARTIFACT_HASHES="$($PYBIN - \
+    "$E12_LIVE_CURRENT_USAGE_ARTIFACT" \
+    "$E12_LIVE_VERIFY_RECEIPT_ARTIFACT" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+print(" ".join(
+    hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+    for path in sys.argv[1:]
+))
+PY
+)"
+  read -r E12_LIVE_CURRENT_USAGE_SHA256 \
+    E12_LIVE_VERIFY_RECEIPT_SHA256 <<< "$E12_LIVE_ARTIFACT_HASHES"
+fi
+LIVE_FINGERPRINT_ARGS=()
+E12_LIVE_MANIFEST_LINE=
+if [[ "$E12_LIVE_ACTIVE" == 1 ]]; then
+  LIVE_FINGERPRINT_ARGS=(
+    "$E12_LIVE_CONTRACT_ID"
+    "$E12_LIVE_CONTRACT"
+    "$E12_LIVE_STAGE"
+    "$E12_LIVE_EXPECT_N"
+    "$E12_LIVE_ARM_ORDER_SEED"
+    "$E12_LIVE_EXACT_ARM"
+    "$E12_LIVE_AUTHORIZED_BUDGET_USD"
+    "$E12_LIVE_BUDGET_ATTESTATION_SHA256"
+    "$E12_LIVE_KEY_LIMIT_MAX_USD"
+    "$E12_LIVE_COOLDOWN_S"
+    "$E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256"
+    "$E12_LIVE_CURRENT_USAGE_SHA256"
+    "$E12_LIVE_VERIFY_RECEIPT_SHA256"
+  )
+  printf -v E12_LIVE_MANIFEST_LINE \
+    'live_contract_id=%s live_contract=%s live_stage=%s live_expected_trace_n=%s live_arm_order_seed=%s live_exact_arm=%s live_authorized_budget_usd=%s live_budget_attestation_sha256=%s live_key_limit_max_usd=%s live_cooldown_s=%s live_stage_launch_attestation_sha256=%s live_current_usage_sha256=%s live_stage_launch_verify_receipt_sha256=%s' \
+    "${LIVE_FINGERPRINT_ARGS[@]}"
+fi
 RUN_FINGERPRINT="$($PYBIN - "$TRACE_SHA" "$TRACE_MANIFEST_SHA" "$PROFILE_SHA" \
   "$SERVER_LOG_PREFIX_SHA" "$SERVER_PID" "$ENDPOINT_VERSION_SHA" \
   "$ENDPOINT_MODELS_IDENTITY_SHA" "$BASE_URL" "$CHAT_URL" "$COMMIT" "$SCENARIO" \
@@ -402,7 +691,8 @@ RUN_FINGERPRINT="$($PYBIN - "$TRACE_SHA" "$TRACE_MANIFEST_SHA" "$PROFILE_SHA" \
   "$CLOUD_API_KEY_ENV" "$CLOUD_MAX_CONCURRENCY" "$CLOUD_PROVIDER" \
   "$CLOUD_NO_FALLBACKS" "$CLOUD_STOP_AFTER_FIRST_TOKEN" \
   "$LOCAL_IGNORE_EOS" "$CLOUD_IGNORE_EOS" "$REAL_CLOUD_EXPECT_N" \
-  "$ARM_ORDER_MODE" "$ARM_ORDER_SEED" "$@" <<'PY'
+  "$ARM_ORDER_MODE" "$ARM_ORDER_SEED" "$@" \
+  "${LIVE_FINGERPRINT_ARGS[@]}" <<'PY'
 import hashlib
 import json
 import sys
@@ -416,6 +706,11 @@ EVENTS="$OUT_DIR/matrix_events.log"
 if [[ -e "$MANIFEST" ]]; then
   if ! grep -qx "run_fingerprint=$RUN_FINGERPRINT" "$MANIFEST"; then
     printf 'OUT_DIR contains a matrix manifest for different inputs/config\n' >&2
+    exit 3
+  fi
+  if [[ "$E12_LIVE_ACTIVE" == 1 ]] && \
+      ! grep -Fqx "$E12_LIVE_MANIFEST_LINE" "$MANIFEST"; then
+    printf 'OUT_DIR matrix manifest lacks the exact E12 live contract\n' >&2
     exit 3
   fi
 else
@@ -451,6 +746,9 @@ else
       "$CLOUD_NO_FALLBACKS" "$CLOUD_STOP_AFTER_FIRST_TOKEN"
     printf 'real_cloud_expected_trace_n=%s secret_value_recorded=false\n' \
       "$REAL_CLOUD_EXPECT_N"
+    if [[ "$E12_LIVE_ACTIVE" == 1 ]]; then
+      printf '%s\n' "$E12_LIVE_MANIFEST_LINE"
+    fi
     printf 'arm_order_mode=%s arm_order_seed=%s\n' \
       "$ARM_ORDER_MODE" "$ARM_ORDER_SEED"
     printf 'arms='
@@ -460,6 +758,97 @@ else
   } > "$manifest_tmp"
   mv "$manifest_tmp" "$MANIFEST"
 fi
+
+# A real endpoint can return a complete result file while every request was
+# rejected by authentication, billing, permission, or a shared bad request
+# configuration.  router.run stops early on the deterministic online subset;
+# this persisted gate also catches complete but unusable arms (for example,
+# zero successful cloud TTFTs) before a completion marker can authorize a later
+# stage.  Re-checking persisted markers closes the same gate on resume; the
+# post-marker check also prevents a marker from being treated as permission to
+# continue if raw evidence changes at that boundary.
+check_systemic_cloud_errors() {
+  local raw_path=$1
+  local arm_name=$2
+  local checkpoint=$3
+  "$PYBIN" - "$raw_path" "$arm_name" "$checkpoint" <<'PY_SYSTEMIC_CLOUD_CHECK'
+import collections
+import json
+import sys
+
+raw_path, arm, checkpoint = sys.argv[1:]
+cloud_rows = []
+try:
+    with open(raw_path, encoding="utf-8") as source:
+        for line_number, line in enumerate(source, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                raise ValueError(
+                    f"raw line {line_number} is not valid JSON: {exc}"
+                ) from exc
+            if not isinstance(row, dict):
+                raise ValueError(f"raw line {line_number} is not an object")
+            if row.get("endpoint") == "cloud":
+                cloud_rows.append(row)
+except (OSError, ValueError) as exc:
+    print(
+        f"cloud status gate failed at {checkpoint} for {arm}: {exc}",
+        file=sys.stderr,
+    )
+    raise SystemExit(5) from None
+
+status_counts = collections.Counter()
+cloud_success_n = 0
+non429_http_failure_n = 0
+for row in cloud_rows:
+    status = row.get("http_status")
+    if isinstance(status, int) and not isinstance(status, bool):
+        status_counts[status] += 1
+        success = row.get("success") is True and 200 <= status < 300
+        cloud_success_n += int(success)
+        if not success and status != 429:
+            non429_http_failure_n += 1
+
+immediate_statuses = (401, 402, 403, 404, 405, 422)
+cloud_n = len(cloud_rows)
+# A complete arm with no successful cloud TTFT is not usable evidence, even
+# when its failures (including 429s) remain valid measured rows.  With at least
+# one success, isolated HTTP failures remain measured.  Reject only an
+# immediate fixed-endpoint/config status, a >=80% 400 pattern after 3 rows, or
+# a >=80% non-429 HTTP-failure pattern after 10 rows.  Transport failures with
+# no HTTP status do not count toward the dominant-HTTP threshold.
+hard_stop = (
+    any(status_counts[status] for status in immediate_statuses)
+    or any(
+        count for status, count in status_counts.items()
+        if 300 <= status < 400
+    )
+)
+zero_success = cloud_n > 0 and cloud_success_n == 0
+dominant_400 = (
+    cloud_n >= 3 and status_counts[400] * 5 >= cloud_n * 4
+)
+dominant_non429_http = (
+    cloud_n >= 10 and non429_http_failure_n * 5 >= cloud_n * 4
+)
+if hard_stop or zero_success or dominant_400 or dominant_non429_http:
+    rendered = ",".join(
+        f"{status}:{status_counts[status]}"
+        for status in sorted(status_counts)
+    )
+    print(
+        "systemic cloud authentication/configuration/transport failure "
+        f"at {checkpoint} for {arm}: cloud_n={cloud_n} "
+        f"cloud_success_n={cloud_success_n} "
+        f"non429_http_failure_n={non429_http_failure_n} statuses={rendered}",
+        file=sys.stderr,
+    )
+    raise SystemExit(5)
+PY_SYSTEMIC_CLOUD_CHECK
+}
 
 for arm in "$@"; do
   read -r _arm_kind _policy trigger selector seed < <(
@@ -500,6 +889,9 @@ for arm in "$@"; do
   fi
   if [[ -e "$marker" ]]; then
     "${evidence_cmd[@]}"
+    if [[ "$CLOUD" == real ]]; then
+      check_systemic_cloud_errors "$raw" "$arm" resume_marker
+    fi
     printf 'skip completed arm: %s\n' "$arm"
     continue
   fi
@@ -514,7 +906,8 @@ for arm in "$@"; do
   done < <("$PYBIN" -m tools.ttft_matrix_evidence policy-cli "$arm")
   cmd=(
     "$PYBIN" -m router.run
-    --data "$DATA" --scenario "$SCENARIO" "${policy_args[@]}"
+    --data "$DATA" --expected-trace-sha256 "$TRACE_SHA"
+    --scenario "$SCENARIO" "${policy_args[@]}"
     --local-url "$CHAT_URL" --local-model "$MODEL" --max-inflight "$MAX_INFLIGHT"
     --seed "$seed"
     --kv-capacity-tokens "$KV_CAP"
@@ -551,16 +944,62 @@ for arm in "$@"; do
     )
   fi
   {
-    printf 'arm_started_at=%s arm=%s command=' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$arm"
-    printf '%q ' "${cmd[@]}"
-    printf '\n'
+    if [[ "$E12_LIVE_ACTIVE" == 1 ]]; then
+      printf 'arm_started_at=%s arm=%s live_contract_id=%s live_stage=%s live_authorized_budget_usd=%s live_budget_attestation_sha256=%s live_key_limit_max_usd=%s live_cooldown_s=%s live_stage_launch_attestation_sha256=%s live_current_usage_sha256=%s live_stage_launch_verify_receipt_sha256=%s command=router.run_config_bound_by_fingerprint\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$arm" \
+        "$E12_LIVE_CONTRACT_ID" "$E12_LIVE_STAGE" \
+        "$E12_LIVE_AUTHORIZED_BUDGET_USD" \
+        "$E12_LIVE_BUDGET_ATTESTATION_SHA256" \
+        "$E12_LIVE_KEY_LIMIT_MAX_USD" \
+        "$E12_LIVE_COOLDOWN_S" \
+        "$E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256" \
+        "$E12_LIVE_CURRENT_USAGE_SHA256" \
+        "$E12_LIVE_VERIFY_RECEIPT_SHA256"
+    else
+      printf 'arm_started_at=%s arm=%s command=' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$arm"
+      printf '%q ' "${cmd[@]}"
+      printf '\n'
+    fi
   } >> "$EVENTS"
   "${cmd[@]}"
+  if [[ "$CLOUD" == real ]]; then
+    check_systemic_cloud_errors "$raw" "$arm" pre_marker
+  fi
   "${evidence_cmd[@]}" --write-marker
-  printf 'arm_finished_at=%s arm=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$arm" \
-    >> "$EVENTS"
+  if [[ "$CLOUD" == real ]]; then
+    check_systemic_cloud_errors "$raw" "$arm" post_marker
+  fi
+  if [[ "$E12_LIVE_ACTIVE" == 1 ]]; then
+    printf 'arm_finished_at=%s arm=%s live_contract_id=%s live_stage=%s live_authorized_budget_usd=%s live_budget_attestation_sha256=%s live_key_limit_max_usd=%s live_cooldown_s=%s live_stage_launch_attestation_sha256=%s live_current_usage_sha256=%s live_stage_launch_verify_receipt_sha256=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$arm" \
+      "$E12_LIVE_CONTRACT_ID" "$E12_LIVE_STAGE" \
+      "$E12_LIVE_AUTHORIZED_BUDGET_USD" \
+      "$E12_LIVE_BUDGET_ATTESTATION_SHA256" \
+      "$E12_LIVE_KEY_LIMIT_MAX_USD" \
+      "$E12_LIVE_COOLDOWN_S" \
+      "$E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256" \
+      "$E12_LIVE_CURRENT_USAGE_SHA256" \
+      "$E12_LIVE_VERIFY_RECEIPT_SHA256" >> "$EVENTS"
+  else
+    printf 'arm_finished_at=%s arm=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$arm" >> "$EVENTS"
+  fi
   sleep "$COOLDOWN_S"
 done
 
-printf 'matrix_finished_at=%s run_fingerprint=%s\n' \
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RUN_FINGERPRINT" >> "$EVENTS"
+if [[ "$E12_LIVE_ACTIVE" == 1 ]]; then
+  printf 'matrix_finished_at=%s run_fingerprint=%s live_contract_id=%s live_stage=%s live_authorized_budget_usd=%s live_budget_attestation_sha256=%s live_key_limit_max_usd=%s live_cooldown_s=%s live_stage_launch_attestation_sha256=%s live_current_usage_sha256=%s live_stage_launch_verify_receipt_sha256=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RUN_FINGERPRINT" \
+    "$E12_LIVE_CONTRACT_ID" "$E12_LIVE_STAGE" \
+    "$E12_LIVE_AUTHORIZED_BUDGET_USD" \
+    "$E12_LIVE_BUDGET_ATTESTATION_SHA256" \
+    "$E12_LIVE_KEY_LIMIT_MAX_USD" \
+    "$E12_LIVE_COOLDOWN_S" \
+    "$E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256" \
+    "$E12_LIVE_CURRENT_USAGE_SHA256" \
+    "$E12_LIVE_VERIFY_RECEIPT_SHA256" >> "$EVENTS"
+else
+  printf 'matrix_finished_at=%s run_fingerprint=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RUN_FINGERPRINT" >> "$EVENTS"
+fi

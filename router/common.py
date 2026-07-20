@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import random
@@ -44,6 +45,39 @@ SCENARIOS = {
 
 DEFAULT_TIMEOUT_S: float = float(os.environ.get("TIMEOUT_S", "600"))
 DEFAULT_KV_HYSTERESIS_FRACTION: float = 0.05
+
+# OpenRouter's request provider identifiers are lower-case slugs, while the
+# response metadata uses a documented display spelling for some providers.
+# Keep the accepted wire values finite and exact: a provider-controlled string
+# is never copied into an artifact merely because it case-folds similarly.
+_OPENROUTER_PROVIDER_WIRE_NAMES: dict[str, frozenset[str]] = {
+    "deepinfra": frozenset({"deepinfra", "DeepInfra"}),
+}
+
+
+def _generation_id_sha256(value: Any) -> str | None:
+    """Hash a provider generation id without ever stringifying other types."""
+    if not isinstance(value, str) or not value:
+        return None
+    return hashlib.sha256(
+        value.encode("utf-8", errors="surrogatepass")
+    ).hexdigest()
+
+
+def _canonical_requested_provider(
+    observed: Any,
+    provider_order: list[str] | None,
+) -> str | None:
+    """Return a safe requested slug only after an exact wire-value match."""
+    if not isinstance(observed, str):
+        return None
+    for requested in provider_order or ():
+        allowed = _OPENROUTER_PROVIDER_WIRE_NAMES.get(
+            requested, frozenset({requested})
+        )
+        if observed in allowed:
+            return requested
+    return None
 
 
 def effective_decode(
@@ -352,7 +386,7 @@ async def one_request(
         "probe_mode": "ttft_cancel" if stop_after_first_token else None,
         "first_token_kind": None,
         "first_content_ttft_ms": None,
-        "generation_id": None,
+        "generation_id_sha256": None,
         "provider": None,
         "response_model": None,
         "requested_provider_order": list(provider_order or []),
@@ -369,6 +403,51 @@ async def one_request(
         if first_token_time is not None:
             result["ttft_ms"] = (first_token_time - start) * 1000
 
+    def record_protocol_mismatch(resp: Any) -> None:
+        """Abort while persisting only fixed, request-derived metadata."""
+        result["provider"] = None
+        result["response_model"] = None
+        result["stream_abort_requested"] = True
+        close = getattr(resp, "close", None)
+        if close is not None:
+            close()
+        record_error(
+            "ProtocolMismatch",
+            "provider response metadata mismatch; details omitted",
+        )
+
+    def observe_generation_id(value: Any) -> bool:
+        """Hash an id immediately and require header/SSE consistency."""
+        digest = _generation_id_sha256(value)
+        if digest is None:
+            return value is None
+        current = result["generation_id_sha256"]
+        if current is not None and current != digest:
+            return False
+        result["generation_id_sha256"] = digest
+        return True
+
+    def observe_provider(value: Any) -> bool:
+        # Endpoints without a pinned provider do not need this optional field;
+        # omitting it prevents arbitrary local/provider labels from leaking.
+        if not provider_order:
+            return True
+        canonical = _canonical_requested_provider(value, provider_order)
+        if canonical is None:
+            return False
+        current = result["provider"]
+        if current is not None and current != canonical:
+            return False
+        result["provider"] = canonical
+        return True
+
+    def observe_model(value: Any) -> bool:
+        if value != endpoint.model:
+            return False
+        # Persist the request-derived value, never the response object.
+        result["response_model"] = endpoint.model
+        return True
+
     try:
         async with session.post(
             endpoint.url,
@@ -384,15 +463,30 @@ async def one_request(
                 allow_fallbacks=allow_fallbacks,
             ),
             timeout=timeout,
+            # Never replay a bearer credential or ShareGPT payload to a
+            # redirect target.  The frozen endpoint must answer directly.
+            allow_redirects=False,
         ) as resp:
             result["http_status"] = resp.status
             headers = getattr(resp, "headers", None)
             if headers is not None:
-                result["generation_id"] = headers.get("X-Generation-Id")
+                header_generation_id = headers.get("X-Generation-Id")
+                if header_generation_id is not None:
+                    # Hash at the transport boundary: a raw generation id is
+                    # never inserted into the result dictionary.
+                    if not observe_generation_id(header_generation_id):
+                        record_protocol_mismatch(resp)
+                        return result
 
-            if resp.status >= 400:
-                error_text = (await resp.text())[:500]
-                record_error(f"HTTP {resp.status}", f"HTTP {resp.status}: {error_text}")
+            if resp.status != 200:
+                # Provider error bodies are not experiment evidence and may
+                # echo user-supplied prompt text.  Keep only the status code in
+                # result artifacts so a failed cloud request cannot copy
+                # ShareGPT content into an otherwise text-free audit bundle.
+                record_error(
+                    f"HTTP {resp.status}",
+                    f"HTTP {resp.status}: provider response body omitted",
+                )
                 return result
 
             buffer = ""
@@ -416,21 +510,34 @@ async def one_request(
                         break
 
                     obj = json.loads(data)
+                    if not isinstance(obj, dict):
+                        record_protocol_mismatch(resp)
+                        return result
 
                     # OpenRouter exposes the generation id in a response
                     # header and may repeat id/provider/model on SSE chunks.
-                    # Keep both paths: the header survives a first-token abort.
-                    if obj.get("id"):
-                        result["generation_id"] = obj["id"]
-                    if obj.get("provider"):
-                        result["provider"] = obj["provider"]
-                    if obj.get("model"):
-                        result["response_model"] = obj["model"]
+                    # Hash both paths and keep only request-derived allowlisted
+                    # provider/model values.  A mismatch records no response
+                    # string, even when the string itself contains user data.
+                    metadata_ok = True
+                    if "id" in obj and obj["id"] is not None:
+                        metadata_ok = observe_generation_id(obj["id"])
+                    if metadata_ok and "provider" in obj and obj["provider"] is not None:
+                        metadata_ok = observe_provider(obj["provider"])
+                    if metadata_ok and "model" in obj and obj["model"] is not None:
+                        metadata_ok = observe_model(obj["model"])
+                    if not metadata_ok:
+                        record_protocol_mismatch(resp)
+                        return result
 
                     if obj.get("error"):
-                        error = obj["error"]
-                        message = error.get("message") if isinstance(error, dict) else str(error)
-                        record_error("StreamError", message)
+                        # SSE error messages can also quote request content.
+                        # The error class is sufficient for aggregate failure
+                        # accounting; deliberately omit the provider message.
+                        record_error(
+                            "StreamError",
+                            "provider stream error message omitted",
+                        )
                         return result
 
                     completion_progress = None
@@ -456,6 +563,22 @@ async def one_request(
                         content = ""
                         reasoning = ""
                     token = content or reasoning
+
+                    if (
+                        token
+                        and stop_after_first_token
+                        and provider_order
+                        and (
+                            result["generation_id_sha256"] is None
+                            or result["provider"] is None
+                            or result["response_model"] is None
+                        )
+                    ):
+                        # The TTFT probe aborts on this chunk, so conformance
+                        # must already be observable here.  Missing metadata is
+                        # a fixed protocol failure, never a successful sample.
+                        record_protocol_mismatch(resp)
+                        return result
 
                     if (
                         on_output_progress is not None
@@ -498,6 +621,12 @@ async def one_request(
                 if done or probe_stopped:
                     break
 
+        if first_token_time is None:
+            # A clean HTTP/SSE close without a generated token is a measured
+            # failure, not a successful request with an unusable null TTFT.
+            record_error("NoToken", "stream ended before a generated token")
+            return result
+
         result["success"] = True
         result["chunks"] = chunks
 
@@ -527,9 +656,15 @@ async def one_request(
     except asyncio.TimeoutError:
         record_error("TimeoutError", f"timeout after {timeout_s}s")
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        record_error(type(exc).__name__, str(exc))
+        # Parser exception strings may embed a fragment of the provider frame,
+        # which can in turn contain request text.  Persist only the class and a
+        # fixed message in experiment artifacts.
+        record_error(type(exc).__name__, "invalid provider stream encoding")
     except Exception as exc:
-        record_error(type(exc).__name__, str(exc) or repr(exc))
+        # Transport libraries sometimes include request URLs, headers, or
+        # payload fragments in exception text.  The exception class is enough
+        # for aggregate diagnostics; never serialize ``str(exc)``/``repr``.
+        record_error(type(exc).__name__, "request transport failure; details omitted")
 
     if not probe_stopped:
         result["cost_usd"] = compute_cost_usd(endpoint, result)

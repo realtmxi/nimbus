@@ -5,6 +5,7 @@ Run from the repo root:  python3 -m unittest router.test_common -v
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import tempfile
 import time
@@ -66,9 +67,24 @@ class FakeSession:
         self._resp = resp
         self.calls: list[dict] = []
 
-    def post(self, url, headers=None, json=None, timeout=None):
-        self.calls.append({"url": url, "headers": headers, "json": json})
+    def post(self, url, headers=None, json=None, timeout=None,
+             allow_redirects=None):
+        self.calls.append({
+            "url": url,
+            "headers": headers,
+            "json": json,
+            "allow_redirects": allow_redirects,
+        })
         return self._resp
+
+
+class RaisingSession:
+    def __init__(self, message: str):
+        self.message = message
+
+    def post(self, url, headers=None, json=None, timeout=None,
+             allow_redirects=None):
+        raise RuntimeError(self.message)
 
 
 def sse_ok() -> list[str]:
@@ -178,6 +194,7 @@ class TestOneRequest(unittest.TestCase):
             session.calls[0]["json"]["stream_options"],
             {"include_usage": True},
         )
+        self.assertIs(session.calls[0]["allow_redirects"], False)
 
     def test_cloud_success_is_billed_from_usage(self):
         res, _ = self.run_req(CLOUD, FakeResp(200, sse_ok()))
@@ -186,18 +203,57 @@ class TestOneRequest(unittest.TestCase):
         self.assertAlmostEqual(res["cost_usd"], expected)
 
     def test_http_error_records_and_bills_zero(self):
-        res, _ = self.run_req(CLOUD, FakeResp(429, [], text="rate limited"))
+        sensitive_body = "rejected prompt=private ShareGPT text"
+        res, _ = self.run_req(CLOUD, FakeResp(429, [], text=sensitive_body))
         self.assertFalse(res["success"])
         self.assertEqual(res["http_status"], 429)
         self.assertEqual(res["error_type"], "HTTP 429")
+        self.assertNotIn(sensitive_body, res["error"])
+        self.assertEqual(res["error"], "HTTP 429: provider response body omitted")
         self.assertEqual(res["cost_usd"], 0.0)        # failed request: never bill
 
+    def test_redirect_is_not_followed_and_is_an_explicit_failure(self):
+        res, session = self.run_req(CLOUD, FakeResp(307, sse_ok()))
+        self.assertFalse(res["success"])
+        self.assertEqual(res["http_status"], 307)
+        self.assertEqual(res["error_type"], "HTTP 307")
+        self.assertIs(session.calls[0]["allow_redirects"], False)
+
     def test_stream_error_records(self):
-        lines = ['data: {"error":{"message":"boom"}}\n']
+        sensitive_message = "prompt contained private ShareGPT text"
+        lines = [f'data: {{"error":{{"message":"{sensitive_message}"}}}}\n']
         res, _ = self.run_req(LOCAL, FakeResp(200, lines))
         self.assertFalse(res["success"])
         self.assertEqual(res["error_type"], "StreamError")
-        self.assertEqual(res["error"], "boom")
+        self.assertNotIn(sensitive_message, res["error"])
+        self.assertEqual(res["error"], "provider stream error message omitted")
+
+    def test_stream_without_generated_token_is_explicit_failure(self):
+        lines = [
+            'data: {"id":"gen-empty","choices":[]}\n',
+            "data: [DONE]\n",
+        ]
+        res, _ = self.run_req(CLOUD, FakeResp(200, lines))
+        self.assertFalse(res["success"])
+        self.assertEqual(res["error_type"], "NoToken")
+        self.assertIsNone(res["ttft_ms"])
+
+    def test_transport_exception_never_persists_exception_text(self):
+        sensitive = "request payload contained private ShareGPT text"
+        res = asyncio.run(
+            one_request(
+                RaisingSession(sensitive),
+                CLOUD,
+                REQ,
+                time.perf_counter(),
+            )
+        )
+        self.assertFalse(res["success"])
+        self.assertEqual(res["error_type"], "RuntimeError")
+        self.assertEqual(
+            res["error"], "request transport failure; details omitted"
+        )
+        self.assertNotIn(sensitive, json.dumps(res))
 
     def test_max_tokens_override(self):
         session = FakeSession(FakeResp(200, sse_ok()))
@@ -231,12 +287,11 @@ class TestOneRequest(unittest.TestCase):
     def test_ttft_probe_aborts_after_first_generated_token(self):
         # Put content and usage after reasoning in the same transport chunk:
         # once TTFT is observed, cancellation must not consume the rest.
-        # observed, cancellation must not accidentally consume the rest.
         stream = [
-            'data: {"id":"gen-123","model":"qwen/qwen3-32b",'
+            'data: {"id":"gen-123","model":"m",'
             '"provider":"DeepInfra","choices":[{"delta":'
             '{"reasoning":"thinking"}}]}\n'
-            'data: {"id":"gen-123","model":"qwen/qwen3-32b",'
+            'data: {"id":"gen-123","model":"m",'
             '"provider":"DeepInfra","choices":[{"delta":'
             '{"content":"Hello"}}]}\n'
             'data: {"usage":{"prompt_tokens":10,"completion_tokens":50},'
@@ -272,9 +327,13 @@ class TestOneRequest(unittest.TestCase):
         self.assertEqual(result["output_chars"], len("thinking"))
         self.assertIsNone(result["prompt_tokens"])
         self.assertIsNone(result["completion_tokens"])
-        self.assertEqual(result["generation_id"], "gen-123")
-        self.assertEqual(result["provider"], "DeepInfra")
-        self.assertEqual(result["response_model"], "qwen/qwen3-32b")
+        self.assertEqual(
+            result["generation_id_sha256"],
+            hashlib.sha256(b"gen-123").hexdigest(),
+        )
+        self.assertNotIn("generation_id", result)
+        self.assertEqual(result["provider"], "deepinfra")
+        self.assertEqual(result["response_model"], "m")
         self.assertEqual(result["first_token_kind"], "reasoning")
         self.assertIsNone(result["first_content_ttft_ms"])
         self.assertEqual(result["requested_provider_order"], ["deepinfra"])
@@ -282,6 +341,139 @@ class TestOneRequest(unittest.TestCase):
         self.assertEqual(session.calls[0]["json"]["provider"], {
             "order": ["deepinfra"], "allow_fallbacks": False,
         })
+        self.assertNotIn("gen-123", json.dumps(result))
+
+    def test_provider_and_model_mismatch_never_persist_response_strings(self):
+        sensitive_provider = "DeepInfra private ShareGPT prompt"
+        sensitive_model = "private/model/with-user-text"
+        sensitive_id = "generation-id-private-user-text"
+        lines = [
+            json.dumps({
+                "id": sensitive_id,
+                "provider": sensitive_provider,
+                "model": sensitive_model,
+                "choices": [{"delta": {"content": "Hello"}}],
+            })
+        ]
+        resp = FakeResp(200, [f"data: {lines[0]}\n"])
+        result = asyncio.run(one_request(
+            FakeSession(resp),
+            CLOUD,
+            REQ,
+            time.perf_counter(),
+            provider_order=["deepinfra"],
+            allow_fallbacks=False,
+            stop_after_first_token=True,
+        ))
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_type"], "ProtocolMismatch")
+        self.assertEqual(
+            result["error"],
+            "provider response metadata mismatch; details omitted",
+        )
+        self.assertIsNone(result["provider"])
+        self.assertIsNone(result["response_model"])
+        self.assertEqual(
+            result["generation_id_sha256"],
+            hashlib.sha256(sensitive_id.encode()).hexdigest(),
+        )
+        rendered = json.dumps(result)
+        self.assertNotIn(sensitive_provider, rendered)
+        self.assertNotIn(sensitive_model, rendered)
+        self.assertNotIn(sensitive_id, rendered)
+        self.assertEqual(resp.close_count, 1)
+
+    def test_fixed_probe_requires_generation_identifier(self):
+        lines = [
+            'data: {"model":"m","provider":"DeepInfra",'
+            '"choices":[{"delta":{"content":"Hello"}}]}\n'
+        ]
+        resp = FakeResp(200, lines)
+        result = asyncio.run(one_request(
+            FakeSession(resp),
+            CLOUD,
+            REQ,
+            time.perf_counter(),
+            provider_order=["deepinfra"],
+            allow_fallbacks=False,
+            stop_after_first_token=True,
+        ))
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_type"], "ProtocolMismatch")
+        self.assertIsNone(result["generation_id_sha256"])
+        self.assertIsNone(result["provider"])
+        self.assertIsNone(result["response_model"])
+        self.assertEqual(resp.close_count, 1)
+
+    def test_model_mismatch_scrubs_previously_matched_provider(self):
+        sensitive_model = "qwen/qwen3-32b private prompt fragment"
+        lines = [
+            "data: " + json.dumps({
+                "provider": "DeepInfra",
+                "model": sensitive_model,
+                "choices": [{"delta": {"content": "Hello"}}],
+            }) + "\n",
+        ]
+        result = asyncio.run(one_request(
+            FakeSession(FakeResp(200, lines)),
+            CLOUD,
+            REQ,
+            time.perf_counter(),
+            provider_order=["deepinfra"],
+            allow_fallbacks=False,
+            stop_after_first_token=True,
+        ))
+
+        self.assertEqual(result["error_type"], "ProtocolMismatch")
+        self.assertIsNone(result["provider"])
+        self.assertIsNone(result["response_model"])
+        self.assertNotIn(sensitive_model, json.dumps(result))
+
+    def test_sse_generation_id_must_match_hashed_header(self):
+        header_id = "header-secret-id"
+        sse_id = "different-sse-secret-id"
+        lines = [
+            "data: " + json.dumps({
+                "id": sse_id,
+                "provider": "DeepInfra",
+                "model": "m",
+                "choices": [{"delta": {"content": "Hello"}}],
+            }) + "\n",
+        ]
+        result = asyncio.run(one_request(
+            FakeSession(FakeResp(
+                200, lines, headers={"X-Generation-Id": header_id}
+            )),
+            CLOUD,
+            REQ,
+            time.perf_counter(),
+            provider_order=["deepinfra"],
+            stop_after_first_token=True,
+        ))
+
+        self.assertEqual(result["error_type"], "ProtocolMismatch")
+        rendered = json.dumps(result)
+        self.assertNotIn(header_id, rendered)
+        self.assertNotIn(sse_id, rendered)
+
+    def test_unpinned_provider_metadata_is_omitted(self):
+        sensitive_provider = "provider-private-prompt-fragment"
+        lines = [
+            "data: " + json.dumps({
+                "provider": sensitive_provider,
+                "model": "m",
+                "choices": [{"delta": {"content": "Hello"}}],
+            }) + "\n",
+            "data: [DONE]\n",
+        ]
+        result, _ = self.run_req(LOCAL, FakeResp(200, lines))
+
+        self.assertTrue(result["success"])
+        self.assertIsNone(result["provider"])
+        self.assertEqual(result["response_model"], "m")
+        self.assertNotIn(sensitive_provider, json.dumps(result))
 
     def test_output_progress_uses_exact_continuous_usage_not_chunk_count(self):
         mtp_stream = [

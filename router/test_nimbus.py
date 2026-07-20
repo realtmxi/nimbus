@@ -5,6 +5,7 @@ Run from the repo root:  python3 -m unittest router.test_nimbus -v
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import unittest
 
@@ -379,6 +380,7 @@ class TestReviewRegressions(unittest.TestCase):
                            "--local-url", "http://x", "--local-model", "m",
                            "--cloud", "real", "--cloud-url", "http://c",
                            "--cloud-model", "m",
+                           "--expected-trace-sha256", "a" * 64,
                            "--kv-capacity-tokens", "1000000", "--max-inflight", "1",
                            "--out-dir", str(out_dir)])
         results, _, _ = asyncio.run(replay_queued(
@@ -439,14 +441,17 @@ class TestCodexRegressions(unittest.TestCase):
         from router.run import parse_args, replay_queued
         from router.test_run import RecordingSender
 
+        sensitive = "private ShareGPT prompt and bearer token"
+
         async def boom_cloud(req, due):
-            raise RuntimeError("cloud down")
+            raise RuntimeError(sensitive)
 
         out_dir = Path(tempfile.mkdtemp())
         args = parse_args(["--data", "t", "--scenario", "normal", "--policy", "nimbus",
                            "--local-url", "http://x", "--local-model", "m",
                            "--cloud", "real", "--cloud-url", "http://c",
                            "--cloud-model", "m",
+                           "--expected-trace-sha256", "a" * 64,
                            "--kv-capacity-tokens", "1000000", "--max-inflight", "2",
                            "--out-dir", str(out_dir)])
         results, _, _ = asyncio.run(replay_queued(
@@ -459,6 +464,8 @@ class TestCodexRegressions(unittest.TestCase):
         for r in cloud:
             self.assertFalse(r["success"])
             self.assertEqual(r["error_type"], "RuntimeError")
+            self.assertEqual(r["error"], "sender exception; details omitted")
+            self.assertNotIn(sensitive, json.dumps(r))
             self.assertEqual(r["cost_usd"], 0.0)
 
     def test_bad_nimbus_args_rejected(self):

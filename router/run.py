@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import io
 import json
 import time
 from dataclasses import dataclass
@@ -141,6 +142,126 @@ class LocalAdmission:
 
     def release(self, req: dict[str, Any]) -> None:
         self.inflight -= 1
+
+
+class CloudFatalError(RuntimeError):
+    """A sanitized fatal fixed-provider probe status/count gate."""
+
+
+class TraceIntegrityError(RuntimeError):
+    """A sanitized failure to load the exact expected trace bytes."""
+
+
+@dataclass(frozen=True)
+class _InMemoryTraceSource:
+    """Path-like adapter that makes ``load_trace`` parse one frozen read."""
+
+    text: str
+
+    def open(self, mode: str = "r", encoding: str | None = None):
+        if mode != "r" or encoding != "utf-8":  # defensive contract check
+            raise ValueError("unsupported in-memory trace open mode")
+        return io.StringIO(self.text)
+
+
+def load_verified_trace(
+    path: Path, scenario: str, expected_sha256: str | None,
+) -> list[dict[str, Any]]:
+    """Hash and parse the same in-memory bytes, closing filesystem TOCTOU.
+
+    Error messages deliberately omit the path, parser exception, and input
+    content because this trace can contain raw ShareGPT current-turn text.
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        raise TraceIntegrityError(
+            "trace bytes could not be read; details omitted"
+        ) from None
+    actual_sha256 = hashlib.sha256(raw).hexdigest()
+    if expected_sha256 is not None and actual_sha256 != expected_sha256:
+        raise TraceIntegrityError("trace SHA256 mismatch; details omitted")
+    try:
+        source = _InMemoryTraceSource(raw.decode("utf-8"))
+        return load_trace(source, scenario)  # type: ignore[arg-type]
+    except Exception:
+        raise TraceIntegrityError(
+            "trace bytes could not be parsed; details omitted"
+        ) from None
+
+
+def _cloud_fatal_mode(args: argparse.Namespace, cloud: Endpoint | None,
+                      sink: Any | None) -> bool:
+    """Only the authenticated, no-fallback TTFT-cancel path spends this way."""
+    return bool(
+        cloud is not None
+        and sink is None
+        and getattr(args, "cloud", None) == "real"
+        and getattr(args, "cloud_stop_after_first_token", False)
+        and getattr(args, "cloud_no_fallbacks", False)
+    )
+
+
+def _is_canonical_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _sanitize_fixed_cloud_metadata(
+    result: dict[str, Any],
+    args: argparse.Namespace,
+    cloud: Endpoint,
+) -> None:
+    """Enforce the metadata contract again at the raw-writer boundary.
+
+    ``one_request`` already hashes/allowlists metadata as it parses the wire.
+    This defense prevents a future sender implementation from writing a raw
+    SSE/header id or arbitrary provider/model string into an E12 artifact.
+    """
+    mismatch = result.get("error_type") == "ProtocolMismatch"
+    for unsafe_key in ("generation_id", "id", "sse_id", "response_id"):
+        if unsafe_key in result:
+            result.pop(unsafe_key, None)
+            mismatch = True
+
+    generation_hash = result.get("generation_id_sha256")
+    if generation_hash is not None and not _is_canonical_sha256(generation_hash):
+        result["generation_id_sha256"] = None
+        mismatch = True
+
+    expected_provider = args.cloud_provider[0]
+    if result.get("model") != cloud.model:
+        mismatch = True
+    # These fields describe the request contract, so source them from the
+    # frozen local configuration even when the sender returns its own values.
+    result["endpoint"] = "cloud"
+    result["model"] = cloud.model
+    result["requested_provider_order"] = list(args.cloud_provider)
+    provider = result.get("provider")
+    response_model = result.get("response_model")
+    if provider not in {None, expected_provider}:
+        mismatch = True
+    if response_model not in {None, cloud.model}:
+        mismatch = True
+    if result.get("success") is True and (
+        generation_hash is None
+        or provider != expected_provider
+        or response_model != cloud.model
+    ):
+        mismatch = True
+
+    if mismatch:
+        result["success"] = False
+        result["provider"] = None
+        result["response_model"] = None
+        result["error_type"] = "ProtocolMismatch"
+        result["error"] = (
+            "provider response metadata mismatch; details omitted"
+        )
+        result["stream_abort_requested"] = True
 
 
 @dataclass
@@ -260,6 +381,13 @@ async def replay_queued(
 
     cloud_gate = (asyncio.Semaphore(args.cloud_max_concurrency)
                   if getattr(args, "cloud_max_concurrency", 0) > 0 else None)
+    fatal_cloud_enabled = _cloud_fatal_mode(args, cloud, sink)
+    fatal_cloud_event = asyncio.Event()
+    fatal_cloud_error: CloudFatalError | None = None
+    completed_cloud_n = 0
+    cloud_success_n = 0
+    cloud_non429_http_failure_n = 0
+    cloud_400_n = 0
 
     async with session_cm as session:
         if (kv_monitor is None and needs_kv
@@ -321,6 +449,83 @@ async def replay_queued(
             if decision_f is not None:
                 decision_f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
+        def observe_cloud_status(res: dict[str, Any]) -> None:
+            """Set the fatal gate from sanitized row metadata only.
+
+            The caller records ``res`` before invoking this function, preserving
+            the row that triggered the stop.  No response body or error string
+            is inspected or copied into the exception.
+            """
+            nonlocal fatal_cloud_error, completed_cloud_n, cloud_success_n
+            nonlocal cloud_non429_http_failure_n, cloud_400_n
+            if not fatal_cloud_enabled or fatal_cloud_error is not None:
+                return
+            completed_cloud_n += 1
+            status = res.get("http_status")
+            success = res.get("success") is True
+            protocol_mismatch = res.get("error_type") == "ProtocolMismatch"
+            if success and isinstance(status, int) and not isinstance(status, bool) \
+                    and 200 <= status < 300:
+                cloud_success_n += 1
+            if isinstance(status, int) and not isinstance(status, bool):
+                if status == 400:
+                    cloud_400_n += 1
+                if not success and status != 429:
+                    cloud_non429_http_failure_n += 1
+                # Redirects are forbidden at the transport layer.  Seeing one
+                # means the frozen endpoint contract is wrong, so stop before
+                # more trace rows can be submitted.  Auth/credit/config/method
+                # failures are likewise fatal immediately; 429 remains a
+                # measured outcome and is excluded from systemic-failure counts.
+                hard_stop = 300 <= status < 400 or status in {
+                    401, 402, 403, 404, 405, 422,
+                }
+            else:
+                hard_stop = False
+            dominant_400 = (
+                completed_cloud_n >= 3
+                and cloud_400_n * 5 >= completed_cloud_n * 4
+            )
+            zero_success_systemic = (
+                cloud_success_n == 0
+                and cloud_non429_http_failure_n >= 3
+            )
+            dominant_non429_http = (
+                completed_cloud_n >= 10
+                and cloud_non429_http_failure_n * 5 >= completed_cloud_n * 4
+            )
+            if not (
+                hard_stop or dominant_400 or zero_success_systemic
+                or dominant_non429_http or protocol_mismatch
+            ):
+                return
+            if protocol_mismatch:
+                fatal_cloud_error = CloudFatalError(
+                    "fatal cloud protocol gate: "
+                    f"completed_n={completed_cloud_n}"
+                )
+                fatal_cloud_event.set()
+                current = asyncio.current_task()
+                for task in tuple(pending):
+                    if task is not current and not task.done():
+                        task.cancel()
+                return
+            fatal_status = int(status) if hard_stop else (
+                400 if dominant_400 else 0
+            )
+            fatal_cloud_error = CloudFatalError(
+                "fatal cloud status gate: "
+                f"status={fatal_status} completed_n={completed_cloud_n} "
+                f"cloud_success_n={cloud_success_n} "
+                f"non429_http_failure_n={cloud_non429_http_failure_n} "
+                f"http_400_n={cloud_400_n}"
+            )
+            fatal_cloud_event.set()
+            current = asyncio.current_task()
+            for task in tuple(pending):
+                if task is not current and not task.done():
+                    task.cancel()
+
         def prediction_telemetry() -> dict[str, Any]:
             if getattr(policy, "trigger", None) != "ttft_pred":
                 return {}
@@ -375,7 +580,8 @@ async def replay_queued(
                 res = {"request_id": req["request_id"], "arrived_at": req["arrived_at"],
                        "relative_arrival_s": req["relative_arrival_s"],
                        "endpoint": "local", "model": getattr(local, "model", None),
-                       "success": False, "error": str(exc),
+                       "success": False,
+                       "error": "sender exception; details omitted",
                        "error_type": type(exc).__name__, "http_status": None,
                        "ttft_ms": None, "e2e_ms": None, "tpot_ms": None,
                        "chunks": 0, "prompt_tokens": None, "completion_tokens": None,
@@ -398,10 +604,13 @@ async def replay_queued(
             if res.get("e2e_ms") is not None:
                 res["e2e_ms"] = queue_delay_ms + res["e2e_ms"]
             record(res)
-            await maybe_kick()
-            maybe_dispatch()
+            if not fatal_cloud_event.is_set():
+                await maybe_kick()
+                maybe_dispatch()
 
         def spawn_local(req: dict[str, Any], arrival_due: float) -> None:
+            if fatal_cloud_event.is_set():
+                return
             admission.reserve(req)
             if inflight_kv is not None:
                 inflight_kv.add(req)
@@ -413,7 +622,7 @@ async def replay_queued(
             # policy first: while a shed decision is in flight, admission is
             # frozen — otherwise a completing request could dispatch a victim
             # the policy is about to kick (race caught in review)
-            if has_tick and tick_busy:
+            if fatal_cloud_event.is_set() or (has_tick and tick_busy):
                 return
             # work-conserving: admit the head while a slot is free
             while queue and admission.fits(queue[0][0]):
@@ -445,6 +654,8 @@ async def replay_queued(
 
         def route_cloud(req: dict[str, Any], due: float,
                         pre_route_queue_ms: float = 0.0) -> None:
+            if fatal_cloud_event.is_set():
+                return
             if sink is not None:
                 res = sink.serve(req, due, max_tokens_override=args.max_tokens)
                 annotate_scheduler_estimates(res, req)
@@ -457,9 +668,13 @@ async def replay_queued(
                     try:
                         if cloud_gate is not None:
                             async with cloud_gate:
+                                if fatal_cloud_event.is_set():
+                                    return
                                 send_started_at = time.perf_counter()
                                 res = await send_cloud(req, due)
                         else:
+                            if fatal_cloud_event.is_set():
+                                return
                             res = await send_cloud(req, due)
                     except Exception as exc:  # a sender bug must not lose the row
                         res = {"request_id": req["request_id"],
@@ -467,12 +682,15 @@ async def replay_queued(
                                "relative_arrival_s": req["relative_arrival_s"],
                                "endpoint": "cloud",
                                "model": getattr(cloud, "model", None),
-                               "success": False, "error": str(exc),
+                               "success": False,
+                               "error": "sender exception; details omitted",
                                "error_type": type(exc).__name__, "http_status": None,
                                "ttft_ms": None, "e2e_ms": None, "tpot_ms": None,
                                "chunks": 0, "prompt_tokens": None,
                                "completion_tokens": None, "output_chars": 0,
                                "cost_usd": 0.0, "scheduled_lag_ms": 0.0}
+                    if fatal_cloud_enabled:
+                        _sanitize_fixed_cloud_metadata(res, args, cloud)
                     cloud_gate_wait_ms = max(
                         0.0, (send_started_at - cloud_queued_at) * 1000
                     )
@@ -481,6 +699,7 @@ async def replay_queued(
                         res, pre_route_queue_ms, cloud_gate_wait_ms
                     )
                     record(res)
+                    observe_cloud_status(res)
                 task = asyncio.create_task(cloud_task())
                 pending.add(task)
                 task.add_done_callback(pending.discard)
@@ -506,6 +725,8 @@ async def replay_queued(
             re-adjudicate the combined candidate set first.
             """
             nonlocal tick_busy, tick_rerun, decision_seq
+            if fatal_cloud_event.is_set():
+                return True
             if not has_tick:
                 return True
             assert inflight_kv is not None
@@ -646,6 +867,8 @@ async def replay_queued(
                         continue
                     applied_ids = []
                     for v in victims:
+                        if fatal_cloud_event.is_set():
+                            break
                         idx = next((i for i, (r, _) in enumerate(queue)
                                     if r["request_id"] == v["request_id"]), None)
                         if idx is None:      # defensive; admission is frozen,
@@ -691,6 +914,17 @@ async def replay_queued(
             else None
         )
 
+        async def sleep_until_or_fatal(delay_s: float) -> bool:
+            """Return True when the fatal gate wakes the producer early."""
+            if not fatal_cloud_enabled:
+                await asyncio.sleep(delay_s)
+                return False
+            try:
+                await asyncio.wait_for(fatal_cloud_event.wait(), timeout=delay_s)
+            except asyncio.TimeoutError:
+                return False
+            return True
+
         async def wait_for_arrival(due: float) -> None:
             """Sleep to an arrival while periodically rechecking TTFT risk."""
             while True:
@@ -698,9 +932,10 @@ async def replay_queued(
                 if wait <= 0:
                     return
                 if periodic_tick_s is None:
-                    await asyncio.sleep(wait)
+                    await sleep_until_or_fatal(wait)
                     return
-                await asyncio.sleep(min(wait, periodic_tick_s))
+                if await sleep_until_or_fatal(min(wait, periodic_tick_s)):
+                    return
                 if queue:
                     if not await maybe_kick(due):
                         return
@@ -714,16 +949,22 @@ async def replay_queued(
             # one-item "choice" (an invalid selector experiment).
             cohort_start = 0
             while cohort_start < len(trace):
+                if fatal_cloud_event.is_set():
+                    break
                 due = run_start + (
                     trace[cohort_start]["relative_arrival_s"] * args.time_scale
                 )
                 await wait_for_arrival(due)
+                if fatal_cloud_event.is_set():
+                    break
 
                 # Absorb every cohort due as of one clock sample. If policy
                 # computation crosses the following arrival, maybe_kick()
                 # returns False without applying victims and this loop expands
                 # the candidate set before trying again.
                 while True:
+                    if fatal_cloud_event.is_set():
+                        break
                     now = time.perf_counter()
                     while cohort_start < len(trace):
                         relative_arrival_s = trace[cohort_start][
@@ -740,6 +981,8 @@ async def replay_queued(
                                == relative_arrival_s):
                             cohort_end += 1
                         for req in trace[cohort_start:cohort_end]:
+                            if fatal_cloud_event.is_set():
+                                break
                             if policy.outsource(req):
                                 route_cloud(req, cohort_due)
                             else:
@@ -749,6 +992,9 @@ async def replay_queued(
                         )
                         cohort_start = cohort_end
 
+                    if fatal_cloud_event.is_set():
+                        break
+
                     next_due = (
                         run_start
                         + trace[cohort_start]["relative_arrival_s"] * args.time_scale
@@ -756,6 +1002,9 @@ async def replay_queued(
                     )
                     if await maybe_kick(next_due):
                         break
+
+                if fatal_cloud_event.is_set():
+                    break
 
                 # Only a decision that completed before the next arrival may
                 # make the retained cohort irrevocably in-flight.
@@ -769,6 +1018,8 @@ async def replay_queued(
                 else None
             )
             while queue or pending:
+                if fatal_cloud_event.is_set():
+                    break
                 if pending:
                     timeout = (
                         max(0.0, next_periodic_tick_at - time.perf_counter())
@@ -793,10 +1044,23 @@ async def replay_queued(
                 else:  # queue non-empty, nothing in flight -> dispatch now
                     maybe_dispatch()
         finally:
+            if fatal_cloud_error is not None:
+                queue.clear()
+                current = asyncio.current_task()
+                cleanup = [
+                    task for task in tuple(pending)
+                    if task is not current and not task.done()
+                ]
+                for task in cleanup:
+                    task.cancel()
+                if cleanup:
+                    await asyncio.gather(*cleanup, return_exceptions=True)
             f.close()
             if decision_f is not None:
                 decision_f.close()
 
+    if fatal_cloud_error is not None:
+        raise fatal_cloud_error
     print(f"raw: {out}")
     return results, admission, kv_monitor
 
@@ -805,6 +1069,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
 
     parser.add_argument("--data", type=Path, required=True)
+    parser.add_argument(
+        "--expected-trace-sha256", default=None,
+        help="lowercase SHA256 of the exact trace bytes; required for real cloud",
+    )
     parser.add_argument("--scenario", choices=[*SCENARIOS, "full"], required=True,
                         help="BurstGPT window, or 'full' = replay the whole file")
     parser.add_argument("--policy", choices=["all_local", "all_cloud", "random", "nimbus"], required=True)
@@ -956,8 +1224,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--cloud-max-concurrency must be >= 0 (0 = unlimited)")
     if args.time_scale <= 0:
         parser.error("--time-scale must be > 0")
+    if args.expected_trace_sha256 is not None and (
+        len(args.expected_trace_sha256) != 64
+        or any(ch not in "0123456789abcdef" for ch in args.expected_trace_sha256)
+    ):
+        parser.error("--expected-trace-sha256 must be exactly 64 lowercase hex characters")
     needs_local = args.policy in ("all_local", "random", "nimbus")
     needs_cloud = args.policy in ("all_cloud", "random", "nimbus")
+    if needs_cloud and args.cloud == "real" and args.expected_trace_sha256 is None:
+        parser.error("--cloud real requires --expected-trace-sha256")
     if args.cloud_provider:
         args.cloud_provider = [provider.strip() for provider in args.cloud_provider]
         if any(not provider for provider in args.cloud_provider):
@@ -1129,7 +1404,9 @@ def token_alignment_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
 
 async def main() -> None:
     args = parse_args()
-    trace = load_trace(args.data, args.scenario)
+    trace = load_verified_trace(
+        args.data, args.scenario, args.expected_trace_sha256
+    )
     print(f"loaded {len(trace)} requests  scenario={args.scenario} policy={args.policy} "
           f"max_inflight={args.max_inflight}")
 
