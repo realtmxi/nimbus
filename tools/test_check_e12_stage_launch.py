@@ -465,10 +465,11 @@ class TestE12StageLaunch(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             fixture = LaunchFixture(Path(directory))
             original = fixture.profile.read_bytes()
+            real_profile_size = 3_090_188
             fixture.profile.write_bytes(
-                original + b" " * (MAX_JSON_BYTES + 1 - len(original))
+                original + b" " * (real_profile_size - len(original))
             )
-            self.assertGreater(fixture.profile.stat().st_size, MAX_JSON_BYTES)
+            self.assertEqual(fixture.profile.stat().st_size, real_profile_size)
             self.assertLessEqual(
                 fixture.profile.stat().st_size, MAX_PROFILE_JSON_BYTES,
             )
@@ -481,6 +482,17 @@ class TestE12StageLaunch(unittest.TestCase):
                 )
             )
             with self.assertRaisesRegex(LaunchCheckError, "profile is too large"):
+                fixture.create_a()
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = LaunchFixture(Path(directory))
+            original = fixture.price.read_bytes()
+            fixture.price.write_bytes(
+                original + b" " * (MAX_JSON_BYTES + 1 - len(original))
+            )
+            with self.assertRaisesRegex(
+                LaunchCheckError, "price snapshot is too large",
+            ):
                 fixture.create_a()
 
     def test_marketplace_contract_binds_non_byok_usage_and_exact_limit(self):
