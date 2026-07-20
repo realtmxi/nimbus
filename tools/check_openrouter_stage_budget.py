@@ -20,6 +20,15 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+from tools.openrouter_key_contract import (
+    E12_MARKETPLACE_KEY_CONTRACT,
+    KEY_CONTRACT_MODES,
+    STRICT_KEY_CONTRACT,
+    include_byok_in_limit_required,
+    key_limit_max_usd,
+    validate_key_contract_mode,
+)
+
 
 AUTHORIZED_BUDGET_USD = Decimal("3")
 DEFAULT_NEXT_STAGE_FULL_UPPER_BOUND_USD = Decimal("0.95401528")
@@ -41,6 +50,7 @@ KEY_FIELDS = frozenset({
     "is_free_tier",
     "expires_at_utc",
 })
+E12_MARKETPLACE_KEY_FIELDS = KEY_FIELDS | {"byok_usage"}
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -172,12 +182,19 @@ def _validate_snapshot_times(
         raise StageGateError("settlement snapshots must be at least 60 seconds apart")
 
 
-def _key_values(snapshot: dict[str, Any], which: str) -> dict[str, Any]:
+def _key_values(
+    snapshot: dict[str, Any], which: str, *, key_contract_mode: str
+) -> dict[str, Any]:
     schema_version = snapshot.get("schema_version")
     if isinstance(schema_version, bool) or schema_version != 1:
         raise StageGateError(f"{which} snapshot schema_version must be 1")
     key = _mapping(snapshot.get("key"), f"{which} key")
-    if set(key) != KEY_FIELDS:
+    expected_fields = (
+        E12_MARKETPLACE_KEY_FIELDS
+        if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT
+        else KEY_FIELDS
+    )
+    if set(key) != expected_fields:
         raise StageGateError(f"{which} key snapshot fields do not match E12 schema")
     if _http_status(key.get("http_status"), f"{which} key http_status") != 200:
         raise StageGateError(f"{which} key snapshot did not return HTTP 200")
@@ -186,8 +203,9 @@ def _key_values(snapshot: dict[str, Any], which: str) -> dict[str, Any]:
     fingerprint = key.get("key_fingerprint_sha256")
     if not isinstance(fingerprint, str) or not SHA256_RE.fullmatch(fingerprint):
         raise StageGateError(f"{which} key fingerprint is invalid")
-    if key.get("include_byok_in_limit") is not True:
-        raise StageGateError(f"{which} key include_byok_in_limit must be true")
+    required_include_byok = include_byok_in_limit_required(key_contract_mode)
+    if key.get("include_byok_in_limit") is not required_include_byok:
+        raise StageGateError(f"{which} key does not match the selected contract mode")
     for field in ("is_management_key", "is_provisioning_key", "is_free_tier"):
         value = key.get(field)
         if not isinstance(value, bool):
@@ -200,7 +218,11 @@ def _key_values(snapshot: dict[str, Any], which: str) -> dict[str, Any]:
     remaining = _number(
         key.get("limit_remaining"), f"{which} key limit_remaining"
     )
-    if limit > AUTHORIZED_BUDGET_USD:
+    limit_max = key_limit_max_usd(key_contract_mode)
+    if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT:
+        if limit != limit_max:
+            raise StageGateError("key limit is not the exact E12 marketplace value")
+    elif limit > limit_max:
         raise StageGateError("key limit exceeds the authorized budget")
     if remaining > limit:
         raise StageGateError(f"{which} key limit_remaining exceeds key limit")
@@ -209,12 +231,16 @@ def _key_values(snapshot: dict[str, Any], which: str) -> dict[str, Any]:
     expires = key.get("expires_at_utc")
     if expires is not None:
         _timestamp(expires, f"{which} key expires_at_utc")
+    byok_usage = None
+    if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT:
+        byok_usage = _number(key.get("byok_usage"), f"{which} key byok_usage")
     return {
         "usage": usage,
         "limit": limit,
         "remaining": remaining,
         "fingerprint": fingerprint,
         "expires_at_utc": expires,
+        "byok_usage": byok_usage,
     }
 
 
@@ -295,10 +321,15 @@ def build_stage_gate_attestation(
     final: bool = False,
     settlement_previous_path: Path | None = None,
     now: datetime | None = None,
+    key_contract_mode: str = STRICT_KEY_CONTRACT,
 ) -> dict[str, Any]:
     """Validate two snapshots and return only fixed, text-free fields."""
     if not isinstance(final, bool):
         raise StageGateError("final must be boolean")
+    try:
+        validate_key_contract_mode(key_contract_mode)
+    except ValueError:
+        raise StageGateError("unknown OpenRouter key contract mode") from None
     next_upper = _decimal_argument(
         next_stage_full_upper_bound_usd,
         "next_stage_full_upper_bound_usd",
@@ -338,8 +369,12 @@ def build_stage_gate_attestation(
         settlement_previous=settlement_previous_at,
     )
 
-    baseline_key = _key_values(baseline, "baseline")
-    current_key = _key_values(current, "current")
+    baseline_key = _key_values(
+        baseline, "baseline", key_contract_mode=key_contract_mode
+    )
+    current_key = _key_values(
+        current, "current", key_contract_mode=key_contract_mode
+    )
     if baseline_key["limit"] != current_key["limit"]:
         raise StageGateError("key limit changed between snapshots")
     if baseline_key["fingerprint"] != current_key["fingerprint"]:
@@ -348,10 +383,19 @@ def build_stage_gate_attestation(
         raise StageGateError("key expiration changed between snapshots")
     if current_key["usage"] < baseline_key["usage"]:
         raise StageGateError("key usage decreased between snapshots")
+    if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT:
+        if current_key["usage"] <= baseline_key["usage"]:
+            raise StageGateError("marketplace key usage did not increase")
+        if current_key["byok_usage"] != baseline_key["byok_usage"]:
+            raise StageGateError("BYOK usage changed during marketplace experiment")
 
     settlement_interval_s: Decimal | None = None
     if settlement_previous is not None:
-        previous_key = _key_values(settlement_previous, "settlement-previous")
+        previous_key = _key_values(
+            settlement_previous,
+            "settlement-previous",
+            key_contract_mode=key_contract_mode,
+        )
         if previous_key != current_key:
             raise StageGateError(
                 "settlement key usage/limit/remaining did not remain equal"
@@ -406,7 +450,7 @@ def build_stage_gate_attestation(
     # This is an explicit whitelist.  Timestamps are parsed and re-rendered in
     # canonical UTC form because stage ordering/settlement is safety evidence;
     # labels, paths, provider bodies, and arbitrary snapshot fields stay out.
-    return {
+    result = {
         "schema_version": 1,
         "status": "pass",
         "mode": "final" if final else "before_next",
@@ -472,6 +516,21 @@ def build_stage_gate_attestation(
             ),
         },
     }
+    if key_contract_mode != STRICT_KEY_CONTRACT:
+        result["key_contract_mode"] = key_contract_mode
+        result["marketplace_route"] = {
+            "origin": "openrouter",
+            "provider": "deepinfra",
+            "byok_allowed": False,
+            "fallbacks_allowed": False,
+        }
+        result["baseline_byok_usage_usd"] = _decimal_text(
+            baseline_key["byok_usage"]
+        )
+        result["current_byok_usage_usd"] = _decimal_text(
+            current_key["byok_usage"]
+        )
+    return result
 
 
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -520,6 +579,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--final", action="store_true")
+    parser.add_argument(
+        "--key-contract-mode",
+        choices=sorted(KEY_CONTRACT_MODES),
+        default=STRICT_KEY_CONTRACT,
+    )
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args(argv)
 
@@ -535,6 +599,7 @@ def main(argv: list[str] | None = None) -> int:
             ),
             final=args.final,
             settlement_previous_path=args.settlement_previous,
+            key_contract_mode=args.key_contract_mode,
         )
         write_json_atomic(args.output, attestation)
     except StageGateError as exc:

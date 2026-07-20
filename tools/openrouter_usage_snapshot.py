@@ -12,8 +12,18 @@ import tempfile
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
+
+from tools.openrouter_key_contract import (
+    E12_MARKETPLACE_KEY_CONTRACT,
+    KEY_CONTRACT_MODES,
+    STRICT_KEY_CONTRACT,
+    include_byok_in_limit_required,
+    key_limit_max_usd,
+    validate_key_contract_mode,
+)
 
 
 DEFAULT_BASE_URL = "https://openrouter.ai"
@@ -130,6 +140,7 @@ def capture_usage_snapshot(
     timeout_s: float = 15.0,
     opener: Callable[..., Any] | None = None,
     now: Callable[[], datetime] | None = None,
+    key_contract_mode: str = STRICT_KEY_CONTRACT,
 ) -> dict[str, Any]:
     """Fetch both endpoints and return only approved numeric metadata."""
     if not api_key:
@@ -141,6 +152,10 @@ def capture_usage_snapshot(
         raise SnapshotError("OpenRouter metadata base URL is not the frozen HTTPS origin")
     if not math.isfinite(timeout_s) or timeout_s <= 0:
         raise SnapshotError("timeout_s must be finite and > 0")
+    try:
+        validate_key_contract_mode(key_contract_mode)
+    except ValueError:
+        raise SnapshotError("unknown OpenRouter key contract mode") from None
 
     captured = now() if now is not None else datetime.now(timezone.utc)
     if captured.tzinfo is None or captured.utcoffset() is None:
@@ -198,8 +213,29 @@ def capture_usage_snapshot(
         raise SnapshotError("OpenRouter key is not a dedicated inference key")
     if is_free_tier:
         raise SnapshotError("OpenRouter key is attached to a free-tier account")
-    if not include_byok_in_limit:
-        raise SnapshotError("OpenRouter key limit does not include BYOK usage")
+    required_include_byok = include_byok_in_limit_required(key_contract_mode)
+    if include_byok_in_limit is not required_include_byok:
+        raise SnapshotError("OpenRouter key does not match the selected contract mode")
+    if limit is None:
+        raise SnapshotError("OpenRouter key limit must be numeric")
+    numeric_limit = Decimal(str(limit))
+    limit_max = key_limit_max_usd(key_contract_mode)
+    if numeric_limit <= 0:
+        raise SnapshotError("OpenRouter key limit must be positive")
+    if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT:
+        if numeric_limit != limit_max:
+            raise SnapshotError("OpenRouter key limit is not the exact E12 value")
+    elif numeric_limit > limit_max:
+        raise SnapshotError("OpenRouter key limit exceeds the authorized budget")
+    byok_usage: int | float | None = None
+    if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT:
+        if "byok_usage" not in key_data:
+            raise SnapshotError("OpenRouter key byok_usage is missing")
+        byok_usage = _numeric_or_none(
+            key_data.get("byok_usage"), "key byok_usage"
+        )
+        if byok_usage is None or byok_usage < 0:
+            raise SnapshotError("OpenRouter key byok_usage must be nonnegative")
     if "expires_at" not in key_data:
         raise SnapshotError("OpenRouter key expires_at is missing")
     expires_at_utc = _expiry(key_data.get("expires_at"), captured=captured)
@@ -220,22 +256,26 @@ def capture_usage_snapshot(
     # raw responses, or lengths.  The only derived identifier is a SHA-256 of
     # the high-entropy key, used solely to prove that all stages used the same
     # credential without persisting the credential itself.
+    key_result = {
+        "http_status": key_status,
+        "usage": usage,
+        "limit": limit,
+        "limit_remaining": limit_remaining,
+        "key_fingerprint_sha256": hashlib.sha256(api_key.encode()).hexdigest(),
+        "limit_reset": None,
+        "include_byok_in_limit": include_byok_in_limit,
+        "is_management_key": False,
+        "is_provisioning_key": False,
+        "is_free_tier": False,
+        "expires_at_utc": expires_at_utc,
+    }
+    if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT:
+        key_result["byok_usage"] = byok_usage
+
     return {
         "schema_version": 1,
         "captured_at_utc": captured_utc,
-        "key": {
-            "http_status": key_status,
-            "usage": usage,
-            "limit": limit,
-            "limit_remaining": limit_remaining,
-            "key_fingerprint_sha256": hashlib.sha256(api_key.encode()).hexdigest(),
-            "limit_reset": None,
-            "include_byok_in_limit": True,
-            "is_management_key": False,
-            "is_provisioning_key": False,
-            "is_free_tier": False,
-            "expires_at_utc": expires_at_utc,
-        },
+        "key": key_result,
         "account": {
             "http_status": credits_status,
             "total_usage": total_usage,
@@ -253,6 +293,7 @@ def snapshot_from_environment(
     environ: dict[str, str] | os._Environ[str] | None = None,
     opener: Callable[..., Any] | None = None,
     now: Callable[[], datetime] | None = None,
+    key_contract_mode: str = STRICT_KEY_CONTRACT,
 ) -> dict[str, Any]:
     if not api_key_env:
         raise SnapshotError("API key environment variable name is empty")
@@ -267,6 +308,7 @@ def snapshot_from_environment(
         timeout_s=timeout_s,
         opener=opener,
         now=now,
+        key_contract_mode=key_contract_mode,
     )
 
 
@@ -311,6 +353,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--timeout-s", type=float, default=15.0)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--no-overwrite", action="store_true")
+    parser.add_argument(
+        "--key-contract-mode",
+        choices=sorted(KEY_CONTRACT_MODES),
+        default=STRICT_KEY_CONTRACT,
+        help=(
+            "strict_server_cap_v1 is the default; the E12 marketplace mode is "
+            "an explicit experiment-only exception for fixed DeepInfra/no-BYOK"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -321,6 +372,7 @@ def main(argv: list[str] | None = None) -> int:
             api_key_env=args.api_key_env,
             base_url=args.base_url,
             timeout_s=args.timeout_s,
+            key_contract_mode=args.key_contract_mode,
         )
         write_json_atomic(args.output, snapshot, overwrite=not args.no_overwrite)
     except SnapshotError as exc:

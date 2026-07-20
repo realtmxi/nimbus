@@ -344,6 +344,7 @@ async def one_request(
     provider_order: list[str] | None = None,
     allow_fallbacks: bool | None = None,
     stop_after_first_token: bool = False,
+    on_generation_id: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Send one streaming chat-completion and measure TTFT/TPOT/e2e.
 
@@ -424,6 +425,11 @@ async def one_request(
         current = result["generation_id_sha256"]
         if current is not None and current != digest:
             return False
+        if on_generation_id is not None:
+            # The callback is an in-memory escape hatch used only by the E12
+            # canary to query OpenRouter's generation metadata.  The raw id is
+            # never inserted into the result or any persisted evidence.
+            on_generation_id(value)
         result["generation_id_sha256"] = digest
         return True
 

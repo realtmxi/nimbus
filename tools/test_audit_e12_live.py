@@ -432,7 +432,7 @@ class LiveFixture(unittest.TestCase):
             return_value=TIMES["canary"],
         ):
             payload = assess_result(
-                raw, key_fingerprint_sha256=KEY_FINGERPRINT
+                raw, key_fingerprint_sha256=KEY_FINGERPRINT, is_byok=False
             )
         return self.write_json("canary.json", payload)
 

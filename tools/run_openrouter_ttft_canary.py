@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import json
 import math
 import os
 import re
@@ -32,6 +33,10 @@ CANARY_PROMPT = "Nimbus E12 synthetic TTFT canary; no user or trace data."
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL = "qwen/qwen3-32b"
 OPENROUTER_PROVIDER = "deepinfra"
+OPENROUTER_GENERATION_URL = "https://openrouter.ai/api/v1/generation"
+GENERATION_METADATA_MAX_BYTES = 1_000_000
+GENERATION_METADATA_ATTEMPTS = 8
+GENERATION_METADATA_POLL_S = 2.0
 ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -45,7 +50,7 @@ def _utc_now() -> str:
 
 
 def assess_result(
-    result: dict[str, Any], *, key_fingerprint_sha256: str
+    result: dict[str, Any], *, key_fingerprint_sha256: str, is_byok: bool
 ) -> dict[str, Any]:
     """Validate a raw request result and return only approved fields."""
     if not isinstance(key_fingerprint_sha256, str) or not SHA256_RE.fullmatch(
@@ -79,12 +84,14 @@ def assess_result(
         raise CanaryError("canary response model does not match the frozen model")
     if result.get("cost_pending") is not True or result.get("cost_usd") is not None:
         raise CanaryError("canary cancel cost was not kept pending")
+    if is_byok is not False:
+        raise CanaryError("canary generation was not marketplace-billed")
 
     # ``one_request`` hashes the provider-controlled header/SSE id at the
     # transport boundary.  Validate and forward that digest; never accept a
     # raw identifier here and never double-hash the digest.
     generation_id_sha256 = result.get("generation_id_sha256")
-    if generation_id_sha256 is not None and (
+    if (
         not isinstance(generation_id_sha256, str)
         or not SHA256_RE.fullmatch(generation_id_sha256)
     ):
@@ -107,7 +114,82 @@ def assess_result(
         "cost_pending": True,
         "key_fingerprint_sha256": key_fingerprint_sha256,
         "generation_id_sha256": generation_id_sha256,
+        "is_byok": False,
     }
+
+
+async def fetch_generation_is_byok(
+    session: Any,
+    *,
+    api_key: str,
+    generation_id: str,
+    timeout_s: float = 10.0,
+    attempts: int = GENERATION_METADATA_ATTEMPTS,
+    poll_s: float = GENERATION_METADATA_POLL_S,
+) -> bool:
+    """Poll sanitized generation metadata and return its exact BYOK bit."""
+    if not isinstance(generation_id, str) or not generation_id:
+        raise CanaryError("canary generation id is unavailable")
+    if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts <= 0:
+        raise CanaryError("generation metadata attempts must be positive")
+    if not math.isfinite(timeout_s) or timeout_s <= 0:
+        raise CanaryError("generation metadata timeout must be positive")
+    if not math.isfinite(poll_s) or poll_s < 0:
+        raise CanaryError("generation metadata poll interval is invalid")
+    for attempt in range(attempts):
+        try:
+            async with session.get(
+                OPENROUTER_GENERATION_URL,
+                params={"id": generation_id},
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Accept": "application/json",
+                },
+                timeout=timeout_s,
+                allow_redirects=False,
+            ) as response:
+                status = int(response.status)
+                if 300 <= status < 400:
+                    raise CanaryError("generation metadata request was redirected")
+                if status in {202, 404}:
+                    pass
+                elif status != 200:
+                    raise CanaryError(
+                        f"generation metadata returned HTTP {status}"
+                    )
+                else:
+                    raw = await response.content.read(
+                        GENERATION_METADATA_MAX_BYTES + 1
+                    )
+                    if len(raw) > GENERATION_METADATA_MAX_BYTES:
+                        raise CanaryError("generation metadata response is too large")
+                    try:
+                        payload = json.loads(raw)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        raise CanaryError(
+                            "generation metadata response is not valid JSON"
+                        ) from None
+                    data = payload.get("data") if isinstance(payload, dict) else None
+                    if isinstance(data, dict) and isinstance(
+                        data.get("is_byok"), bool
+                    ):
+                        return data["is_byok"]
+                    # A generation record can become visible before all billing
+                    # fields settle.  Keep polling, but never treat missing/null
+                    # is_byok as false and never publish the partial response.
+        except CanaryError:
+            raise
+        except (asyncio.TimeoutError, OSError):
+            # Finite retry for eventual generation-record availability or a
+            # transient transport failure.  Never stringify provider errors.
+            pass
+        except Exception:
+            # aiohttp transport exceptions are not stable across versions;
+            # retry without ever serializing their potentially sensitive text.
+            pass
+        if attempt + 1 < attempts:
+            await asyncio.sleep(poll_s)
+    raise CanaryError("generation metadata did not settle within the poll window")
 
 
 async def run_canary(*, api_key_env: str, timeout_s: float) -> dict[str, Any]:
@@ -136,6 +218,14 @@ async def run_canary(*, api_key_env: str, timeout_s: float) -> dict[str, Any]:
         "prompt": CANARY_PROMPT,
         "max_tokens": 1,
     }
+    generation_id: str | None = None
+
+    def capture_generation_id(value: str) -> None:
+        nonlocal generation_id
+        if generation_id is not None and generation_id != value:
+            raise CanaryError("canary generation id changed during streaming")
+        generation_id = value
+
     async with common.aiohttp.ClientSession(
         connector=common.aiohttp.TCPConnector(limit=1)
     ) as session:
@@ -150,10 +240,25 @@ async def run_canary(*, api_key_env: str, timeout_s: float) -> dict[str, Any]:
             provider_order=[OPENROUTER_PROVIDER],
             allow_fallbacks=False,
             stop_after_first_token=True,
+            on_generation_id=capture_generation_id,
+        )
+        if generation_id is None:
+            raise CanaryError("canary response omitted the generation id")
+        expected_digest = hashlib.sha256(
+            generation_id.encode("utf-8", errors="surrogatepass")
+        ).hexdigest()
+        if raw.get("generation_id_sha256") != expected_digest:
+            raise CanaryError("canary generation id evidence is inconsistent")
+        is_byok = await fetch_generation_is_byok(
+            session,
+            api_key=api_key,
+            generation_id=generation_id,
+            timeout_s=min(5.0, timeout_s),
         )
     return assess_result(
         raw,
         key_fingerprint_sha256=hashlib.sha256(api_key.encode()).hexdigest(),
+        is_byok=is_byok,
     )
 
 

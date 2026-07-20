@@ -3,6 +3,18 @@
 # by the caller; this script only runs clients and never starts or kills a GPU
 # process.
 set -euo pipefail
+set +x
+
+# Capture the frozen OpenRouter secret before the first external command, then
+# remove it from the matrix environment.  The value remains a non-exported
+# shell variable and is scoped only to the usage capture and router.run below;
+# git, evidence, budget, launch-verification, and other child processes never
+# inherit it.
+MATRIX_OPENROUTER_API_KEY_WAS_SET=${OPENROUTER_API_KEY+x}
+MATRIX_OPENROUTER_API_KEY=${OPENROUTER_API_KEY-}
+unset OPENROUTER_API_KEY
+MATRIX_CLOUD_API_KEY_SECRET=
+trap 'MATRIX_CLOUD_API_KEY_SECRET=; MATRIX_OPENROUTER_API_KEY=' EXIT
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -81,6 +93,7 @@ E12_LIVE_ARM_ORDER_SEED_WAS_SET=${E12_LIVE_ARM_ORDER_SEED+x}
 E12_LIVE_AUTHORIZED_BUDGET_USD_WAS_SET=${E12_LIVE_AUTHORIZED_BUDGET_USD+x}
 E12_LIVE_BUDGET_ATTESTATION_SHA256_WAS_SET=${E12_LIVE_BUDGET_ATTESTATION_SHA256+x}
 E12_LIVE_KEY_LIMIT_MAX_USD_WAS_SET=${E12_LIVE_KEY_LIMIT_MAX_USD+x}
+E12_LIVE_KEY_CONTRACT_MODE_WAS_SET=${E12_LIVE_KEY_CONTRACT_MODE+x}
 E12_LIVE_STAGE_LAUNCH_ATTESTATION_WAS_SET=${E12_LIVE_STAGE_LAUNCH_ATTESTATION+x}
 E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256_WAS_SET=${E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256+x}
 E12_LIVE_PRICE_SNAPSHOT_WAS_SET=${E12_LIVE_PRICE_SNAPSHOT+x}
@@ -99,6 +112,7 @@ E12_LIVE_ARM_ORDER_SEED=${E12_LIVE_ARM_ORDER_SEED:-20260716}
 E12_LIVE_AUTHORIZED_BUDGET_USD=${E12_LIVE_AUTHORIZED_BUDGET_USD:-}
 E12_LIVE_BUDGET_ATTESTATION_SHA256=${E12_LIVE_BUDGET_ATTESTATION_SHA256:-}
 E12_LIVE_KEY_LIMIT_MAX_USD=${E12_LIVE_KEY_LIMIT_MAX_USD:-}
+E12_LIVE_KEY_CONTRACT_MODE=${E12_LIVE_KEY_CONTRACT_MODE:-strict_server_cap_v1}
 E12_LIVE_STAGE_LAUNCH_ATTESTATION=${E12_LIVE_STAGE_LAUNCH_ATTESTATION:-}
 E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256=${E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256:-}
 E12_LIVE_PRICE_SNAPSHOT=${E12_LIVE_PRICE_SNAPSHOT:-}
@@ -111,6 +125,9 @@ E12_LIVE_STAGE_BUDGET_GATE=${E12_LIVE_STAGE_BUDGET_GATE:-}
 E12_LIVE_A_DIR=${E12_LIVE_A_DIR:-}
 E12_LIVE_A_STAGE_LAUNCH_ATTESTATION=${E12_LIVE_A_STAGE_LAUNCH_ATTESTATION:-}
 E12_LIVE_CONTRACT=e12_current_turn_v1
+if [[ "$E12_LIVE_KEY_CONTRACT_MODE" == e12_marketplace_deepinfra_no_byok_v1 ]]; then
+  E12_LIVE_CONTRACT=e12_current_turn_marketplace_v2
+fi
 E12_LIVE_COOLDOWN_S=20
 E12_LIVE_ACTIVE=0
 if [[ -n "$E12_LIVE_CONTRACT_ID_WAS_SET" || \
@@ -120,6 +137,7 @@ if [[ -n "$E12_LIVE_CONTRACT_ID_WAS_SET" || \
       -n "$E12_LIVE_AUTHORIZED_BUDGET_USD_WAS_SET" || \
       -n "$E12_LIVE_BUDGET_ATTESTATION_SHA256_WAS_SET" || \
       -n "$E12_LIVE_KEY_LIMIT_MAX_USD_WAS_SET" || \
+      -n "$E12_LIVE_KEY_CONTRACT_MODE_WAS_SET" || \
       -n "$E12_LIVE_STAGE_LAUNCH_ATTESTATION_WAS_SET" || \
       -n "$E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256_WAS_SET" || \
       -n "$E12_LIVE_PRICE_SNAPSHOT_WAS_SET" || \
@@ -184,8 +202,20 @@ if [[ -n "$E12_LIVE_CONTRACT_ID_WAS_SET" || \
     printf 'E12_LIVE_BUDGET_ATTESTATION_SHA256 must be exactly 64 lowercase hex characters\n' >&2
     exit 4
   fi
-  if [[ "$E12_LIVE_KEY_LIMIT_MAX_USD" != 3 ]]; then
-    printf 'E12 live freezes E12_LIVE_KEY_LIMIT_MAX_USD=3\n' >&2
+  case "$E12_LIVE_KEY_CONTRACT_MODE" in
+    strict_server_cap_v1)
+      E12_LIVE_EXPECTED_KEY_LIMIT_MAX_USD=3
+      ;;
+    e12_marketplace_deepinfra_no_byok_v1)
+      E12_LIVE_EXPECTED_KEY_LIMIT_MAX_USD=5
+      ;;
+    *)
+      printf 'unknown E12_LIVE_KEY_CONTRACT_MODE\n' >&2
+      exit 4
+      ;;
+  esac
+  if [[ "$E12_LIVE_KEY_LIMIT_MAX_USD" != "$E12_LIVE_EXPECTED_KEY_LIMIT_MAX_USD" ]]; then
+    printf 'E12 key-limit maximum does not match the selected key contract\n' >&2
     exit 4
   fi
   if [[ ! "$E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
@@ -248,7 +278,16 @@ if [[ "$CLOUD" == real ]]; then
     printf 'CLOUD_API_KEY_ENV must be an environment-variable name\n' >&2
     exit 4
   fi
-  if [[ -z "${!CLOUD_API_KEY_ENV:-}" ]]; then
+  if [[ "$CLOUD_API_KEY_ENV" == OPENROUTER_API_KEY && \
+        -n "$MATRIX_OPENROUTER_API_KEY_WAS_SET" ]]; then
+    MATRIX_CLOUD_API_KEY_SECRET=$MATRIX_OPENROUTER_API_KEY
+  else
+    MATRIX_CLOUD_API_KEY_SECRET=${!CLOUD_API_KEY_ENV:-}
+    unset "$CLOUD_API_KEY_ENV"
+  fi
+  MATRIX_OPENROUTER_API_KEY=
+  unset MATRIX_OPENROUTER_API_KEY_WAS_SET
+  if [[ -z "$MATRIX_CLOUD_API_KEY_SECRET" ]]; then
     printf 'real cloud requires nonempty secret env %s\n' \
       "$CLOUD_API_KEY_ENV" >&2
     exit 4
@@ -288,6 +327,9 @@ if [[ "$CLOUD" == real ]]; then
 elif [[ "$CLOUD" != null ]]; then
   printf 'CLOUD must be null or real (got %s)\n' "$CLOUD" >&2
   exit 4
+else
+  MATRIX_OPENROUTER_API_KEY=
+  unset MATRIX_OPENROUTER_API_KEY_WAS_SET
 fi
 
 if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -600,8 +642,10 @@ if [[ "$E12_LIVE_ACTIVE" == 1 ]]; then
   fi
   (
     umask 077
+    export "$CLOUD_API_KEY_ENV=$MATRIX_CLOUD_API_KEY_SECRET"
     "$PYBIN" -m tools.openrouter_usage_snapshot \
       --api-key-env "$CLOUD_API_KEY_ENV" \
+      --key-contract-mode "$E12_LIVE_KEY_CONTRACT_MODE" \
       --output "$E12_LIVE_CURRENT_USAGE_ARTIFACT" \
       --no-overwrite
   )
@@ -617,6 +661,7 @@ if [[ "$E12_LIVE_ACTIVE" == 1 ]]; then
     --attestation "$E12_LIVE_STAGE_LAUNCH_ATTESTATION" \
     --expected-sha256 "$E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256" \
     --stage "$E12_LIVE_STAGE" \
+    --key-contract-mode "$E12_LIVE_KEY_CONTRACT_MODE" \
     --contract-id "$E12_LIVE_CONTRACT_ID" \
     --trace-manifest-sha256 "$TRACE_MANIFEST_SHA" \
     --profile-sha256 "$PROFILE_SHA" \
@@ -671,13 +716,14 @@ if [[ "$E12_LIVE_ACTIVE" == 1 ]]; then
     "$E12_LIVE_AUTHORIZED_BUDGET_USD"
     "$E12_LIVE_BUDGET_ATTESTATION_SHA256"
     "$E12_LIVE_KEY_LIMIT_MAX_USD"
+    "$E12_LIVE_KEY_CONTRACT_MODE"
     "$E12_LIVE_COOLDOWN_S"
     "$E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256"
     "$E12_LIVE_CURRENT_USAGE_SHA256"
     "$E12_LIVE_VERIFY_RECEIPT_SHA256"
   )
   printf -v E12_LIVE_MANIFEST_LINE \
-    'live_contract_id=%s live_contract=%s live_stage=%s live_expected_trace_n=%s live_arm_order_seed=%s live_exact_arm=%s live_authorized_budget_usd=%s live_budget_attestation_sha256=%s live_key_limit_max_usd=%s live_cooldown_s=%s live_stage_launch_attestation_sha256=%s live_current_usage_sha256=%s live_stage_launch_verify_receipt_sha256=%s' \
+    'live_contract_id=%s live_contract=%s live_stage=%s live_expected_trace_n=%s live_arm_order_seed=%s live_exact_arm=%s live_authorized_budget_usd=%s live_budget_attestation_sha256=%s live_key_limit_max_usd=%s live_key_contract_mode=%s live_cooldown_s=%s live_stage_launch_attestation_sha256=%s live_current_usage_sha256=%s live_stage_launch_verify_receipt_sha256=%s' \
     "${LIVE_FINGERPRINT_ARGS[@]}"
 fi
 RUN_FINGERPRINT="$($PYBIN - "$TRACE_SHA" "$TRACE_MANIFEST_SHA" "$PROFILE_SHA" \
@@ -945,12 +991,13 @@ for arm in "$@"; do
   fi
   {
     if [[ "$E12_LIVE_ACTIVE" == 1 ]]; then
-      printf 'arm_started_at=%s arm=%s live_contract_id=%s live_stage=%s live_authorized_budget_usd=%s live_budget_attestation_sha256=%s live_key_limit_max_usd=%s live_cooldown_s=%s live_stage_launch_attestation_sha256=%s live_current_usage_sha256=%s live_stage_launch_verify_receipt_sha256=%s command=router.run_config_bound_by_fingerprint\n' \
+      printf 'arm_started_at=%s arm=%s live_contract_id=%s live_stage=%s live_authorized_budget_usd=%s live_budget_attestation_sha256=%s live_key_limit_max_usd=%s live_key_contract_mode=%s live_cooldown_s=%s live_stage_launch_attestation_sha256=%s live_current_usage_sha256=%s live_stage_launch_verify_receipt_sha256=%s command=router.run_config_bound_by_fingerprint\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$arm" \
         "$E12_LIVE_CONTRACT_ID" "$E12_LIVE_STAGE" \
         "$E12_LIVE_AUTHORIZED_BUDGET_USD" \
         "$E12_LIVE_BUDGET_ATTESTATION_SHA256" \
         "$E12_LIVE_KEY_LIMIT_MAX_USD" \
+        "$E12_LIVE_KEY_CONTRACT_MODE" \
         "$E12_LIVE_COOLDOWN_S" \
         "$E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256" \
         "$E12_LIVE_CURRENT_USAGE_SHA256" \
@@ -962,7 +1009,10 @@ for arm in "$@"; do
       printf '\n'
     fi
   } >> "$EVENTS"
-  "${cmd[@]}"
+  (
+    export "$CLOUD_API_KEY_ENV=$MATRIX_CLOUD_API_KEY_SECRET"
+    "${cmd[@]}"
+  )
   if [[ "$CLOUD" == real ]]; then
     check_systemic_cloud_errors "$raw" "$arm" pre_marker
   fi
@@ -971,12 +1021,13 @@ for arm in "$@"; do
     check_systemic_cloud_errors "$raw" "$arm" post_marker
   fi
   if [[ "$E12_LIVE_ACTIVE" == 1 ]]; then
-    printf 'arm_finished_at=%s arm=%s live_contract_id=%s live_stage=%s live_authorized_budget_usd=%s live_budget_attestation_sha256=%s live_key_limit_max_usd=%s live_cooldown_s=%s live_stage_launch_attestation_sha256=%s live_current_usage_sha256=%s live_stage_launch_verify_receipt_sha256=%s\n' \
+    printf 'arm_finished_at=%s arm=%s live_contract_id=%s live_stage=%s live_authorized_budget_usd=%s live_budget_attestation_sha256=%s live_key_limit_max_usd=%s live_key_contract_mode=%s live_cooldown_s=%s live_stage_launch_attestation_sha256=%s live_current_usage_sha256=%s live_stage_launch_verify_receipt_sha256=%s\n' \
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$arm" \
       "$E12_LIVE_CONTRACT_ID" "$E12_LIVE_STAGE" \
       "$E12_LIVE_AUTHORIZED_BUDGET_USD" \
       "$E12_LIVE_BUDGET_ATTESTATION_SHA256" \
       "$E12_LIVE_KEY_LIMIT_MAX_USD" \
+      "$E12_LIVE_KEY_CONTRACT_MODE" \
       "$E12_LIVE_COOLDOWN_S" \
       "$E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256" \
       "$E12_LIVE_CURRENT_USAGE_SHA256" \
@@ -989,12 +1040,13 @@ for arm in "$@"; do
 done
 
 if [[ "$E12_LIVE_ACTIVE" == 1 ]]; then
-  printf 'matrix_finished_at=%s run_fingerprint=%s live_contract_id=%s live_stage=%s live_authorized_budget_usd=%s live_budget_attestation_sha256=%s live_key_limit_max_usd=%s live_cooldown_s=%s live_stage_launch_attestation_sha256=%s live_current_usage_sha256=%s live_stage_launch_verify_receipt_sha256=%s\n' \
+  printf 'matrix_finished_at=%s run_fingerprint=%s live_contract_id=%s live_stage=%s live_authorized_budget_usd=%s live_budget_attestation_sha256=%s live_key_limit_max_usd=%s live_key_contract_mode=%s live_cooldown_s=%s live_stage_launch_attestation_sha256=%s live_current_usage_sha256=%s live_stage_launch_verify_receipt_sha256=%s\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RUN_FINGERPRINT" \
     "$E12_LIVE_CONTRACT_ID" "$E12_LIVE_STAGE" \
     "$E12_LIVE_AUTHORIZED_BUDGET_USD" \
     "$E12_LIVE_BUDGET_ATTESTATION_SHA256" \
     "$E12_LIVE_KEY_LIMIT_MAX_USD" \
+    "$E12_LIVE_KEY_CONTRACT_MODE" \
     "$E12_LIVE_COOLDOWN_S" \
     "$E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256" \
     "$E12_LIVE_CURRENT_USAGE_SHA256" \

@@ -69,6 +69,7 @@ class TestTTFTSelectorMatrixRunner(unittest.TestCase):
             "E12_LIVE_AUTHORIZED_BUDGET_USD",
             "E12_LIVE_BUDGET_ATTESTATION_SHA256",
             "E12_LIVE_KEY_LIMIT_MAX_USD",
+            "E12_LIVE_KEY_CONTRACT_MODE",
             "E12_LIVE_STAGE_LAUNCH_ATTESTATION",
             "E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256",
             "E12_LIVE_PRICE_SNAPSHOT",
@@ -216,6 +217,23 @@ class TestTTFTSelectorMatrixRunner(unittest.TestCase):
                     ],
                 )
 
+        marketplace = self.run_contract_setup(
+            CLOUD="real",
+            E12_LIVE_CONTRACT_ID="e12-live-marketplace-001",
+            E12_LIVE_STAGE="A",
+            E12_LIVE_AUTHORIZED_BUDGET_USD="3",
+            E12_LIVE_BUDGET_ATTESTATION_SHA256=ATTESTATION_SHA,
+            E12_LIVE_KEY_LIMIT_MAX_USD="5",
+            E12_LIVE_KEY_CONTRACT_MODE="e12_marketplace_deepinfra_no_byok_v1",
+            E12_LIVE_STAGE_LAUNCH_ATTESTATION=LAUNCH_PATH,
+            E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256=LAUNCH_SHA,
+            **EVIDENCE_ENV,
+        )
+        self.assertEqual(marketplace.returncode, 0, marketplace.stderr)
+        fields = marketplace.stdout.strip().split("\t")
+        self.assertEqual(fields[3], "e12_current_turn_marketplace_v2")
+        self.assertEqual(fields[8], "5")
+
     def test_contract_setup_rejects_partial_or_mutated_e12_contracts(self) -> None:
         authorized = {
             **EVIDENCE_ENV,
@@ -271,6 +289,7 @@ class TestTTFTSelectorMatrixRunner(unittest.TestCase):
     "$E12_LIVE_AUTHORIZED_BUDGET_USD"
     "$E12_LIVE_BUDGET_ATTESTATION_SHA256"
     "$E12_LIVE_KEY_LIMIT_MAX_USD"
+    "$E12_LIVE_KEY_CONTRACT_MODE"
     "$E12_LIVE_COOLDOWN_S"
     "$E12_LIVE_STAGE_LAUNCH_ATTESTATION_SHA256"
     "$E12_LIVE_CURRENT_USAGE_SHA256"
@@ -282,6 +301,7 @@ class TestTTFTSelectorMatrixRunner(unittest.TestCase):
             "live_expected_trace_n=%s live_arm_order_seed=%s live_exact_arm=%s "
             "live_authorized_budget_usd=%s "
             "live_budget_attestation_sha256=%s live_key_limit_max_usd=%s "
+            "live_key_contract_mode=%s "
             "live_cooldown_s=%s live_stage_launch_attestation_sha256=%s "
             "live_current_usage_sha256=%s "
             "live_stage_launch_verify_receipt_sha256=%s",
@@ -291,6 +311,7 @@ class TestTTFTSelectorMatrixRunner(unittest.TestCase):
             "arm_started_at=%s arm=%s live_contract_id=%s live_stage=%s "
             "live_authorized_budget_usd=%s "
             "live_budget_attestation_sha256=%s live_key_limit_max_usd=%s "
+            "live_key_contract_mode=%s "
             "live_cooldown_s=%s live_stage_launch_attestation_sha256=%s "
             "live_current_usage_sha256=%s "
             "live_stage_launch_verify_receipt_sha256=%s "
@@ -301,6 +322,7 @@ class TestTTFTSelectorMatrixRunner(unittest.TestCase):
             "matrix_finished_at=%s run_fingerprint=%s live_contract_id=%s "
             "live_stage=%s live_authorized_budget_usd=%s "
             "live_budget_attestation_sha256=%s live_key_limit_max_usd=%s "
+            "live_key_contract_mode=%s "
             "live_cooldown_s=%s live_stage_launch_attestation_sha256=%s "
             "live_current_usage_sha256=%s "
             "live_stage_launch_verify_receipt_sha256=%s",
@@ -342,6 +364,32 @@ class TestTTFTSelectorMatrixRunner(unittest.TestCase):
         self.assertIn(
             '--data "$DATA" --expected-trace-sha256 "$TRACE_SHA"',
             self.source,
+        )
+
+    def test_openrouter_secret_is_unset_before_children_and_scoped(self) -> None:
+        capture = (
+            "MATRIX_OPENROUTER_API_KEY=${OPENROUTER_API_KEY-}\n"
+            "unset OPENROUTER_API_KEY"
+        )
+        first_external = 'REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"'
+        self.assertIn("set +x", self.source)
+        self.assertIn(capture, self.source)
+        self.assertLess(self.source.index(capture), self.source.index(first_external))
+        self.assertIn(
+            'export "$CLOUD_API_KEY_ENV=$MATRIX_CLOUD_API_KEY_SECRET"\n'
+            '    "$PYBIN" -m tools.openrouter_usage_snapshot',
+            self.source,
+        )
+        self.assertIn(
+            'export "$CLOUD_API_KEY_ENV=$MATRIX_CLOUD_API_KEY_SECRET"\n'
+            '    "${cmd[@]}"',
+            self.source,
+        )
+        self.assertEqual(
+            self.source.count(
+                'export "$CLOUD_API_KEY_ENV=$MATRIX_CLOUD_API_KEY_SECRET"'
+            ),
+            2,
         )
 
     def test_e12_payload_and_expected_n_cannot_bypass_contract(self) -> None:

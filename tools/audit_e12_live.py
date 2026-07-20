@@ -45,9 +45,18 @@ from tools.check_e12_live_budget import (
     BudgetCheckError,
     validate_materializer_manifest_schema,
 )
+from tools.openrouter_key_contract import (
+    E12_MARKETPLACE_KEY_CONTRACT,
+    KEY_CONTRACT_MODES,
+    STRICT_KEY_CONTRACT,
+    include_byok_in_limit_required,
+    key_limit_max_usd,
+    validate_key_contract_mode,
+)
 
 
 LIVE_CONTRACT = "e12_current_turn_v1"
+MARKETPLACE_LIVE_CONTRACT = "e12_current_turn_marketplace_v2"
 PAYLOAD_MODE = "sharegpt_current_turn_retokenized"
 CACHE_MODE = "none"
 TRACE_N = 11_604
@@ -57,7 +66,6 @@ TRACE_SHA256 = (
 PROMPT_TOKEN_SUM = 1_289_405
 DECODE_TOKEN_SUM = 3_038_796
 AUTHORIZED_BUDGET_USD = Decimal("3")
-KEY_LIMIT_MAX_USD = Decimal("3")
 MIN_STAGE_COOLDOWN_S = Decimal("20")
 INPUT_PRICE = Decimal("0.08")
 OUTPUT_PRICE = Decimal("0.28")
@@ -157,6 +165,15 @@ class UsageSnapshot:
     account_usage: Decimal | None
     account_credits: Decimal | None
     account_remaining: Decimal | None
+    byok_usage: Decimal | None
+
+
+def _live_contract(key_contract_mode: str) -> str:
+    return (
+        MARKETPLACE_LIVE_CONTRACT
+        if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT
+        else LIVE_CONTRACT
+    )
 
 
 def _sha256(path: Path, label: str) -> str:
@@ -354,7 +371,10 @@ FINGERPRINT_LIVE_KEYS = (
     "live_contract_id", "live_contract", "live_stage",
     "live_expected_trace_n", "live_arm_order_seed", "live_exact_arm",
     "live_authorized_budget_usd", "live_budget_attestation_sha256",
-    "live_key_limit_max_usd", "live_cooldown_s",
+    "live_key_limit_max_usd",
+)
+FINGERPRINT_LIVE_TAIL_KEYS = (
+    "live_cooldown_s",
     "live_stage_launch_attestation_sha256",
     "live_current_usage_sha256", "live_stage_launch_verify_receipt_sha256",
 )
@@ -366,6 +386,9 @@ def recompute_run_fingerprint(manifest: dict[str, Any]) -> str:
         base = [manifest[key] for key in FINGERPRINT_BASE_KEYS]
         arms = manifest["arms"]
         extras = [manifest[key] for key in FINGERPRINT_LIVE_KEYS]
+        if "live_key_contract_mode" in manifest:
+            extras.append(manifest["live_key_contract_mode"])
+        extras.extend(manifest[key] for key in FINGERPRINT_LIVE_TAIL_KEYS)
     except KeyError as exc:
         raise EvidenceError(f"manifest lacks fingerprint input {exc.args[0]}") from None
     if not all(isinstance(value, str) for value in base + extras):
@@ -610,6 +633,7 @@ def _validate_stage_manifest(
     launch_sha: str,
     live_current_usage_sha: str,
     launch_verify_receipt_sha: str,
+    key_contract_mode: str,
 ) -> None:
     source = f"stage {label} manifest"
     arm = EXPECTED_ARMS[label]
@@ -641,15 +665,19 @@ def _validate_stage_manifest(
         "secret_value_recorded": "false",
         "arm_order_mode": "e12_contract_stage",
         "arm_order_seed": ARM_ORDER_SEED,
-        "live_contract": LIVE_CONTRACT,
+        "live_contract": _live_contract(key_contract_mode),
         "live_stage": label,
         "live_expected_trace_n": str(identity.n),
         "live_arm_order_seed": ARM_ORDER_SEED,
         "live_exact_arm": arm,
         "live_authorized_budget_usd": "3",
-        "live_key_limit_max_usd": "3",
+        "live_key_limit_max_usd": _decimal_text(
+            key_limit_max_usd(key_contract_mode)
+        ),
         "live_cooldown_s": "20",
     }
+    if key_contract_mode != STRICT_KEY_CONTRACT or "live_key_contract_mode" in manifest:
+        exact["live_key_contract_mode"] = key_contract_mode
     for key, expected in exact.items():
         if manifest.get(key) != expected:
             raise EvidenceError(f"{source}: frozen field mismatch")
@@ -695,7 +723,9 @@ def _validate_stage_manifest(
         raise EvidenceError(f"{source}: run fingerprint does not bind exact inputs")
 
 
-def _event_regexes() -> tuple[re.Pattern[str], re.Pattern[str], re.Pattern[str]]:
+def _event_regexes(
+    *, has_key_contract_mode: bool
+) -> tuple[re.Pattern[str], re.Pattern[str], re.Pattern[str]]:
     token = r"(\S+)"
     common = (
         r" live_contract_id=" + token
@@ -703,6 +733,7 @@ def _event_regexes() -> tuple[re.Pattern[str], re.Pattern[str], re.Pattern[str]]
         + r" live_authorized_budget_usd=" + token
         + r" live_budget_attestation_sha256=" + token
         + r" live_key_limit_max_usd=" + token
+        + (r" live_key_contract_mode=" + token if has_key_contract_mode else "")
         + r" live_cooldown_s=" + token
         + r" live_stage_launch_attestation_sha256=" + token
         + r" live_current_usage_sha256=" + token
@@ -724,27 +755,38 @@ def _validate_events(path: Path, label: str, manifest: dict[str, Any]) -> EventA
         raise EvidenceError(f"{source}: unreadable UTF-8") from None
     if len(lines) != 3 or any(not line for line in lines):
         raise EvidenceError(f"{source}: require exactly three complete event lines")
-    start_re, finish_re, matrix_re = _event_regexes()
+    has_key_contract_mode = "live_key_contract_mode" in manifest
+    start_re, finish_re, matrix_re = _event_regexes(
+        has_key_contract_mode=has_key_contract_mode
+    )
     matches = (start_re.fullmatch(lines[0]), finish_re.fullmatch(lines[1]), matrix_re.fullmatch(lines[2]))
     if any(match is None for match in matches):
         raise EvidenceError(f"{source}: event line does not match live schema")
     start, finish, matrix = matches
     assert start is not None and finish is not None and matrix is not None
-    # timestamp/arm-or-fingerprint precede nine identical live fields.
+    # timestamp/arm-or-fingerprint precede ten identical live fields.
     expected_live = (
         manifest["live_contract_id"], label, "3",
-        manifest["live_budget_attestation_sha256"], "3", "20",
+        manifest["live_budget_attestation_sha256"],
+        manifest["live_key_limit_max_usd"],
+        *(
+            (manifest["live_key_contract_mode"],)
+            if has_key_contract_mode
+            else ()
+        ),
+        "20",
         manifest["live_stage_launch_attestation_sha256"],
         manifest["live_current_usage_sha256"],
         manifest["live_stage_launch_verify_receipt_sha256"],
     )
-    if start.group(2) != EXPECTED_ARMS[label] or tuple(start.group(i) for i in range(3, 12)) != expected_live:
+    common_end = 13 if has_key_contract_mode else 12
+    if start.group(2) != EXPECTED_ARMS[label] or tuple(start.group(i) for i in range(3, common_end)) != expected_live:
         raise EvidenceError(f"{source}: start event contract/stage/arm mismatch")
-    if finish.group(2) != EXPECTED_ARMS[label] or tuple(finish.group(i) for i in range(3, 12)) != expected_live:
+    if finish.group(2) != EXPECTED_ARMS[label] or tuple(finish.group(i) for i in range(3, common_end)) != expected_live:
         raise EvidenceError(f"{source}: finish event contract/stage/arm mismatch")
-    if matrix.group(2) != manifest["run_fingerprint"] or tuple(matrix.group(i) for i in range(3, 12)) != expected_live:
+    if matrix.group(2) != manifest["run_fingerprint"] or tuple(matrix.group(i) for i in range(3, common_end)) != expected_live:
         raise EvidenceError(f"{source}: matrix-finish contract/fingerprint mismatch")
-    if start.group(12) != "router.run_config_bound_by_fingerprint":
+    if start.group(common_end) != "router.run_config_bound_by_fingerprint":
         raise EvidenceError(f"{source}: start command attestation is invalid")
     started_at = _parse_iso(start.group(1), source)
     finished_at = _parse_iso(finish.group(1), source)
@@ -1324,6 +1366,7 @@ def _audit_stage(
     launch_sha: str,
     live_current_usage_sha: str,
     launch_verify_receipt_sha: str,
+    key_contract_mode: str,
 ) -> StageAudit:
     if not directory.is_dir():
         raise EvidenceError(f"stage {label}: directory does not exist")
@@ -1331,6 +1374,7 @@ def _audit_stage(
     _validate_stage_manifest(
         manifest, label, identity, trace_manifest_sha, budget_sha, launch_sha,
         live_current_usage_sha, launch_verify_receipt_sha,
+        key_contract_mode,
     )
     markers = sorted(directory.glob("*.complete.json"))
     if len(markers) != 1:
@@ -1439,6 +1483,7 @@ USAGE_KEY_FIELDS = frozenset({
     "is_management_key", "is_provisioning_key", "is_free_tier",
     "expires_at_utc",
 })
+MARKETPLACE_USAGE_KEY_FIELDS = USAGE_KEY_FIELDS | {"byok_usage"}
 USAGE_ACCOUNT_FIELDS = frozenset({
     "http_status", "total_usage", "total_credits", "remaining_credits",
 })
@@ -1460,7 +1505,9 @@ def _decimal_text(value: Decimal) -> str:
     return rendered or "0"
 
 
-def _load_usage_snapshot(path: Path, label: str) -> UsageSnapshot:
+def _load_usage_snapshot(
+    path: Path, label: str, *, key_contract_mode: str = STRICT_KEY_CONTRACT
+) -> UsageSnapshot:
     source = f"usage snapshot {label}"
     sha = _sha256(path, source)
     payload = _json_object(path, source)
@@ -1468,12 +1515,19 @@ def _load_usage_snapshot(path: Path, label: str) -> UsageSnapshot:
         raise EvidenceError(f"{source}: top-level schema mismatch")
     key = _object(payload.get("key"), "key", source)
     account = _object(payload.get("account"), "account", source)
-    if set(key) != USAGE_KEY_FIELDS or set(account) != USAGE_ACCOUNT_FIELDS:
+    expected_key_fields = (
+        MARKETPLACE_USAGE_KEY_FIELDS
+        if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT
+        else USAGE_KEY_FIELDS
+    )
+    if set(key) != expected_key_fields or set(account) != USAGE_ACCOUNT_FIELDS:
         raise EvidenceError(f"{source}: whitelist schema mismatch")
     exact_key = {
         "http_status": 200,
         "limit_reset": None,
-        "include_byok_in_limit": True,
+        "include_byok_in_limit": include_byok_in_limit_required(
+            key_contract_mode
+        ),
         "is_management_key": False,
         "is_provisioning_key": False,
         "is_free_tier": False,
@@ -1498,8 +1552,16 @@ def _load_usage_snapshot(path: Path, label: str) -> UsageSnapshot:
     key_remaining = _nonnegative_decimal(
         key.get("limit_remaining"), "key.limit_remaining", source
     )
-    if key_limit <= 0 or key_limit > KEY_LIMIT_MAX_USD:
-        raise EvidenceError(f"{source}: key limit is not within the exact $3 guard")
+    key_limit_max = key_limit_max_usd(key_contract_mode)
+    if (
+        key_limit <= 0
+        or (
+            key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT
+            and key_limit != key_limit_max
+        )
+        or (key_contract_mode == STRICT_KEY_CONTRACT and key_limit > key_limit_max)
+    ):
+        raise EvidenceError(f"{source}: key limit does not match contract")
     if abs(key_usage + key_remaining - key_limit) > USAGE_ARITHMETIC_TOLERANCE:
         raise EvidenceError(f"{source}: key remaining arithmetic mismatch")
 
@@ -1529,6 +1591,11 @@ def _load_usage_snapshot(path: Path, label: str) -> UsageSnapshot:
                 f"{source}: safe account HTTP 403 must carry only null numerics"
             )
         account_usage = account_credits = account_remaining = None
+    byok_usage = None
+    if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT:
+        byok_usage = _nonnegative_decimal(
+            key.get("byok_usage"), "key.byok_usage", source
+        )
     return UsageSnapshot(
         sha256=sha,
         captured_at=captured_at,
@@ -1538,7 +1605,7 @@ def _load_usage_snapshot(path: Path, label: str) -> UsageSnapshot:
         key_fingerprint_sha256=fingerprint,
         expires_at=expiry,
         limit_reset=None,
-        include_byok_in_limit=True,
+        include_byok_in_limit=include_byok_in_limit_required(key_contract_mode),
         is_management_key=False,
         is_provisioning_key=False,
         is_free_tier=False,
@@ -1546,6 +1613,7 @@ def _load_usage_snapshot(path: Path, label: str) -> UsageSnapshot:
         account_usage=account_usage,
         account_credits=account_credits,
         account_remaining=account_remaining,
+        byok_usage=byok_usage,
     )
 
 
@@ -1567,12 +1635,13 @@ def _same_settled_snapshot(left: UsageSnapshot, right: UsageSnapshot) -> bool:
         and left.account_usage == right.account_usage
         and left.account_credits == right.account_credits
         and left.account_remaining == right.account_remaining
+        and left.byok_usage == right.byok_usage
     )
 
 
 def _validate_final_gate(
     *, gate_path: Path, baseline_path: Path, previous_path: Path,
-    current_path: Path, current_at: datetime,
+    current_path: Path, current_at: datetime, key_contract_mode: str,
 ) -> str:
     actual = _json_object(gate_path, "final budget gate")
     try:
@@ -1582,6 +1651,7 @@ def _validate_final_gate(
             settlement_previous_path=previous_path,
             final=True,
             now=current_at,
+            key_contract_mode=key_contract_mode,
         )
     except StageGateError:
         raise EvidenceError("final budget gate sources are invalid") from None
@@ -1618,6 +1688,7 @@ def _revalidate_launch_attestation(
     settlement_previous_path: Path, settlement_current_path: Path,
     stage_budget_gate_path: Path, stages: dict[str, StageAudit],
     a_dir: Path | None = None, a_launch_attestation_path: Path | None = None,
+    key_contract_mode: str = STRICT_KEY_CONTRACT,
 ) -> dict[str, Any]:
     source = f"stage {label} launch attestation"
     actual = _json_object(attestation_path, source)
@@ -1640,6 +1711,7 @@ def _revalidate_launch_attestation(
             a_dir=a_dir,
             a_launch_attestation_path=a_launch_attestation_path,
             now=authorized_at,
+            key_contract_mode=key_contract_mode,
         )
     except (LaunchCheckError, KeyError):
         raise EvidenceError(f"stage {label} launch evidence is invalid") from None
@@ -1676,6 +1748,7 @@ def _revalidate_launch_attestation(
 def _revalidate_launch_verify_receipt(
     *, label: str, receipt_path: Path, live_current_usage_path: Path,
     launch_attestation_path: Path, stage: StageAudit,
+    key_contract_mode: str = STRICT_KEY_CONTRACT,
 ) -> dict[str, Any]:
     """Validate the persisted last-moment quota check without exposing key IDs."""
     expected_receipt_sha = stage.manifest[
@@ -1687,12 +1760,17 @@ def _revalidate_launch_verify_receipt(
             expected_sha256=expected_receipt_sha,
             launch_attestation_path=launch_attestation_path,
             live_current_usage_path=live_current_usage_path,
+            key_contract_mode=key_contract_mode,
         )
     except LaunchCheckError:
         raise EvidenceError(
             f"stage {label} persisted launch verification is invalid"
         ) from None
-    live = _load_usage_snapshot(live_current_usage_path, f"stage {label} launch")
+    live = _load_usage_snapshot(
+        live_current_usage_path,
+        f"stage {label} launch",
+        key_contract_mode=key_contract_mode,
+    )
     receipt_sha = _sha256(receipt_path, f"stage {label} launch verify receipt")
     if live.sha256 != stage.manifest["live_current_usage_sha256"].lower():
         raise EvidenceError(f"stage {label} manifest does not bind live usage")
@@ -1740,6 +1818,7 @@ def _audit_usage(
     canary_key_fingerprint_sha256: str, stages: dict[str, StageAudit],
     budget: BudgetAudit, a_launch_usage: UsageSnapshot,
     c_launch_usage: UsageSnapshot,
+    key_contract_mode: str = STRICT_KEY_CONTRACT,
 ) -> dict[str, Any]:
     paths = {
         "baseline": baseline_path,
@@ -1751,7 +1830,10 @@ def _audit_usage(
         "final_current": final_current_path,
     }
     snapshots = {
-        label: _load_usage_snapshot(path, label) for label, path in paths.items()
+        label: _load_usage_snapshot(
+            path, label, key_contract_mode=key_contract_mode
+        )
+        for label, path in paths.items()
     }
     ordered_labels = tuple(paths)
     ordered = [snapshots[label] for label in ordered_labels]
@@ -1774,6 +1856,11 @@ def _audit_usage(
             raise EvidenceError("usage audit: account metadata availability changed")
         if snapshot.account_credits != first.account_credits:
             raise EvidenceError("usage audit: account credit identity changed")
+        if (
+            key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT
+            and snapshot.byok_usage != first.byok_usage
+        ):
+            raise EvidenceError("usage audit: BYOK usage changed")
     for snapshot in (a_launch_usage, c_launch_usage):
         if snapshot.key_fingerprint_sha256 != first.key_fingerprint_sha256:
             raise EvidenceError("usage audit: launch API key fingerprint changed")
@@ -1781,6 +1868,11 @@ def _audit_usage(
             raise EvidenceError("usage audit: launch key limit changed")
         if snapshot.expires_at != first.expires_at:
             raise EvidenceError("usage audit: launch key expiry changed")
+        if (
+            key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT
+            and snapshot.byok_usage != first.byok_usage
+        ):
+            raise EvidenceError("usage audit: launch BYOK usage changed")
     if first.expires_at is not None and first.expires_at <= snapshots["final_current"].captured_at:
         raise EvidenceError("usage audit: key expires before final evidence")
     for left, right in zip(ordered, ordered[1:]):
@@ -1829,6 +1921,7 @@ def _audit_usage(
             or settled.key_remaining != live.key_remaining
             or settled.key_fingerprint_sha256 != live.key_fingerprint_sha256
             or settled.expires_at != live.expires_at
+            or settled.byok_usage != live.byok_usage
         ):
             raise EvidenceError(
                 f"usage audit: stage {label} launch counters differ from settlement"
@@ -1840,6 +1933,7 @@ def _audit_usage(
         previous_path=final_previous_path,
         current_path=final_current_path,
         current_at=snapshots["final_current"].captured_at,
+        key_contract_mode=key_contract_mode,
     )
     key_canary = _usage_delta(
         snapshots["pre_A_current"].key_usage, first.key_usage, "key canary"
@@ -1859,6 +1953,10 @@ def _audit_usage(
     )
     if key_canary + key_a + key_c != key_total:
         raise EvidenceError("usage audit: key stage deltas do not add to total")
+    if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT and any(
+        value <= 0 for value in (key_canary, key_a, key_c)
+    ):
+        raise EvidenceError("usage audit: each marketplace stage must increase usage")
 
     account_available = first.account_status == 200
     if account_available:
@@ -1908,7 +2006,15 @@ def _audit_usage(
         "key_limit_usd": _decimal_text(first.key_limit),
         "same_key_fingerprint_verified": True,
         "no_reset_verified": True,
-        "byok_in_limit_verified": True,
+        "byok_in_limit_verified": (
+            key_contract_mode == STRICT_KEY_CONTRACT
+        ),
+        "marketplace_non_byok_verified": (
+            key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT
+        ),
+        "byok_usage_unchanged_verified": (
+            key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT
+        ),
         "paid_dedicated_inference_key_verified": True,
         "key_valid_through_final": True,
         "all_settled_pairs_verified": True,
@@ -1958,10 +2064,15 @@ def audit(
     usage_final_current: str | Path,
     final_gate: str | Path,
     trace_identity: TraceIdentity,
+    key_contract_mode: str = STRICT_KEY_CONTRACT,
 ) -> dict[str, Any]:
     """Audit all E12 live artifacts without writing files or using network I/O."""
     if trace_identity.n <= 0:
         raise EvidenceError("trace identity N must be positive")
+    try:
+        validate_key_contract_mode(key_contract_mode)
+    except ValueError:
+        raise EvidenceError("unknown OpenRouter key contract mode") from None
     for value, label in (
         (trace_identity.trace_sha256, "trace SHA256"),
         (trace_identity.manifest_sha256, "trace manifest SHA256"),
@@ -2006,11 +2117,13 @@ def audit(
             Path(a_dir), "A", trace_identity, trace_manifest_sha, budget.sha256,
             launch_shas["A"], live_current_usage_shas["A"],
             launch_verify_receipt_shas["A"],
+            key_contract_mode,
         ),
         "C": _audit_stage(
             Path(c_dir), "C", trace_identity, trace_manifest_sha, budget.sha256,
             launch_shas["C"], live_current_usage_shas["C"],
             launch_verify_receipt_shas["C"],
+            key_contract_mode,
         ),
     }
     _validate_common_stages(stages["A"], stages["C"])
@@ -2031,6 +2144,7 @@ def audit(
             settlement_current_path=Path(usage_pre_a_current),
             stage_budget_gate_path=Path(pre_a_gate),
             stages=stages,
+            key_contract_mode=key_contract_mode,
         ),
         "C": _revalidate_launch_attestation(
             label="C",
@@ -2047,6 +2161,7 @@ def audit(
             stages=stages,
             a_dir=Path(a_dir),
             a_launch_attestation_path=launch_paths["A"],
+            key_contract_mode=key_contract_mode,
         ),
     }
     if any(
@@ -2066,6 +2181,7 @@ def audit(
             live_current_usage_path=live_current_usage_paths[label],
             launch_attestation_path=launch_paths[label],
             stage=stages[label],
+            key_contract_mode=key_contract_mode,
         )
         for label in ("A", "C")
     }
@@ -2083,6 +2199,11 @@ def audit(
         or not SHA256_RE.fullmatch(canary_key_fingerprint)
     ):
         raise EvidenceError("synthetic canary key fingerprint is invalid")
+    if (
+        key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT
+        and canary_payload.get("is_byok") is not False
+    ):
+        raise EvidenceError("synthetic canary was not marketplace-billed")
     usage = _audit_usage(
         baseline_path=Path(usage_baseline),
         pre_a_previous_path=Path(usage_pre_a_previous),
@@ -2098,6 +2219,7 @@ def audit(
         budget=budget,
         a_launch_usage=launch_verifications["A"]["snapshot"],
         c_launch_usage=launch_verifications["C"]["snapshot"],
+        key_contract_mode=key_contract_mode,
     )
     result = {
         "schema_version": 1,
@@ -2106,10 +2228,13 @@ def audit(
         "text_payload_in_output": False,
         "contract": {
             "id": stages["A"].manifest["live_contract_id"],
-            "name": LIVE_CONTRACT,
+            "name": _live_contract(key_contract_mode),
             "stage_order": ["A", "C"],
             "authorized_budget_usd": "3",
-            "key_limit_max_usd": "3",
+            "key_limit_max_usd": _decimal_text(
+                key_limit_max_usd(key_contract_mode)
+            ),
+            "key_contract_mode": key_contract_mode,
         },
         "evidence": {
             "trace_n": trace_identity.n,
@@ -2230,6 +2355,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--usage-final-current", type=Path, required=True)
     parser.add_argument("--final-gate", type=Path, required=True)
     parser.add_argument(
+        "--key-contract-mode",
+        choices=sorted(KEY_CONTRACT_MODES),
+        default=STRICT_KEY_CONTRACT,
+    )
+    parser.add_argument(
         "--expected-trace-manifest-sha256",
         required=True,
         help=(
@@ -2275,6 +2405,7 @@ def main(argv: list[str] | None = None) -> int:
             usage_final_current=args.usage_final_current,
             final_gate=args.final_gate,
             trace_identity=trace_identity,
+            key_contract_mode=args.key_contract_mode,
         )
     except EvidenceError as exc:
         print(f"E12 live evidence invalid: {exc}", file=sys.stderr)

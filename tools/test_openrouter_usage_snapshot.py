@@ -16,6 +16,7 @@ from tools.openrouter_usage_snapshot import (
     snapshot_from_environment,
     write_json_atomic,
 )
+from tools.openrouter_key_contract import E12_MARKETPLACE_KEY_CONTRACT
 
 
 SECRET = "TEST-OPENROUTER-KEY-DO-NOT-LEAK"
@@ -93,6 +94,39 @@ class RecordingOpener:
 
 
 class TestOpenRouterUsageSnapshot(unittest.TestCase):
+    def test_explicit_e12_marketplace_mode_keeps_real_byok_metadata(self):
+        class MarketplaceOpener(RecordingOpener):
+            def __call__(self, request, *, timeout):
+                if request.full_url.endswith("/api/v1/key"):
+                    return FakeResponse({"data": {
+                        "usage": 1.9,
+                        "limit": 5,
+                        "limit_remaining": 3.1,
+                        "limit_reset": None,
+                        "include_byok_in_limit": False,
+                        "byok_usage": 0.25,
+                        "is_free_tier": False,
+                        "is_management_key": False,
+                        "is_provisioning_key": False,
+                        "expires_at": None,
+                    }}, url=request.full_url)
+                return super().__call__(request, timeout=timeout)
+
+        result = capture_usage_snapshot(
+            api_key=SECRET,
+            opener=MarketplaceOpener(),
+            key_contract_mode=E12_MARKETPLACE_KEY_CONTRACT,
+        )
+        self.assertEqual(result["key"]["limit"], 5)
+        self.assertIs(result["key"]["include_byok_in_limit"], False)
+        self.assertEqual(result["key"]["byok_usage"], 0.25)
+
+        broken = MarketplaceOpener()
+        original = broken.__call__
+        # Strict mode remains fail-closed for this otherwise accepted key.
+        with self.assertRaises(SnapshotError):
+            capture_usage_snapshot(api_key=SECRET, opener=original)
+
     def test_fetches_both_endpoints_but_emits_only_whitelisted_numbers(self):
         opener = RecordingOpener()
         snapshot = snapshot_from_environment(

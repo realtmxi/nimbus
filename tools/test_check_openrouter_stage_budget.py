@@ -16,6 +16,7 @@ from tools.check_openrouter_stage_budget import (
     main,
     write_json_atomic,
 )
+from tools.openrouter_key_contract import E12_MARKETPLACE_KEY_CONTRACT
 
 
 SECRET_LABEL = "provider-label-must-not-leak"
@@ -120,6 +121,44 @@ def gate(
 
 
 class TestOpenRouterStageBudget(unittest.TestCase):
+    def test_explicit_marketplace_mode_keeps_three_dollar_gate_and_no_byok(self):
+        def marketplace(value: float) -> dict[str, object]:
+            result = unavailable_snapshot(
+                usage=value, limit=5, limit_remaining=5 - value
+            )
+            key = result["key"]
+            assert isinstance(key, dict)
+            key["include_byok_in_limit"] = False
+            key["byok_usage"] = 0.4
+            return result
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = gate(
+                root,
+                marketplace(1.9),
+                marketplace(2.0),
+                key_contract_mode=E12_MARKETPLACE_KEY_CONTRACT,
+            )
+            self.assertEqual(result["authorized_budget_usd"], "3")
+            self.assertEqual(result["baseline_key_limit_usd"], "5")
+            self.assertEqual(result["key_contract_mode"], E12_MARKETPLACE_KEY_CONTRACT)
+            self.assertIs(result["marketplace_route"]["byok_allowed"], False)
+
+            changed = marketplace(2.0)
+            changed_key = changed["key"]
+            assert isinstance(changed_key, dict)
+            changed_key["byok_usage"] = 0.5
+            with self.assertRaisesRegex(StageGateError, "BYOK usage changed"):
+                gate(
+                    root,
+                    marketplace(1.9),
+                    changed,
+                    key_contract_mode=E12_MARKETPLACE_KEY_CONTRACT,
+                )
+            with self.assertRaises(StageGateError):
+                gate(root, marketplace(1.9), marketplace(2.0))
+
     def test_before_next_uses_exact_decimal_delta_and_whitelist(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

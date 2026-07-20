@@ -22,6 +22,7 @@ from tools.check_e12_stage_launch import (
     write_json_atomic,
 )
 from tools.check_openrouter_stage_budget import build_stage_gate_attestation
+from tools.openrouter_key_contract import E12_MARKETPLACE_KEY_CONTRACT
 
 
 NOW = datetime(2026, 7, 20, 12, 5, tzinfo=timezone.utc)
@@ -458,6 +459,55 @@ class LaunchFixture:
 
 
 class TestE12StageLaunch(unittest.TestCase):
+    def test_marketplace_contract_binds_non_byok_usage_and_exact_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = LaunchFixture(Path(directory))
+            canary = json.loads(fixture.canary.read_text())
+            canary["is_byok"] = False
+            dump(fixture.canary, canary)
+            for path in (fixture.baseline, fixture.previous, fixture.current):
+                payload = json.loads(path.read_text())
+                key = payload["key"]
+                key["limit"] = 5
+                key["limit_remaining"] = 5 - key["usage"]
+                key["include_byok_in_limit"] = False
+                key["byok_usage"] = 0.4
+                dump(path, payload)
+            dump(fixture.gate, build_stage_gate_attestation(
+                baseline_path=fixture.baseline,
+                current_path=fixture.current,
+                settlement_previous_path=fixture.previous,
+                next_stage_full_upper_bound_usd="1.90803056",
+                now=NOW,
+                key_contract_mode=E12_MARKETPLACE_KEY_CONTRACT,
+            ))
+            result = create_launch_attestation(
+                stage="A",
+                contract_id=CONTRACT_ID,
+                trace_manifest_path=fixture.trace_manifest,
+                profile_path=fixture.profile,
+                price_snapshot_path=fixture.price,
+                budget_attestation_path=fixture.budget,
+                canary_path=fixture.canary,
+                baseline_usage_path=fixture.baseline,
+                settlement_previous_path=fixture.previous,
+                settlement_current_path=fixture.current,
+                stage_budget_gate_path=fixture.gate,
+                context=fixture.context,
+                now=NOW,
+                key_contract_mode=E12_MARKETPLACE_KEY_CONTRACT,
+            )
+            self.assertEqual(result["settled_key"]["limit_usd"], "5")
+            self.assertEqual(result["settled_key"]["byok_usage_usd"], "0.4")
+            self.assertEqual(
+                result["frozen_contract"]["openrouter_billing_route"],
+                "marketplace",
+            )
+            self.assertEqual(
+                result["frozen_contract"]["static_full_pair_bound_usd"],
+                "1.90803056",
+            )
+
     def test_create_a_and_verify_live_key_are_text_free(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = LaunchFixture(Path(directory))

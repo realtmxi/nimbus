@@ -12,6 +12,7 @@ from tools.run_openrouter_ttft_canary import (
     OPENROUTER_URL,
     CanaryError,
     assess_result,
+    fetch_generation_is_byok,
     run_canary,
 )
 
@@ -43,13 +44,52 @@ def valid_result() -> dict:
 
 
 class TestOpenRouterTTFTCanary(unittest.TestCase):
+    def test_generation_metadata_check_is_no_redirect_and_exact(self):
+        class Content:
+            async def read(self, limit):
+                return b'{"data":{"is_byok":false}}'
+
+        class Response:
+            status = 200
+            content = Content()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+        class Session:
+            def __init__(self):
+                self.kwargs = None
+
+            def get(self, url, **kwargs):
+                self.url = url
+                self.kwargs = kwargs
+                return Response()
+
+        session = Session()
+        result = asyncio.run(fetch_generation_is_byok(
+            session,
+            api_key=KEY,
+            generation_id="gen-sensitive-provider-id",
+            attempts=1,
+            poll_s=0,
+        ))
+        self.assertIs(result, False)
+        self.assertIs(session.kwargs["allow_redirects"], False)
+        self.assertEqual(
+            session.kwargs["params"], {"id": "gen-sensitive-provider-id"}
+        )
+
     def test_pass_output_is_whitelisted_and_hashes_generation_id(self):
         with patch(
             "tools.run_openrouter_ttft_canary._utc_now",
             return_value="2026-07-18T00:00:00Z",
         ):
             result = assess_result(
-                valid_result(), key_fingerprint_sha256=KEY_FINGERPRINT
+                valid_result(), key_fingerprint_sha256=KEY_FINGERPRINT,
+                is_byok=False,
             )
         self.assertEqual(result["status"], "pass")
         self.assertEqual(result["provider"], "deepinfra")
@@ -86,7 +126,8 @@ class TestOpenRouterTTFTCanary(unittest.TestCase):
                 row[field] = value
                 with self.assertRaises(CanaryError):
                     assess_result(
-                        row, key_fingerprint_sha256=KEY_FINGERPRINT
+                        row, key_fingerprint_sha256=KEY_FINGERPRINT,
+                        is_byok=False,
                     )
 
     def test_rejects_nonfinite_or_negative_ttft(self):
@@ -96,7 +137,8 @@ class TestOpenRouterTTFTCanary(unittest.TestCase):
                 row["ttft_ms"] = value
                 with self.assertRaises(CanaryError):
                     assess_result(
-                        row, key_fingerprint_sha256=KEY_FINGERPRINT
+                        row, key_fingerprint_sha256=KEY_FINGERPRINT,
+                        is_byok=False,
                     )
 
     def test_run_canary_freezes_transport_and_payload_contract(self):
@@ -118,11 +160,20 @@ class TestOpenRouterTTFTCanary(unittest.TestCase):
             TCPConnector = FakeConnector
             ClientSession = FakeSession
 
-        sender = AsyncMock(return_value=valid_result())
+        async def send(*args, **kwargs):
+            kwargs["on_generation_id"]("gen-sensitive-provider-id")
+            return valid_result()
+
+        sender = AsyncMock(side_effect=send)
+        generation_metadata = AsyncMock(return_value=False)
         with (
             patch.dict("os.environ", {"OPENROUTER_API_KEY": KEY}, clear=False),
             patch("tools.run_openrouter_ttft_canary.common.aiohttp", FakeAiohttp),
             patch("tools.run_openrouter_ttft_canary.one_request", sender),
+            patch(
+                "tools.run_openrouter_ttft_canary.fetch_generation_is_byok",
+                generation_metadata,
+            ),
         ):
             result = asyncio.run(run_canary(
                 api_key_env="OPENROUTER_API_KEY", timeout_s=120.0
@@ -144,6 +195,17 @@ class TestOpenRouterTTFTCanary(unittest.TestCase):
         self.assertIs(kwargs["allow_fallbacks"], False)
         self.assertIs(kwargs["stop_after_first_token"], True)
         self.assertEqual(result["key_fingerprint_sha256"], KEY_FINGERPRINT)
+        self.assertIs(result["is_byok"], False)
+        metadata_kwargs = generation_metadata.await_args.kwargs
+        self.assertEqual(metadata_kwargs["generation_id"], "gen-sensitive-provider-id")
+
+    def test_rejects_byok_generation(self):
+        with self.assertRaisesRegex(CanaryError, "marketplace-billed"):
+            assess_result(
+                valid_result(),
+                key_fingerprint_sha256=KEY_FINGERPRINT,
+                is_byok=True,
+            )
 
 
 if __name__ == "__main__":

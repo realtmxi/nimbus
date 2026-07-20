@@ -51,6 +51,14 @@ from tools.check_openrouter_stage_budget import (
     StageGateError,
     build_stage_gate_attestation,
 )
+from tools.openrouter_key_contract import (
+    E12_MARKETPLACE_KEY_CONTRACT,
+    KEY_CONTRACT_MODES,
+    STRICT_KEY_CONTRACT,
+    include_byok_in_limit_required,
+    key_limit_max_usd,
+    validate_key_contract_mode,
+)
 from tools.ttft_matrix_evidence import (
     MatrixEvidenceError,
     MatrixExpectations,
@@ -59,6 +67,7 @@ from tools.ttft_matrix_evidence import (
 
 
 LIVE_CONTRACT = "e12_current_turn_v1"
+MARKETPLACE_LIVE_CONTRACT = "e12_current_turn_marketplace_v2"
 EXPECTED_ARMS = {
     "A": "ttft_pred:cost_cachedisp_old:0",
     "C": "ttft_pred:cost_disp_current:0",
@@ -95,11 +104,13 @@ CANARY_FIELDS = frozenset({
     "stream_abort_requested", "response_completed", "cost_pending",
     "generation_id_sha256", "key_fingerprint_sha256",
 })
+MARKETPLACE_CANARY_FIELDS = CANARY_FIELDS | {"is_byok"}
 USAGE_KEY_FIELDS = frozenset({
     "http_status", "usage", "limit", "limit_remaining", "limit_reset",
     "key_fingerprint_sha256", "include_byok_in_limit", "is_management_key",
     "is_provisioning_key", "is_free_tier", "expires_at_utc",
 })
+MARKETPLACE_USAGE_KEY_FIELDS = USAGE_KEY_FIELDS | {"byok_usage"}
 USAGE_ACCOUNT_FIELDS = frozenset({
     "http_status", "total_usage", "total_credits", "remaining_credits",
 })
@@ -123,7 +134,10 @@ FINGERPRINT_LIVE_KEYS = (
     "live_contract_id", "live_contract", "live_stage",
     "live_expected_trace_n", "live_arm_order_seed", "live_exact_arm",
     "live_authorized_budget_usd", "live_budget_attestation_sha256",
-    "live_key_limit_max_usd", "live_cooldown_s",
+    "live_key_limit_max_usd",
+)
+FINGERPRINT_LIVE_TAIL_KEYS = (
+    "live_cooldown_s",
     "live_stage_launch_attestation_sha256",
     "live_current_usage_sha256", "live_stage_launch_verify_receipt_sha256",
 )
@@ -160,6 +174,7 @@ SETTLED_KEY_FIELDS = frozenset({
     "key_fingerprint_sha256", "limit_usd", "usage_usd", "remaining_usd",
     "expires_at_utc",
 })
+MARKETPLACE_SETTLED_KEY_FIELDS = SETTLED_KEY_FIELDS | {"byok_usage_usd"}
 TIMING_FIELDS = frozenset({
     "baseline_usage_at_utc", "canary_at_utc",
     "settlement_previous_at_utc", "settlement_current_at_utc",
@@ -173,7 +188,18 @@ PRIOR_A_FIELDS = frozenset({
     "matrix_finished_at_utc", "authorization_interval_s",
     "key_fingerprint_sha256", "expires_at_utc",
     "live_current_usage_sha256", "launch_verify_receipt_sha256",
+    "key_usage_usd",
 })
+MARKETPLACE_PRIOR_A_FIELDS = PRIOR_A_FIELDS | {"byok_usage_usd"}
+MARKETPLACE_VERIFY_RECEIPT_FIELDS = VERIFY_RECEIPT_FIELDS | {"byok_usage_usd"}
+
+
+def _live_contract(key_contract_mode: str) -> str:
+    if key_contract_mode == STRICT_KEY_CONTRACT:
+        return LIVE_CONTRACT
+    if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT:
+        return MARKETPLACE_LIVE_CONTRACT
+    raise LaunchCheckError("unknown OpenRouter key contract mode")
 
 
 class LaunchCheckError(ValueError):
@@ -416,9 +442,16 @@ def _validate_profile(
         raise LaunchCheckError("profile calibration has held-out false negatives")
 
 
-def _validate_canary(path: Path) -> tuple[str, datetime, Decimal, str]:
+def _validate_canary(
+    path: Path, *, key_contract_mode: str
+) -> tuple[str, datetime, Decimal, str]:
     payload, sha = _load_json(path, "synthetic canary")
-    if set(payload) != CANARY_FIELDS:
+    allowed_field_sets = (
+        (MARKETPLACE_CANARY_FIELDS,)
+        if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT
+        else (CANARY_FIELDS, MARKETPLACE_CANARY_FIELDS)
+    )
+    if set(payload) not in allowed_field_sets:
         raise LaunchCheckError("synthetic canary fields differ from schema")
     exact = {
         "schema_version": 1,
@@ -433,6 +466,8 @@ def _validate_canary(path: Path) -> tuple[str, datetime, Decimal, str]:
         "response_completed": False,
         "cost_pending": True,
     }
+    if "is_byok" in payload:
+        exact["is_byok"] = False
     for key, expected in exact.items():
         if payload.get(key) != expected:
             raise LaunchCheckError(f"synthetic canary {key} is invalid")
@@ -441,6 +476,8 @@ def _validate_canary(path: Path) -> tuple[str, datetime, Decimal, str]:
     generation = payload.get("generation_id_sha256")
     if generation is not None:
         _sha256(generation, "synthetic canary generation id")
+    elif key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT:
+        raise LaunchCheckError("marketplace canary lacks generation metadata binding")
     ttft = _decimal(payload.get("ttft_ms"), "synthetic canary TTFT")
     key_fingerprint = _sha256(
         payload.get("key_fingerprint_sha256"),
@@ -454,19 +491,28 @@ def _validate_canary(path: Path) -> tuple[str, datetime, Decimal, str]:
     )
 
 
-def _usage_key(payload: dict[str, Any], label: str) -> dict[str, Any]:
+def _usage_key(
+    payload: dict[str, Any], label: str, *, key_contract_mode: str
+) -> dict[str, Any]:
     if set(payload) != USAGE_TOP_LEVEL_FIELDS or payload.get("schema_version") != 1:
         raise LaunchCheckError(f"{label} schema is invalid")
     key = payload.get("key")
     account = payload.get("account")
-    if not isinstance(key, dict) or set(key) != USAGE_KEY_FIELDS:
+    expected_key_fields = (
+        MARKETPLACE_USAGE_KEY_FIELDS
+        if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT
+        else USAGE_KEY_FIELDS
+    )
+    if not isinstance(key, dict) or set(key) != expected_key_fields:
         raise LaunchCheckError(f"{label} key fields differ from E12 schema")
     if not isinstance(account, dict) or set(account) != USAGE_ACCOUNT_FIELDS:
         raise LaunchCheckError(f"{label} account fields differ from E12 schema")
     exact = {
         "http_status": 200,
         "limit_reset": None,
-        "include_byok_in_limit": True,
+        "include_byok_in_limit": include_byok_in_limit_required(
+            key_contract_mode
+        ),
         "is_management_key": False,
         "is_provisioning_key": False,
         "is_free_tier": False,
@@ -478,19 +524,28 @@ def _usage_key(payload: dict[str, Any], label: str) -> dict[str, Any]:
     usage = _decimal(key.get("usage"), f"{label} usage")
     limit = _decimal(key.get("limit"), f"{label} limit", positive=True)
     remaining = _decimal(key.get("limit_remaining"), f"{label} remaining")
-    if limit > AUTHORIZED_BUDGET_USD or remaining > limit:
+    limit_max = key_limit_max_usd(key_contract_mode)
+    if (
+        (key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT and limit != limit_max)
+        or (key_contract_mode == STRICT_KEY_CONTRACT and limit > limit_max)
+        or remaining > limit
+    ):
         raise LaunchCheckError(f"{label} key limit is invalid")
     if abs(usage + remaining - limit) > ARITHMETIC_TOLERANCE:
         raise LaunchCheckError(f"{label} key arithmetic is inconsistent")
     expires = key.get("expires_at_utc")
     if expires is not None:
         expires = _timestamp_text(_timestamp(expires, f"{label} key expiration"))
+    byok_usage = None
+    if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT:
+        byok_usage = _decimal(key.get("byok_usage"), f"{label} BYOK usage")
     return {
         "usage": usage,
         "limit": limit,
         "remaining": remaining,
         "fingerprint": fingerprint,
         "expires_at_utc": expires,
+        "byok_usage": byok_usage,
     }
 
 
@@ -534,6 +589,9 @@ def recompute_matrix_fingerprint(manifest: dict[str, Any]) -> str:
         values = [manifest[key] for key in FINGERPRINT_BASE_KEYS]
         arms = manifest["arms"]
         extras = [manifest[key] for key in FINGERPRINT_LIVE_KEYS]
+        if "live_key_contract_mode" in manifest:
+            extras.append(manifest["live_key_contract_mode"])
+        extras.extend(manifest[key] for key in FINGERPRINT_LIVE_TAIL_KEYS)
     except KeyError as exc:
         raise LaunchCheckError(
             f"stage A manifest lacks fingerprint field {exc.args[0]}"
@@ -550,6 +608,7 @@ def _validate_stage_a_manifest(
     trace_manifest_sha256: str, profile_sha256: str,
     budget_attestation_sha256: str, a_launch_sha256: str,
     a_live_usage_sha256: str, a_verify_receipt_sha256: str,
+    key_contract_mode: str,
 ) -> None:
     exact = {
         "arms": (EXPECTED_ARMS["A"],),
@@ -589,19 +648,23 @@ def _validate_stage_a_manifest(
         "arm_order_mode": "e12_contract_stage",
         "arm_order_seed": ARM_ORDER_SEED,
         "live_contract_id": contract_id,
-        "live_contract": LIVE_CONTRACT,
+        "live_contract": _live_contract(key_contract_mode),
         "live_stage": "A",
         "live_expected_trace_n": str(TRACE_N),
         "live_arm_order_seed": ARM_ORDER_SEED,
         "live_exact_arm": EXPECTED_ARMS["A"],
         "live_authorized_budget_usd": "3",
         "live_budget_attestation_sha256": budget_attestation_sha256,
-        "live_key_limit_max_usd": "3",
+        "live_key_limit_max_usd": _decimal_text(
+            key_limit_max_usd(key_contract_mode)
+        ),
         "live_cooldown_s": "20",
         "live_stage_launch_attestation_sha256": a_launch_sha256,
         "live_current_usage_sha256": a_live_usage_sha256,
         "live_stage_launch_verify_receipt_sha256": a_verify_receipt_sha256,
     }
+    if key_contract_mode != STRICT_KEY_CONTRACT or "live_key_contract_mode" in manifest:
+        exact["live_key_contract_mode"] = key_contract_mode
     for field, expected in exact.items():
         if manifest.get(field) != expected:
             raise LaunchCheckError(f"stage A manifest {field} is not exact")
@@ -646,7 +709,7 @@ def _matrix_expectations(manifest: dict[str, Any]) -> MatrixExpectations:
 
 def _validate_stage_a_events(
     path: Path, *, manifest: dict[str, Any], launch_authorized_at: datetime,
-    launch_verified_at: datetime,
+    launch_verified_at: datetime, key_contract_mode: str,
 ) -> tuple[str, datetime]:
     try:
         raw = path.read_bytes()
@@ -689,7 +752,9 @@ def _validate_stage_a_events(
         "live_budget_attestation_sha256": manifest[
             "live_budget_attestation_sha256"
         ],
-        "live_key_limit_max_usd": "3",
+        "live_key_limit_max_usd": _decimal_text(
+            key_limit_max_usd(key_contract_mode)
+        ),
         "live_cooldown_s": "20",
         "live_stage_launch_attestation_sha256": manifest[
             "live_stage_launch_attestation_sha256"
@@ -699,6 +764,8 @@ def _validate_stage_a_events(
             "live_stage_launch_verify_receipt_sha256"
         ],
     }
+    if "live_key_contract_mode" in manifest:
+        common["live_key_contract_mode"] = key_contract_mode
     if set(started) != {"arm_started_at", "arm", *common}:
         raise LaunchCheckError("stage A start event fields are not exact")
     if set(finished) != {"arm_finished_at", "arm", *common}:
@@ -777,10 +844,10 @@ def _validate_no_systemic_cloud_errors(path: Path) -> None:
 def _validate_prior_a(
     *, directory: Path, a_launch_path: Path, contract_id: str,
     context: LaunchContext, trace_manifest_sha256: str, profile_sha256: str,
-    budget_attestation_sha256: str,
+    budget_attestation_sha256: str, key_contract_mode: str,
 ) -> tuple[dict[str, Any], datetime]:
     a_launch, a_launch_sha = _load_json(a_launch_path, "stage A launch attestation")
-    _validate_launch_schema(a_launch)
+    _validate_launch_schema(a_launch, key_contract_mode=key_contract_mode)
     _validate_attestation_bindings(
         a_launch,
         stage="A",
@@ -791,6 +858,7 @@ def _validate_prior_a(
         context=context,
         check_freshness=False,
         now=None,
+        key_contract_mode=key_contract_mode,
     )
     a_live_path = directory / LIVE_CURRENT_USAGE_FILENAME
     a_receipt_path = directory / VERIFY_RECEIPT_FILENAME
@@ -801,6 +869,7 @@ def _validate_prior_a(
         expected_sha256=a_receipt_sha,
         launch_attestation_path=a_launch_path,
         live_current_usage_path=a_live_path,
+        key_contract_mode=key_contract_mode,
     )
     if receipt.get("stage") != "A":
         raise LaunchCheckError("stage A verify receipt stage is invalid")
@@ -815,6 +884,7 @@ def _validate_prior_a(
         a_launch_sha256=a_launch_sha,
         a_live_usage_sha256=a_live_sha,
         a_verify_receipt_sha256=a_receipt_sha,
+        key_contract_mode=key_contract_mode,
     )
     markers = sorted(directory.glob("*.complete.json"))
     if len(markers) != 1:
@@ -851,8 +921,9 @@ def _validate_prior_a(
         launch_verified_at=_timestamp(
             receipt["verified_at_utc"], "stage A launch verification"
         ),
+        key_contract_mode=key_contract_mode,
     )
-    return {
+    prior_result = {
         "launch_attestation_sha256": a_launch_sha,
         "matrix_manifest_sha256": manifest_sha,
         "completion_marker_sha256": marker_sha,
@@ -871,11 +942,17 @@ def _validate_prior_a(
         "expires_at_utc": a_launch["settled_key"]["expires_at_utc"],
         "live_current_usage_sha256": a_live_sha,
         "launch_verify_receipt_sha256": a_receipt_sha,
-    }, matrix_finished
+        "key_usage_usd": a_launch["settled_key"]["usage_usd"],
+    }
+    if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT:
+        prior_result["byok_usage_usd"] = a_launch["settled_key"][
+            "byok_usage_usd"
+        ]
+    return prior_result, matrix_finished
 
 
-def _frozen_contract(stage: str) -> dict[str, Any]:
-    return {
+def _frozen_contract(stage: str, *, key_contract_mode: str) -> dict[str, Any]:
+    result = {
         "input_price_per_million_usd": "0.08",
         "output_price_per_million_usd": "0.28",
         "request_price_per_request_usd": "0",
@@ -889,9 +966,26 @@ def _frozen_contract(stage: str) -> dict[str, Any]:
         "temperature": "0",
         "cloud_max_concurrency": 16,
     }
+    if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT:
+        result.update({
+            "key_contract_mode": key_contract_mode,
+            "key_limit_usd": "5",
+            "static_full_pair_bound_usd": "1.90803056",
+            "openrouter_billing_route": "marketplace",
+            "openrouter_provider": OPENROUTER_PROVIDER,
+            "openrouter_byok_allowed": False,
+            "openrouter_fallbacks_allowed": False,
+        })
+    return result
 
 
-def _validate_launch_schema(payload: dict[str, Any]) -> None:
+def _validate_launch_schema(
+    payload: dict[str, Any], *, key_contract_mode: str = STRICT_KEY_CONTRACT
+) -> None:
+    try:
+        validate_key_contract_mode(key_contract_mode)
+    except ValueError:
+        raise LaunchCheckError("unknown OpenRouter key contract mode") from None
     if set(payload) != TOP_LEVEL_FIELDS:
         raise LaunchCheckError("launch attestation fields differ from schema")
     if payload.get("schema_version") != 1 or payload.get("status") != "pass":
@@ -901,8 +995,15 @@ def _validate_launch_schema(payload: dict[str, Any]) -> None:
         raise LaunchCheckError("launch attestation stage is invalid")
     mappings = (
         ("bindings", BINDING_FIELDS),
-        ("frozen_contract", FROZEN_FIELDS),
-        ("settled_key", SETTLED_KEY_FIELDS),
+        ("frozen_contract", frozenset(_frozen_contract(
+            stage, key_contract_mode=key_contract_mode
+        ))),
+        (
+            "settled_key",
+            MARKETPLACE_SETTLED_KEY_FIELDS
+            if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT
+            else SETTLED_KEY_FIELDS,
+        ),
         ("timing", TIMING_FIELDS),
     )
     for name, fields in mappings:
@@ -912,7 +1013,14 @@ def _validate_launch_schema(payload: dict[str, Any]) -> None:
     prior = payload.get("prior_a")
     if stage == "A" and prior is not None:
         raise LaunchCheckError("stage A launch cannot contain prior-A evidence")
-    if stage == "C" and (not isinstance(prior, dict) or set(prior) != PRIOR_A_FIELDS):
+    expected_prior_fields = (
+        MARKETPLACE_PRIOR_A_FIELDS
+        if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT
+        else PRIOR_A_FIELDS
+    )
+    if stage == "C" and (
+        not isinstance(prior, dict) or set(prior) != expected_prior_fields
+    ):
         raise LaunchCheckError("stage C launch lacks exact prior-A evidence")
     authorized = _timestamp(payload.get("authorized_at_utc"), "launch authorization")
     _sha256(payload.get("contract_id_sha256"), "contract id hash")
@@ -929,7 +1037,9 @@ def _validate_launch_schema(payload: dict[str, Any]) -> None:
     ):
         if payload["bindings"].get(key) != expected:
             raise LaunchCheckError(f"launch binding {key} is invalid")
-    if payload["frozen_contract"] != _frozen_contract(stage):
+    if payload["frozen_contract"] != _frozen_contract(
+        stage, key_contract_mode=key_contract_mode
+    ):
         raise LaunchCheckError("launch frozen contract is invalid")
     for field in SETTLED_KEY_FIELDS:
         if field in {"limit_usd", "usage_usd", "remaining_usd"}:
@@ -946,10 +1056,24 @@ def _validate_launch_schema(payload: dict[str, Any]) -> None:
     remaining = _decimal(
         payload["settled_key"].get("remaining_usd"), "settled key remaining"
     )
-    if limit <= 0 or limit > AUTHORIZED_BUDGET_USD or remaining > limit:
+    limit_max = key_limit_max_usd(key_contract_mode)
+    if (
+        limit <= 0
+        or remaining > limit
+        or (
+            key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT
+            and limit != limit_max
+        )
+        or (key_contract_mode == STRICT_KEY_CONTRACT and limit > limit_max)
+    ):
         raise LaunchCheckError("settled key limit is invalid")
     if abs(usage + remaining - limit) > ARITHMETIC_TOLERANCE:
         raise LaunchCheckError("settled key arithmetic is inconsistent")
+    if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT:
+        _decimal(
+            payload["settled_key"].get("byok_usage_usd"),
+            "settled key BYOK usage",
+        )
     timing = payload["timing"]
     baseline_at = _timestamp(timing["baseline_usage_at_utc"], "baseline time")
     canary_at = _timestamp(timing["canary_at_utc"], "canary time")
@@ -997,6 +1121,9 @@ def _validate_launch_schema(payload: dict[str, Any]) -> None:
         if matrix_at > previous_at:
             raise LaunchCheckError("stage C settlement predates prior A completion")
         _sha256(prior.get("key_fingerprint_sha256"), "prior A key fingerprint")
+        _decimal(prior.get("key_usage_usd"), "prior A key usage")
+        if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT:
+            _decimal(prior.get("byok_usage_usd"), "prior A BYOK usage")
         prior_expiration = prior.get("expires_at_utc")
         if prior_expiration is not None:
             _timestamp(prior_expiration, "prior A key expiration")
@@ -1007,8 +1134,9 @@ def _validate_attestation_bindings(
     trace_manifest_sha256: str, profile_sha256: str,
     budget_attestation_sha256: str, context: LaunchContext,
     check_freshness: bool, now: datetime | None,
+    key_contract_mode: str = STRICT_KEY_CONTRACT,
 ) -> None:
-    _validate_launch_schema(payload)
+    _validate_launch_schema(payload, key_contract_mode=key_contract_mode)
     if payload["stage"] != stage:
         raise LaunchCheckError("launch stage does not match runner stage")
     if payload["contract_id_sha256"] != _contract_id_hash(contract_id):
@@ -1050,10 +1178,15 @@ def create_launch_attestation(
     context: LaunchContext, a_dir: Path | None = None,
     a_launch_attestation_path: Path | None = None,
     now: datetime | None = None,
+    key_contract_mode: str = STRICT_KEY_CONTRACT,
 ) -> dict[str, Any]:
     """Validate all launch sources and return a whitelisted attestation."""
     if stage not in EXPECTED_ARMS:
         raise LaunchCheckError("stage must be exactly A or C")
+    try:
+        validate_key_contract_mode(key_contract_mode)
+    except ValueError:
+        raise LaunchCheckError("unknown OpenRouter key contract mode") from None
     contract_hash = _contract_id_hash(contract_id)
     context.validate()
     # The shell matrix records manifest/events at whole-second resolution.
@@ -1103,7 +1236,7 @@ def create_launch_attestation(
         raise LaunchCheckError("price snapshot is empty")
 
     canary_sha, canary_at, _, canary_key_fingerprint = _validate_canary(
-        canary_path
+        canary_path, key_contract_mode=key_contract_mode
     )
     baseline, baseline_sha = _load_json(baseline_usage_path, "baseline usage")
     previous, previous_sha = _load_json(
@@ -1112,9 +1245,17 @@ def create_launch_attestation(
     settled, settled_sha = _load_json(
         settlement_current_path, "settlement-current usage"
     )
-    baseline_key = _usage_key(baseline, "baseline usage")
-    previous_key = _usage_key(previous, "settlement-previous usage")
-    settled_key = _usage_key(settled, "settlement-current usage")
+    baseline_key = _usage_key(
+        baseline, "baseline usage", key_contract_mode=key_contract_mode
+    )
+    previous_key = _usage_key(
+        previous,
+        "settlement-previous usage",
+        key_contract_mode=key_contract_mode,
+    )
+    settled_key = _usage_key(
+        settled, "settlement-current usage", key_contract_mode=key_contract_mode
+    )
     baseline_at = _timestamp(baseline.get("captured_at_utc"), "baseline time")
     previous_at = _timestamp(previous.get("captured_at_utc"), "settlement previous time")
     settled_at = _timestamp(settled.get("captured_at_utc"), "settlement current time")
@@ -1130,6 +1271,16 @@ def create_launch_attestation(
         raise LaunchCheckError("canary and budget snapshots use different keys")
     if baseline_key["expires_at_utc"] != settled_key["expires_at_utc"]:
         raise LaunchCheckError("key expiration changed during launch evidence")
+    if (
+        key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT
+        and settled_key["usage"] <= baseline_key["usage"]
+    ):
+        raise LaunchCheckError("marketplace canary did not increase metered key usage")
+    if (
+        key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT
+        and settled_key["byok_usage"] != baseline_key["byok_usage"]
+    ):
+        raise LaunchCheckError("BYOK usage changed during marketplace launch evidence")
     if settled_key["expires_at_utc"] is not None:
         expiration = _timestamp(settled_key["expires_at_utc"], "key expiration")
         if expiration - current < timedelta(hours=6):
@@ -1144,6 +1295,7 @@ def create_launch_attestation(
             final=False,
             settlement_previous_path=settlement_previous_path,
             now=current,
+            key_contract_mode=key_contract_mode,
         )
     except StageGateError:
         raise LaunchCheckError("stage budget gate sources are invalid") from None
@@ -1169,6 +1321,7 @@ def create_launch_attestation(
             trace_manifest_sha256=trace_manifest_sha,
             profile_sha256=profile_sha,
             budget_attestation_sha256=budget_sha,
+            key_contract_mode=key_contract_mode,
         )
         if previous_at < matrix_finished:
             raise LaunchCheckError("stage C settled pair predates stage A completion")
@@ -1180,8 +1333,32 @@ def create_launch_attestation(
             raise LaunchCheckError("stage A and stage C use different API keys")
         if prior_a["expires_at_utc"] != settled_key["expires_at_utc"]:
             raise LaunchCheckError("stage A and stage C key expiration differs")
+        if (
+            key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT
+            and settled_key["usage"]
+            <= _decimal(prior_a["key_usage_usd"], "stage A settled usage")
+        ):
+            raise LaunchCheckError("stage A did not increase marketplace key usage")
+        if (
+            key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT
+            and settled_key["byok_usage"]
+            != _decimal(prior_a["byok_usage_usd"], "stage A settled BYOK usage")
+        ):
+            raise LaunchCheckError("BYOK usage changed during stage A")
 
     settlement_interval = Decimal(str((settled_at - previous_at).total_seconds()))
+    settled_key_result = {
+        "key_fingerprint_sha256": settled_key["fingerprint"],
+        "limit_usd": _decimal_text(settled_key["limit"]),
+        "usage_usd": _decimal_text(settled_key["usage"]),
+        "remaining_usd": _decimal_text(settled_key["remaining"]),
+        "expires_at_utc": settled_key["expires_at_utc"],
+    }
+    if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT:
+        settled_key_result["byok_usage_usd"] = _decimal_text(
+            settled_key["byok_usage"]
+        )
+
     result = {
         "schema_version": 1,
         "status": "pass",
@@ -1205,14 +1382,10 @@ def create_launch_attestation(
             "commit": context.commit,
             "lifecycle_sha256": context.lifecycle_sha256,
         },
-        "frozen_contract": _frozen_contract(stage),
-        "settled_key": {
-            "key_fingerprint_sha256": settled_key["fingerprint"],
-            "limit_usd": _decimal_text(settled_key["limit"]),
-            "usage_usd": _decimal_text(settled_key["usage"]),
-            "remaining_usd": _decimal_text(settled_key["remaining"]),
-            "expires_at_utc": settled_key["expires_at_utc"],
-        },
+        "frozen_contract": _frozen_contract(
+            stage, key_contract_mode=key_contract_mode
+        ),
+        "settled_key": settled_key_result,
         "timing": {
             "baseline_usage_at_utc": _timestamp_text(baseline_at),
             "canary_at_utc": _timestamp_text(canary_at),
@@ -1224,7 +1397,7 @@ def create_launch_attestation(
         },
         "prior_a": prior_a,
     }
-    _validate_launch_schema(result)
+    _validate_launch_schema(result, key_contract_mode=key_contract_mode)
     return result
 
 
@@ -1239,6 +1412,7 @@ def verify_launch_attestation(
     live_current_usage_path: Path, a_dir: Path | None = None,
     a_launch_attestation_path: Path | None = None,
     now: datetime | None = None,
+    key_contract_mode: str = STRICT_KEY_CONTRACT,
 ) -> dict[str, Any]:
     """Verify a launch artifact against current runner and live-key evidence."""
     expected_sha256 = _sha256(expected_sha256, "expected launch attestation")
@@ -1255,6 +1429,7 @@ def verify_launch_attestation(
         context=context,
         check_freshness=True,
         now=now,
+        key_contract_mode=key_contract_mode,
     )
     # Do not trust a self-described pass JSON.  Re-run the complete offline
     # source validation at its recorded authorization time and require byte-
@@ -1277,12 +1452,15 @@ def verify_launch_attestation(
         a_dir=a_dir,
         a_launch_attestation_path=a_launch_attestation_path,
         now=_timestamp(payload["authorized_at_utc"], "authorization"),
+        key_contract_mode=key_contract_mode,
     )
     if rebuilt != payload:
         raise LaunchCheckError("launch attestation differs from current source evidence")
     _validate_private_regular_file(live_current_usage_path, "live current usage")
     live, live_sha = _load_json(live_current_usage_path, "live current usage")
-    live_key = _usage_key(live, "live current usage")
+    live_key = _usage_key(
+        live, "live current usage", key_contract_mode=key_contract_mode
+    )
     live_at = _timestamp(live.get("captured_at_utc"), "live current usage time")
     current = _now(now)
     authorized = _timestamp(payload["authorized_at_utc"], "authorization")
@@ -1307,6 +1485,11 @@ def verify_launch_attestation(
         expected = _decimal(settled[attestation_key], f"settled {key}")
         if abs(live_key[key] - expected) > ARITHMETIC_TOLERANCE:
             raise LaunchCheckError("live key counters differ from authorized settlement")
+    if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT:
+        if live_key["byok_usage"] != _decimal(
+            settled["byok_usage_usd"], "settled BYOK usage"
+        ):
+            raise LaunchCheckError("live BYOK usage differs from authorization")
     receipt = {
         "schema_version": 1,
         "status": "pass",
@@ -1325,9 +1508,12 @@ def verify_launch_attestation(
         "key_remaining_usd": _decimal_text(live_key["remaining"]),
         "key_expires_at_utc": live_key["expires_at_utc"],
     }
+    if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT:
+        receipt["byok_usage_usd"] = _decimal_text(live_key["byok_usage"])
     _validate_verify_receipt_payload(
         receipt, launch=payload, launch_sha=actual_sha,
         live=live, live_sha=live_sha,
+        key_contract_mode=key_contract_mode,
     )
     return receipt
 
@@ -1335,8 +1521,14 @@ def verify_launch_attestation(
 def _validate_verify_receipt_payload(
     receipt: dict[str, Any], *, launch: dict[str, Any], launch_sha: str,
     live: dict[str, Any], live_sha: str,
+    key_contract_mode: str = STRICT_KEY_CONTRACT,
 ) -> None:
-    if set(receipt) != VERIFY_RECEIPT_FIELDS:
+    expected_receipt_fields = (
+        MARKETPLACE_VERIFY_RECEIPT_FIELDS
+        if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT
+        else VERIFY_RECEIPT_FIELDS
+    )
+    if set(receipt) != expected_receipt_fields:
         raise LaunchCheckError("launch verification receipt schema is invalid")
     if receipt.get("schema_version") != 1 or receipt.get("status") != "pass":
         raise LaunchCheckError("launch verification receipt header is invalid")
@@ -1346,7 +1538,9 @@ def _validate_verify_receipt_payload(
         raise LaunchCheckError("launch verification receipt attestation hash differs")
     if receipt.get("live_current_usage_sha256") != live_sha:
         raise LaunchCheckError("launch verification receipt usage hash differs")
-    key = _usage_key(live, "receipt live usage")
+    key = _usage_key(
+        live, "receipt live usage", key_contract_mode=key_contract_mode
+    )
     settled = launch["settled_key"]
     exact = {
         "authorization_at_utc": launch["authorized_at_utc"],
@@ -1358,6 +1552,8 @@ def _validate_verify_receipt_payload(
         "key_remaining_usd": _decimal_text(key["remaining"]),
         "key_expires_at_utc": key["expires_at_utc"],
     }
+    if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT:
+        exact["byok_usage_usd"] = _decimal_text(key["byok_usage"])
     for field, expected in exact.items():
         if receipt.get(field) != expected:
             raise LaunchCheckError(f"launch verification receipt {field} differs")
@@ -1371,6 +1567,11 @@ def _validate_verify_receipt_payload(
     ):
         if abs(key[key_name] - _decimal(settled[settled_name], settled_name)) > ARITHMETIC_TOLERANCE:
             raise LaunchCheckError("receipt key counters differ from authorization")
+    if key_contract_mode == E12_MARKETPLACE_KEY_CONTRACT:
+        if key["byok_usage"] != _decimal(
+            settled["byok_usage_usd"], "settled BYOK usage"
+        ):
+            raise LaunchCheckError("receipt BYOK usage differs from authorization")
     authorized = _timestamp(receipt["authorization_at_utc"], "receipt authorization")
     settled_at = _timestamp(receipt["settled_usage_at_utc"], "receipt settlement")
     live_at = _timestamp(receipt["live_usage_at_utc"], "receipt live usage")
@@ -1382,6 +1583,7 @@ def _validate_verify_receipt_payload(
 def validate_verify_receipt(
     *, receipt_path: Path, expected_sha256: str,
     launch_attestation_path: Path, live_current_usage_path: Path,
+    key_contract_mode: str = STRICT_KEY_CONTRACT,
 ) -> dict[str, Any]:
     """Strictly validate a persisted receipt and both artifacts it binds."""
     expected_sha256 = _sha256(expected_sha256, "expected verify receipt")
@@ -1393,11 +1595,12 @@ def validate_verify_receipt(
     launch, launch_sha = _load_json(
         launch_attestation_path, "receipt launch attestation"
     )
-    _validate_launch_schema(launch)
+    _validate_launch_schema(launch, key_contract_mode=key_contract_mode)
     live, live_sha = _load_json(live_current_usage_path, "receipt live usage")
     _validate_verify_receipt_payload(
         receipt, launch=launch, launch_sha=launch_sha,
         live=live, live_sha=live_sha,
+        key_contract_mode=key_contract_mode,
     )
     return receipt
 
@@ -1462,6 +1665,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     commands = parser.add_subparsers(dest="command", required=True)
     create = commands.add_parser("create")
     create.add_argument("--stage", choices=("A", "C"), required=True)
+    create.add_argument(
+        "--key-contract-mode",
+        choices=sorted(KEY_CONTRACT_MODES),
+        default=STRICT_KEY_CONTRACT,
+    )
     create.add_argument("--contract-id", required=True)
     create.add_argument("--trace-manifest", type=Path, required=True)
     create.add_argument("--profile", type=Path, required=True)
@@ -1481,6 +1689,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     verify.add_argument("--attestation", type=Path, required=True)
     verify.add_argument("--expected-sha256", required=True)
     verify.add_argument("--stage", choices=("A", "C"), required=True)
+    verify.add_argument(
+        "--key-contract-mode",
+        choices=sorted(KEY_CONTRACT_MODES),
+        default=STRICT_KEY_CONTRACT,
+    )
     verify.add_argument("--contract-id", required=True)
     verify.add_argument("--trace-manifest-sha256", required=True)
     verify.add_argument("--profile-sha256", required=True)
@@ -1521,6 +1734,7 @@ def main(argv: list[str] | None = None) -> int:
                 context=_context(args),
                 a_dir=args.a_dir,
                 a_launch_attestation_path=args.a_launch_attestation,
+                key_contract_mode=args.key_contract_mode,
             )
             write_json_atomic(args.output, result)
         else:
@@ -1545,6 +1759,7 @@ def main(argv: list[str] | None = None) -> int:
                 a_dir=args.a_dir,
                 a_launch_attestation_path=args.a_launch_attestation,
                 live_current_usage_path=args.live_current_usage,
+                key_contract_mode=args.key_contract_mode,
             )
             write_json_atomic(args.output, result, overwrite=False)
     except LaunchCheckError as exc:

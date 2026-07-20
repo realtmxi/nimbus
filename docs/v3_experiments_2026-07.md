@@ -1370,13 +1370,27 @@ no inference POST—even the synthetic canary—had occurred**. That remains tru
 on 2026-07-20; actual cloud spend remains **$0**. Read-only public
 endpoint/price metadata checks are not inference requests.
 
-The earlier GPU blocker is now cleared: the experiment node is healthy again,
-the source trace and Qwen3-32B tokenizer snapshot were reverified, and no server
-was started merely to wait for credentials. The only remaining pre-POST
-condition is a funded, dedicated OpenRouter inference key whose server-enforced
-limit is greater than zero and at most **$3**, with the exact key properties
-specified below. Do not work around it with a shared/unlimited key, an unfunded
-account, another provider, or an unregistered deployment.
+The experiment node and all three GPUs are healthy. During the final launch
+preflight, the historical dense Qwen3-32B weight directory was found to have
+been removed; no quantized or substitute model was accepted. The exact public
+revision `9216db5781bf21249d130ec9da846c4624c16137` was restored into the
+private scratch area and independently verified byte-for-byte: 27 files,
+17 safetensors shards, 65,540,298,478 bytes, 707 BF16 tensors, exact config and
+index, and official-manifest SHA256
+`6597f6b6ebb926354d721f44fa3cc5ea97f61c4d645858440a08f46cbfd9020e`.
+The source trace and original tokenizer snapshot remain unchanged. No server
+was started during download or verification.
+
+A funded inference key has now been located and passes the static metadata for
+the explicit marketplace-v2 contract: exact server limit `$5`, no reset,
+`include_byok_in_limit=false`, more than the full-pair bound remaining, and
+zero recorded BYOK usage at preflight. This does not itself authorize the live
+arms: the first synthetic generation must still prove `is_byok=false`, and all
+settled snapshots must show positive marketplace usage with unchanged BYOK
+usage. The default remains the strict server-cap contract. The
+experiment-only marketplace-v2 exception is not a general relaxation and
+cannot be used with another provider, BYOK billing, an unfunded account, or an
+unregistered deployment.
 
 #### Frozen trace identity and completed manifest binding
 
@@ -1470,14 +1484,33 @@ in both arms and bills the entire capped decode is:
 
 This bound is deliberately independent of first-token cancellation and is a
 spend guard, not a latency metric. The user-authorized total experiment cap is
-**$3**, including the synthetic canary. Use one dedicated funded inference key
-with a server-side limit greater than zero and no greater than $3. Its reset
-must be null, BYOK usage must be included in the limit, and it must not be a
-management, provisioning, or free-tier key. Expiry must be null or at least six
-hours beyond every launch verification. Record only whitelisted non-secret
-limit/usage/expiry fields plus a SHA256 key fingerprint used solely for equality
-across artifacts. Reject a shared key, an absent/larger/resettable limit,
-insufficient remaining budget, an unfunded account, a key-type mismatch,
+**$3**, including the synthetic canary. The default
+`strict_server_cap_v1` contract requires `0 < limit <= 3`,
+`limit_reset=null`, and `include_byok_in_limit=true`. For this E12 run only,
+`e12_marketplace_deepinfra_no_byok_v1` accepts the exact observed key metadata
+`limit=5`, `limit_reset=null`, and `include_byok_in_limit=false`, but only under
+the separately frozen OpenRouter-marketplace/DeepInfra/no-fallback route. This
+exception does **not** raise the user budget: every delta-plus-future-bound gate
+and the final audit remain capped at $3, while the static full-pair bound remains
+$1.90803056. The exception additionally requires `byok_usage` to be present and
+unchanged in every usage snapshot, positive metered usage for the canary and
+each arm, and the canary's official generation record to report
+`is_byok=false`. The raw generation id exists only in memory for that metadata
+GET; evidence stores only its SHA256 and `is_byok=false`.
+
+Both modes require a non-management, non-provisioning, non-free-tier inference
+key whose expiry is null or at least six hours beyond launch verification.
+The marketplace exception must be selected explicitly in every snapshot,
+stage-gate, launch, runner, and final-audit command; the runner binding is:
+
+```text
+E12_LIVE_KEY_CONTRACT_MODE=e12_marketplace_deepinfra_no_byok_v1
+E12_LIVE_KEY_LIMIT_MAX_USD=5
+```
+
+Omitting the mode retains the strict `<=3`/BYOK-in-limit behavior. Reject an
+absent, mismatched, or resettable limit, missing/changing `byok_usage`, a BYOK
+canary generation, insufficient remaining budget, a key-type mismatch,
 non-monotone usage, or any snapshot that cannot be reconciled.
 
 The exact pre-trace sequence is: capture a baseline key-usage snapshot; run one
