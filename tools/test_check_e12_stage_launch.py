@@ -12,6 +12,8 @@ from unittest.mock import patch
 from tools.check_e12_live_budget import build_budget_attestation
 from tools.check_e12_stage_launch import (
     LIVE_CURRENT_USAGE_FILENAME,
+    MAX_JSON_BYTES,
+    MAX_PROFILE_JSON_BYTES,
     VERIFY_RECEIPT_FILENAME,
     LaunchCheckError,
     LaunchContext,
@@ -459,6 +461,28 @@ class LaunchFixture:
 
 
 class TestE12StageLaunch(unittest.TestCase):
+    def test_profile_has_a_narrow_larger_json_size_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = LaunchFixture(Path(directory))
+            original = fixture.profile.read_bytes()
+            fixture.profile.write_bytes(
+                original + b" " * (MAX_JSON_BYTES + 1 - len(original))
+            )
+            self.assertGreater(fixture.profile.stat().st_size, MAX_JSON_BYTES)
+            self.assertLessEqual(
+                fixture.profile.stat().st_size, MAX_PROFILE_JSON_BYTES,
+            )
+            self.assertEqual(fixture.create_a()["stage"], "A")
+
+            fixture.profile.write_bytes(
+                fixture.profile.read_bytes()
+                + b" " * (
+                    MAX_PROFILE_JSON_BYTES + 1 - fixture.profile.stat().st_size
+                )
+            )
+            with self.assertRaisesRegex(LaunchCheckError, "profile is too large"):
+                fixture.create_a()
+
     def test_marketplace_contract_binds_non_byok_usage_and_exact_limit(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = LaunchFixture(Path(directory))

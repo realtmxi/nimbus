@@ -91,6 +91,7 @@ TEMPERATURE = Decimal("0")
 MIN_SETTLEMENT_S = Decimal("60")
 MAX_ATTESTATION_AGE = timedelta(minutes=10)
 MAX_JSON_BYTES = 2_000_000
+MAX_PROFILE_JSON_BYTES = 4_000_000
 LIVE_CURRENT_USAGE_FILENAME = "e12_live_current_usage.json"
 VERIFY_RECEIPT_FILENAME = "e12_stage_launch_verify_receipt.json"
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -279,13 +280,15 @@ def _validate_private_regular_file(path: Path, label: str) -> None:
         raise LaunchCheckError(f"{label} must be a mode-0600 regular file")
 
 
-def _load_json(path: Path, label: str) -> tuple[dict[str, Any], str]:
+def _load_json(
+    path: Path, label: str, *, max_bytes: int = MAX_JSON_BYTES,
+) -> tuple[dict[str, Any], str]:
     try:
         with path.open("rb") as source:
-            raw = source.read(MAX_JSON_BYTES + 1)
+            raw = source.read(max_bytes + 1)
     except OSError:
         raise LaunchCheckError(f"unable to read {label}") from None
-    if len(raw) > MAX_JSON_BYTES:
+    if len(raw) > max_bytes:
         raise LaunchCheckError(f"{label} is too large")
     try:
         payload = json.loads(
@@ -1198,7 +1201,9 @@ def create_launch_attestation(
         trace_manifest_path, "trace manifest"
     )
     _validate_trace_manifest(trace_manifest, trace_manifest_sha)
-    profile, profile_sha = _load_json(profile_path, "profile")
+    profile, profile_sha = _load_json(
+        profile_path, "profile", max_bytes=MAX_PROFILE_JSON_BYTES,
+    )
     _validate_profile(profile, trace_manifest=trace_manifest, context=context)
 
     price_snapshot, price_sha = _load_json(price_snapshot_path, "price snapshot")
