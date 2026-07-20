@@ -18,6 +18,7 @@ from tools.audit_e12_live import (
     LIVE_CONTRACT,
     PAYLOAD_MODE,
     TraceIdentity,
+    _launch_verification_times_ordered,
     _load_usage_snapshot,
     _parse_manifest,
     audit,
@@ -971,6 +972,23 @@ class LiveFixture(unittest.TestCase):
             "prompt_text", "synthetic-generation", "gen-A-0", "gen-C-0",
         ):
             self.assertNotIn(forbidden, rendered)
+
+    def test_launch_time_precision_accepts_same_second_only(self) -> None:
+        authorized = utc("2026-07-20T09:04:33Z")
+        live = utc("2026-07-20T09:04:33.500000Z")
+        shell_started = utc("2026-07-20T09:04:33Z")
+        self.assertTrue(_launch_verification_times_ordered(
+            authorized,
+            live,
+            utc("2026-07-20T09:04:33.728166Z"),
+            shell_started,
+        ))
+        self.assertFalse(_launch_verification_times_ordered(
+            authorized,
+            live,
+            utc("2026-07-20T09:04:34.000001Z"),
+            shell_started,
+        ))
 
     def test_usage_audit_accepts_binary64_account_dust_only(self) -> None:
         payload = json.loads(self.usage_baseline.read_text())

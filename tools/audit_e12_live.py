@@ -1748,6 +1748,17 @@ def _revalidate_launch_attestation(
     }
 
 
+def _launch_verification_times_ordered(
+    authorized_at: datetime, live_at: datetime, verified_at: datetime,
+    shell_started_at: datetime,
+) -> bool:
+    """Compare a microsecond receipt with a whole-second shell event."""
+    return (
+        authorized_at <= live_at <= verified_at
+        and verified_at.replace(microsecond=0) <= shell_started_at
+    )
+
+
 def _revalidate_launch_verify_receipt(
     *, label: str, receipt_path: Path, live_current_usage_path: Path,
     launch_attestation_path: Path, stage: StageAudit,
@@ -1796,7 +1807,9 @@ def _revalidate_launch_verify_receipt(
         raise EvidenceError(f"stage {label} receipt live time differs from snapshot")
     if verified_at - live_at > timedelta(minutes=2):
         raise EvidenceError(f"stage {label} live launch usage was stale at verification")
-    if not authorized_at <= live_at <= verified_at <= stage.events.arm_started_at:
+    if not _launch_verification_times_ordered(
+        authorized_at, live_at, verified_at, stage.events.arm_started_at,
+    ):
         raise EvidenceError(f"stage {label} launch verification times are not ordered")
     expires_at = receipt.get("key_expires_at_utc")
     if expires_at is not None:
