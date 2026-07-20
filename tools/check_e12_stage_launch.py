@@ -787,8 +787,13 @@ def _validate_stage_a_events(
     finished_at = _timestamp(finished.get("arm_finished_at"), "stage A finish")
     matrix_at = _timestamp(matrix.get("matrix_finished_at"), "stage A matrix finish")
     manifest_at = _timestamp(manifest.get("started_at"), "stage A manifest start")
+    # Launch receipts retain microseconds, while the shell manifest and event
+    # log deliberately use whole-second UTC timestamps.  Treat a receipt in
+    # the same whole-second bucket as ordered before the manifest; an inversion
+    # into the next second still fails closed.
     if not (
-        launch_authorized_at <= launch_verified_at <= manifest_at
+        launch_authorized_at <= launch_verified_at
+        and launch_verified_at.replace(microsecond=0) <= manifest_at
         <= started_at <= finished_at <= matrix_at
     ):
         raise LaunchCheckError("stage A launch/event times are not ordered")

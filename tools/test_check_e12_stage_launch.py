@@ -321,7 +321,9 @@ class LaunchFixture:
             ),
         )
 
-    def make_a_shell_evidence(self, launch_path: Path) -> tuple[Path, dict]:
+    def make_a_shell_evidence(
+        self, launch_path: Path, *, receipt_now: datetime = NOW,
+    ) -> tuple[Path, dict]:
         directory = self.root / "stage_a"
         directory.mkdir()
         launch_sha = sha(launch_path)
@@ -330,7 +332,7 @@ class LaunchFixture:
             usage("2026-07-20T12:05:00Z", 0.01),
         )
         receipt = verify_launch_attestation(
-            **self.verify_a_kwargs(launch_path, live_path, now=NOW)
+            **self.verify_a_kwargs(launch_path, live_path, now=receipt_now)
         )
         receipt_path = directory / VERIFY_RECEIPT_FILENAME
         write_json_atomic(receipt_path, receipt, overwrite=False)
@@ -687,6 +689,54 @@ class TestE12StageLaunch(unittest.TestCase):
                     context=fixture.context,
                     now=NOW,
                 )
+
+    def test_c_orders_fractional_receipt_against_whole_second_events(self) -> None:
+        cases = (
+            (datetime(2026, 7, 20, 12, 5, 0, 728166, tzinfo=timezone.utc), True),
+            (datetime(2026, 7, 20, 12, 5, 1, 1, tzinfo=timezone.utc), False),
+        )
+        for receipt_now, should_pass in cases:
+            with self.subTest(receipt_now=receipt_now, should_pass=should_pass):
+                with tempfile.TemporaryDirectory() as directory:
+                    fixture = LaunchFixture(Path(directory))
+                    a_launch = fixture.root / "a-launch.json"
+                    write_json_atomic(a_launch, fixture.create_a())
+                    a_dir, marker = fixture.make_a_shell_evidence(
+                        a_launch, receipt_now=receipt_now,
+                    )
+                    fixture.configure_c_usage()
+
+                    def create_c() -> dict[str, object]:
+                        return create_launch_attestation(
+                            stage="C",
+                            contract_id=CONTRACT_ID,
+                            trace_manifest_path=fixture.trace_manifest,
+                            profile_path=fixture.profile,
+                            price_snapshot_path=fixture.price,
+                            budget_attestation_path=fixture.budget,
+                            canary_path=fixture.canary,
+                            baseline_usage_path=fixture.baseline,
+                            settlement_previous_path=fixture.previous,
+                            settlement_current_path=fixture.current,
+                            stage_budget_gate_path=fixture.gate,
+                            context=fixture.context,
+                            a_dir=a_dir,
+                            a_launch_attestation_path=a_launch,
+                            now=datetime(2026, 7, 20, 12, 9, tzinfo=timezone.utc),
+                        )
+
+                    with patch(
+                        "tools.check_e12_stage_launch.validate_or_write_marker",
+                        return_value=marker,
+                    ):
+                        if should_pass:
+                            self.assertEqual(create_c()["stage"], "C")
+                        else:
+                            with self.assertRaisesRegex(
+                                LaunchCheckError,
+                                "stage A launch/event times are not ordered",
+                            ):
+                                create_c()
 
     def test_c_binds_exact_completed_a_and_rejects_lifecycle_tamper(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
