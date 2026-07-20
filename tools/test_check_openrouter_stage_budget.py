@@ -371,6 +371,33 @@ class TestOpenRouterStageBudget(unittest.TestCase):
                     with self.assertRaises(StageGateError):
                         gate(root, baseline, snapshot(usage=0))
 
+    def test_account_arithmetic_accepts_binary64_dust_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = snapshot(
+                usage=0,
+                limit_remaining=3,
+                total_usage=1.91640139,
+                total_credits=5,
+                remaining_credits=3.08359861,
+            )
+            dusty = snapshot(
+                usage=0.2,
+                limit_remaining=2.8,
+                total_usage=1.91640375,
+                total_credits=5,
+                remaining_credits=3.0835962500000003,
+            )
+            result = gate(root, baseline, dusty)
+            self.assertEqual(result["status"], "pass")
+
+            inconsistent = copy.deepcopy(dusty)
+            account = inconsistent["account"]
+            assert isinstance(account, dict)
+            account["remaining_credits"] = 3.0835
+            with self.assertRaisesRegex(StageGateError, "credit arithmetic"):
+                gate(root, baseline, inconsistent)
+
     def test_final_rejects_delta_above_budget(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(StageGateError):

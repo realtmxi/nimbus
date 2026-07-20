@@ -1580,7 +1580,10 @@ def _load_usage_snapshot(
         account_remaining = _nonnegative_decimal(
             account.get("remaining_credits"), "account.remaining_credits", source
         )
-        if account_usage + account_remaining != account_credits:
+        if (
+            abs(account_usage + account_remaining - account_credits)
+            > USAGE_ARITHMETIC_TOLERANCE
+        ):
             raise EvidenceError(f"{source}: account remaining arithmetic mismatch")
     else:
         if any(

@@ -278,7 +278,10 @@ def _account_values(
     remaining = _number(
         account.get("remaining_credits"), f"{which} account remaining_credits"
     )
-    if total_usage + remaining != total_credits:
+    # OpenRouter serializes these values as JSON binary64 numbers and derives
+    # remaining_credits by subtraction. Decimal(str(float)) can retain tiny
+    # representation dust, so use the same tight tolerance as key arithmetic.
+    if abs((total_usage + remaining) - total_credits) > ARITHMETIC_TOLERANCE:
         raise StageGateError(f"{which} account credit arithmetic is inconsistent")
     return {
         "status": status,

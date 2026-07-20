@@ -18,6 +18,7 @@ from tools.audit_e12_live import (
     LIVE_CONTRACT,
     PAYLOAD_MODE,
     TraceIdentity,
+    _load_usage_snapshot,
     _parse_manifest,
     audit,
     main,
@@ -970,6 +971,22 @@ class LiveFixture(unittest.TestCase):
             "prompt_text", "synthetic-generation", "gen-A-0", "gen-C-0",
         ):
             self.assertNotIn(forbidden, rendered)
+
+    def test_usage_audit_accepts_binary64_account_dust_only(self) -> None:
+        payload = json.loads(self.usage_baseline.read_text())
+        payload["account"].update({
+            "total_usage": 1.91640375,
+            "total_credits": 5,
+            "remaining_credits": 3.0835962500000003,
+        })
+        dusty = self.write_json("usage_binary64_dust.json", payload)
+        loaded = _load_usage_snapshot(dusty, "binary64-dust")
+        self.assertEqual(loaded.account_remaining, Decimal("3.0835962500000003"))
+
+        payload["account"]["remaining_credits"] = 3.0835
+        inconsistent = self.write_json("usage_inconsistent.json", payload)
+        with self.assertRaisesRegex(EvidenceError, "account remaining arithmetic"):
+            _load_usage_snapshot(inconsistent, "inconsistent")
 
     def test_rejects_missing_canary(self) -> None:
         self.canary.unlink()
