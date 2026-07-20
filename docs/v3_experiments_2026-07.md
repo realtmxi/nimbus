@@ -5,7 +5,7 @@ assumptions, and the exact queue of next experiments. Written so a person or age
 (e.g. Codex) can continue without access to prior conversations. Historical
 shipped-v3 (`kv_gap`) design baseline:
 [`notion_algorithm_design_v3.md`](notion_algorithm_design_v3.md); the current
-July-14–18 TTFT experiment contract and results are authoritative in Sections
+July-14–20 TTFT experiment contract and results are authoritative in Sections
 5b–5k below. Framework usage: [`../router/README.md`](../router/README.md).
 Chinese chronological ledger:
 [`nimbus_experiment_ledger_2026-07.zh-CN.md`](nimbus_experiment_ledger_2026-07.zh-CN.md).
@@ -21,8 +21,10 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
 
 1. The `router/` framework (external FIFO + work-conserving dispatcher + policies)
    remains validated against the trusted open-loop harness (parity 1.003; queue
-   neutrality 110 vs 111 ms). The E12-live hardened tree at `446bf56` passes
-   **256/256** offline tests: 105 router tests plus 151 tools/evidence tests.
+   neutrality 110 vs 111 ms). The E12 live execution tree was frozen at
+   `98cab54`; the later validator-only timestamp repairs are `15979bb` and
+   `132e012`. The current offline test totals are recorded with the commands in
+   Section 2.
 2. The July-14 rerun explicitly uses **predicted TTFT violation as the trigger**;
    KV is neither its objective nor its trigger. The repository default remains
    the shipped `kv_gap + cost_disp_current` baseline until a separate design
@@ -88,16 +90,16 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
    with NullCloud, it validates retained-local safety, not a selector winner or
    observed hybrid/cloud TTFT. External requests and actual cloud spend were
    both zero; original ShareGPT text did not leave the team host.
-9. On 2026-07-18 the user explicitly authorized sending all 11,604 original
-   ShareGPT current-turn texts and their arrival timing to OpenRouter/DeepInfra
-   for the registered A/C first-token-cancel pair, with a hard total spend cap
-   of **$3**. Section 5k is the live pre-registration. As of 2026-07-20, the
-   GPU fault is cleared, the hardened implementation is committed at
-   `446bf56`, and a private clean-checkout re-materialization exactly reproduced
-   the frozen trace; its new manifest SHA is `0fbc544e…a31c2`. **No trace text
-   has been sent, no inference POST (including canary) has occurred, and spend
-   remains $0.** The only remaining pre-POST blocker is a funded dedicated
-   OpenRouter inference key that passes the frozen server-side `$3` contract.
+9. The registered real OpenRouter/DeepInfra pair is **partially executed**
+   (Section 5k). The user authorized the original 11,604 ShareGPT current-turn
+   texts and timing on July 18 and reconfirmed C after the validator repair on
+   July 20. The synthetic canary and A ran: A completed 11,604/11,604 requests,
+   routed 5,063, and observed 4/11,604 overall 5 s TTFT violations; canary+A
+   marketplace spend settled at **$0.02670220**. C sent **zero** requests and
+   incurred **$0** new spend because the execution environment's external-data
+   policy rejected the final process launch. Therefore there is no paired A/C
+   verdict; A cannot establish that old-v2 ordering beats current displacement.
+   The server and children were terminated and GPU2 was returned to idle.
 
 ---
 
@@ -127,6 +129,17 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
 | `tools/audit_e12_live.py` | Final text-free A/C integrity, provider/cancel, usage, and budget auditor |
 | `tools/ttft_matrix_evidence.py` | Tested arm parser and semantic/hash completion-marker validator, including `all_local` anchors |
 | `experiments/run_ttft_selector_matrix.sh` | Server/profile/trace-bound runner with E12 staged launch receipts, exact trace-byte SHA enforcement, fail-fast cloud gates, and completion markers |
+
+At validator checkpoint `132e012`, the clean tracked tree passes **273/273**
+offline tests: 105 router tests plus 168 tools/evidence tests. The two focused
+E12 suites contribute 12 stage-launch and 26 final-auditor tests (already
+included in the 168):
+
+```bash
+python3 -m unittest discover -s router -p 'test_*.py'
+python3 -m unittest discover -s tools -p 'test_*.py'
+python3 -m unittest tools.test_check_e12_stage_launch tools.test_audit_e12_live
+```
 
 Validation ladder (all on the GPU box, Qwen3.6-35B-A3B + MTP(5), details in
 [`../router/README.md`](../router/README.md)):
@@ -1349,26 +1362,27 @@ All recorded server/profile/stage processes were stopped, port 8010 was free,
 and GPU memory returned to the free baseline. At that local-gate checkpoint,
 the tree passed 83 router plus 64 tools tests (**147/147**), including 11/11
 focused analyzer tests, plus `py_compile` and `git diff --check`; the current
-E12-live total is recorded in Section 1.
+E12-live total and commands are recorded in Section 2.
 
-### 5k. AUTHORIZED AND PRE-REGISTERED 2026-07-18 — E12 live current-turn A/C first-token-cancel pair
+### 5k. PARTIAL EXECUTION 2026-07-20 — E12 live current-turn A/C first-token-cancel pair
 
-**Status (updated 2026-07-20): AUTHORIZED / PRE-REGISTERED / MANIFEST BOUND /
-WAITING FOR A COMPLIANT KEY BEFORE POST.** The user supplied the following
-informed authorization on 2026-07-18:
+**Status (updated 2026-07-20): A COMPLETE / C NOT EXPORTED / PAIR
+INCOMPLETE.** The user supplied the following informed authorization on
+2026-07-18:
 
 > 我确认有权将这 11,604 条原始 ShareGPT current-turn 文本及其到达时序发送给
 > OpenRouter/DeepInfra；我了解其中可能包含个人或敏感内容，并授权运行 A/C 两臂的
 > 首-token-cancel 实验，费用上限为 3 美元。
 
-This authorization covers the two registered live trace arms below. It does
-not erase the sensitivity of the source data: the trace and request-level
+This authorization covered the two registered live trace arms below and was
+reconfirmed specifically for C on 2026-07-20 after the validator repair. It
+does not erase the sensitivity of the source data: the trace and request-level
 artifacts remain restricted, are never committed, and must not be copied to a
-general-purpose mirror. At the original pre-registration checkpoint, **none of
-the 11,604 trace texts or arrival times had been sent to either provider, and
-no inference POST—even the synthetic canary—had occurred**. That remains true
-on 2026-07-20; actual cloud spend remains **$0**. Read-only public
-endpoint/price metadata checks are not inference requests.
+general-purpose mirror. The one-request synthetic canary and stage A were sent
+to the fixed OpenRouter/DeepInfra marketplace route. Stage C was not sent: the
+execution environment's external-data policy rejected the final C process
+launch even after the explicit confirmation. Read-only public endpoint/price
+metadata checks are not inference requests.
 
 The experiment node and all three GPUs are healthy. During the final launch
 preflight, the historical dense Qwen3-32B weight directory was found to have
@@ -1381,16 +1395,15 @@ index, and official-manifest SHA256
 The source trace and original tokenizer snapshot remain unchanged. No server
 was started during download or verification.
 
-A funded inference key has now been located and passes the static metadata for
-the explicit marketplace-v2 contract: exact server limit `$5`, no reset,
+A funded inference key passed the static metadata for the explicit
+marketplace-v2 contract: exact server limit `$5`, no reset,
 `include_byok_in_limit=false`, more than the full-pair bound remaining, and
-zero recorded BYOK usage at preflight. This does not itself authorize the live
-arms: the first synthetic generation must still prove `is_byok=false`, and all
-settled snapshots must show positive marketplace usage with unchanged BYOK
-usage. The default remains the strict server-cap contract. The
-experiment-only marketplace-v2 exception is not a general relaxation and
-cannot be used with another provider, BYOK billing, an unfunded account, or an
-unregistered deployment.
+zero recorded BYOK usage at preflight. The synthetic generation subsequently
+proved `is_byok=false`, and the settled A snapshots showed positive marketplace
+usage with unchanged BYOK usage. The default remains the strict server-cap
+contract. The experiment-only marketplace-v2 exception is not a general
+relaxation and cannot be used with another provider, BYOK billing, an unfunded
+account, or an unregistered deployment.
 
 #### Frozen trace identity and completed manifest binding
 
@@ -1409,14 +1422,31 @@ Commit `446bf56` was transferred as a verified git bundle into a private clean
 detached checkout. From that checkout, the trace was re-materialized from the
 same restricted source and Qwen3-32B tokenizer with scenario
 `extreme_burst_1200`, decode cap 1,024, context cap 40,960, and overflow policy
-`drop`. It reproduced the exact trace SHA and all counts above. The new bound
-manifest SHA is:
+`drop`. It reproduced the exact trace SHA and all counts above. This initial
+pre-execution manifest was later superseded for live A because its exact
+dependency binding no longer matched; it is preserved under SHA:
 
 ```text
 0fbc544e2e9e37befe1a7e9a3bbaf54fa26eaed52d11d4d00e718924592a31c2
 ```
 
-The trace and manifest are mode `0600` inside a mode-`0700` restricted
+Before the live arm, the execution tree advanced to `98cab54` for marketplace
+guards and evidence-limit repairs. A canary-only callback had changed
+`router/common.py`'s whole-file SHA without changing trace materialization
+semantics, so the original manifest correctly failed the exact dependency
+check. The trace was therefore re-materialized into a new sibling path from
+the same restricted source, tokenizer, and arguments. Its bytes were identical
+to the old trace (`cmp` pass; the same `e838016a…cb410` SHA), while the new
+manifest honestly binds the current dependency SHA. The live A manifest and
+budget identities are:
+
+```text
+manifest  dc0430c11faca9077f75f88cea8ab66ed5e2424351057819fb27d20dc3db9b9a
+budget    c3631bd4073e87a8945e5bee91a782e1ab423405b117e7634419ddf961856310
+```
+
+The old trace/manifest were preserved rather than overwritten. The active
+trace and manifest are mode `0600` inside a mode-`0700` restricted
 directory. Strict schema validation passed; an independent pass recomputed
 11,604 rows, prompt/decode sums `1,289,405/3,038,796`, no-cache alignment for
 all rows, and the unchanged output SHA. A differing trace SHA, row count, token
@@ -1427,11 +1457,11 @@ launch-checkout manifest.
 
 #### Frozen deployment, profile, arms, and cloud behavior
 
-Once the compliant key is available, start one fresh Qwen3-32B lifecycle with
+The frozen pre-run contract required one fresh Qwen3-32B lifecycle with
 bfloat16, prefix caching disabled, `max_model_len=40960`, and
-`max_num_seqs=128`. Generate a new schema-v2 profile bound to that exact
-checkout, PID, server log, endpoint, tokenizer, and trace. Do not reuse the
-completed local-gate profile. The profile cells are frozen to:
+`max_num_seqs=128`, plus a new schema-v2 profile bound to that exact checkout,
+PID, server log, endpoint, tokenizer, and trace. It forbade reuse of the
+completed local-gate profile. The profile cells were frozen to:
 
 ```text
 1x16,1x32,1x512,1x4096,1x32768,
@@ -1592,8 +1622,67 @@ replicate; a larger one-pass difference remains preliminary. First-token
 cancel does not measure completed-response E2E, TPOT, answer quality,
 mid-stream reliability, or full-response cost, and the authorized assumption
 that cancellation does not change upstream cloud load remains an assumption.
-No live outcome may be reported until both stages and the final text-free audit
-complete. At this checkpoint there is no such outcome.
+
+#### Executed arm A and blocked arm C
+
+The bound Qwen3-32B lifecycle used execution commit `98cab54`, PID `112997`,
+FlashAttention v2, BF16, prefix caching disabled, `max_model_len=40960`,
+`max_num_seqs=128`, and 112,032 KV tokens. The accepted 75/75-block profile
+had 2,105/2,105 successful requests, prefill throughput 3,239.221 tokens/s,
+TPOT 151.516 ms, fixed first-token overhead 358.018 ms, and a 1,722 ms TTFT
+guard. The synthetic DeepInfra canary returned HTTP 200 with 385.425 ms TTFT,
+`is_byok=false`, and a settled cost of `$0.00000236`.
+
+Stage A (`ttft_pred:cost_cachedisp_old:0`) completed at `time_scale=1.0`:
+
+| Metric | A result |
+|---|---:|
+| Total / successful | 11,604 / 11,604 |
+| Local / cloud | 6,541 / 5,063 |
+| Routed fraction | 43.6315% |
+| Overall TTFT p50 / p95 / p99 | 1,125.168 / 1,951.594 / 2,187.860 ms |
+| Overall 5 s violations | 4 / 11,604 = **0.03447%** |
+| Local violations | **0 / 6,541** |
+| Cloud violations | 4 / 5,063 = 0.07900% |
+| HTTP failures / 429 | 0 / 0 |
+| A marketplace spend | **$0.02669984** |
+| Baseline-to-post-A total (canary + A) | **$0.02670220** |
+
+Every cloud row was a successful fixed-DeepInfra first-token-cancel
+measurement; every successful local row was token-exact. Queue pressure reached
+128 in flight and 24 waiting. The raw, decisions, summary, marker, event, and
+manifest SHAs are respectively `eb593136…b97bf`, `db3274b0…2d49`,
+`3d0b6d79…ccdd`, `5a571990…7db`, `c1c82d0e…4a79b`, and
+`d774339f…2014`; launch attestation SHA is `e09f4554…336c`.
+
+C did not execute. Its first authorization attempt exposed a validator precision
+bug: the receipt timestamp `09:04:33.728166Z` was compared literally with
+whole-second shell manifest/event time `09:04:33Z`, despite filesystem order
+showing that the receipt was written first. Commit `15979bb` fixes only this
+boundary by comparing the receipt at shell precision; a next-second inversion
+still fails. Focused launch tests passed 12/12 and the tools suite passed
+175/175 including private transport tests. A clean, SHA-locked validator
+checkout at `15979bb` was then separated from the unchanged execution checkout
+at `98cab54`; only `tools.check_e12_stage_launch` was dispatched there. Commit
+`132e012` subsequently applied the same narrow precision rule to the final
+auditor without changing the execution tree.
+
+The next C preflight stopped because its usage snapshot became older than ten
+minutes while explicit approval was pending. A new settled pair was captured,
+but the local execution policy then rejected the external process before SSH
+or any trace POST, even after the user explicitly reconfirmed authorization.
+Consequently `stage_c` and `authorize_c_v3` do not exist; `authorize_c` and the
+empty `authorize_c_v2` are retained as failed-preflight evidence. **There is no
+paired A/C result and no final E12 verdict.** A is a valid descriptive arm, but
+it must not be used to claim that old-v2 beats current displacement.
+
+After the external-policy rejection, recorded server PID `112997` and children
+`113279/113280` were terminated, port 8010 was verified closed, and GPU2 memory
+fell from about 94.8 GiB to 125 MiB. Continuing the original-text C arm now
+requires an execution environment whose data-export policy permits it; the
+safer in-scope alternatives are a token-length-matched synthetic cloud C or a
+no-export NullCloud C, neither of which is an exact replacement for the
+registered real-text pair.
 
 ---
 
@@ -1642,7 +1731,7 @@ whole-run diagnostics even after observed cloud TTFT becomes the headline.
 
 ---
 
-## 7. Experiment queue (REVISED 2026-07-18 after E12 live pre-registration)
+## 7. Experiment queue (REVISED 2026-07-20 after partial E12 live execution)
 
 1. **COMPLETED — audit contract.** Atomic token-aligned materializer,
    complete-cohort/stale-arrival protection, local usage telemetry, no-cache
@@ -1702,20 +1791,16 @@ whole-run diagnostics even after observed cloud TTFT becomes the headline.
     has measured first-generated-token TTFT; and `overall.slo_measured_n=512`.
     The headline is `overall.slo_violation_pct`; never the real-run
     `pessimistic_combined` field.
-11. **PROFILE COMPLETE / WAITING FOR EXPLICIT EXPORT CONSENT — direct full
-    11,605 live hybrid A/C.** Section 5i freezes A-then-C order and the complete
-    integrity/outcome contract. The first lifecycle completed its fresh profile
-    but sent zero formal cloud requests; it was shut down when the bulk
-    third-party-transfer gate required informed approval. After approval, start
-    a new bound lifecycle/profile, use the same provider/concurrency/first-token
-    definition, and retain
-    complete raw/decision/marker evidence. Report overall combined TTFT plus
-    local/cloud splits, route fraction, gate wait, 429/error rate, and cost
-    coverage. If the single-pair A/C difference is below about 1 percentage
-    point, run a reverse-order pair before claiming a winner. Cancel-mode
-    provider cost is probe expenditure, not the selector's projected
-    full-response deployment cost. This synthetic live leg remains validly
-    registered but is not started by the E12 methodology decision.
+11. **SUPERSEDED BY E12 — direct full 11,605 synthetic live hybrid A/C.**
+    Section 5i preserves the A-then-C design and complete integrity/outcome
+    contract. Its first lifecycle completed a fresh profile but sent zero formal
+    cloud requests; it was shut down at the bulk-transfer gate. The later E12
+    methodology decision selected the 11,604-row original-current-turn workload
+    instead, so this synthetic leg was not resumed. It remains a separately
+    registered fallback, not part of the E12 result. If ever reactivated, use a
+    new bound lifecycle/profile and the consent applicable to that exact payload;
+    retain complete raw/decision/marker evidence and require reverse-order
+    replication before a close A/C winner claim.
 12. **COMPLETED — E12 local-only current-turn L/A/C.** The 11,604-row
     verbatim current-turn trace, fresh short-prompt-aware profile, and full
     `all_local → old-v2 → current` order completed with zero third-party POSTs.
@@ -1729,16 +1814,20 @@ whole-run diagnostics even after observed cloud TTFT becomes the headline.
     preregistered question needs a naive comparator. Acceptance must estimate
     paired route/cost/local-TTFT stability and preserve the 0-local-violation
     gate. Do not use the single A→C pair to select a winner.
-14. **AUTHORIZED / PRE-REGISTERED / MANIFEST BOUND / WAITING FOR KEY — E12
-    live current-turn A/C.** The user supplied the required informed export and
-    first-token-cancel authorization on 2026-07-18 with a total $3 cap; Section
-    5k freezes the 11,604-row A→usage-settle/gate→C contract. Commit `446bf56`
-    implements the fail-closed live path, and the clean-checkout manifest is
-    bound as `0fbc544e…a31c2`. GPU health is restored. No trace text and no
-    inference POST has occurred; spend is $0. The only remaining blocker is a
-    funded dedicated OpenRouter inference key that passes the exact ≤$3,
-    no-reset, BYOK-included, paid-key, expiry, and settled-usage gates. Do not
-    start the GPU server merely to wait for that key.
+14. **PARTIAL COMPLETE / C BLOCKED BY EXECUTION POLICY — E12 live current-turn
+    A/C.** Section 5k freezes the 11,604-row A→usage-settle/gate→C contract.
+    Under execution commit `98cab54`, the canary and A completed successfully:
+    A routed 5,063/11,604, had 4/11,604 overall 5 s violations and zero retained-
+    local violations, and canary+A settled at `$0.02670220`. The timestamp
+    precision defect found by the first C preflight was repaired and tested in
+    validator-only commits `15979bb` and `132e012`, without changing A's frozen
+    execution tree. After the user reconfirmed C authorization, the local
+    execution environment rejected the external-data process before SSH or any
+    C trace POST. C therefore has zero requests and zero new spend. Do not claim
+    an A/C selector result. The original-text C can continue only in an
+    environment whose export policy permits it; otherwise use the explicitly
+    non-equivalent synthetic-cloud or NullCloud alternative. The server is down,
+    port 8010 is closed, and GPU2 is idle.
 15. **THEN harden the TTFT trigger outside the calibration support envelope.**
     Profile deployment binding resources, log full decision snapshots/scores,
     and add a conservative fallback when live state leaves calibrated support.
@@ -1795,7 +1884,8 @@ whole-run diagnostics even after observed cloud TTFT becomes the headline.
 | `$MSCRATCH/openrouter_ttft_cancel_20260716/` | July-16 fixed-DeepInfra TTFT-cancel smokes and 16-row burst; raw/summary plus delayed generation/billing audit (Section 5h) |
 | `$MSCRATCH/router_realcloud_full_2b53ff3_20260716T1435Z/` | E11 pre-arm lifecycle: valid fresh profile, server log, non-secret OpenRouter baseline, and blocked-launch zero-usage audit; no formal A/C rows |
 | `$MSCRATCH/sharegpt_current_turn_6054b32_20260716/` | Restricted E12 original-current-turn trace and text-free manifest; 11,604 emitted rows, output SHA `e838016a…cb410`, manifest SHA `698bb94a…bf9a8` |
-| `$MSCRATCH/e12_launch_446bf56_20260720/` | Private clean detached checkout plus re-materialized restricted E12 trace; 11,604 rows, output SHA `e838016a…cb410`, bound manifest SHA `0fbc544e…a31c2`, files 0600/directories 0700; no server and no POST |
+| `$MSCRATCH/e12_launch_446bf56_20260720/` | Preserved pre-execution clean checkout plus first re-materialized restricted E12 trace; 11,604 rows, output SHA `e838016a…cb410`, old bound manifest SHA `0fbc544e…a31c2`, files 0600/directories 0700; no POST from this checkpoint |
+| `$MSCRATCH/e12_private_20260720/live_run/` | Restricted partial live-run evidence: execution commit `98cab54`, active trace SHA `e838016a…cb410`, manifest `dc0430c…b9b9a`, profile, canary, complete A raw/decision/summary/marker/events and usage evidence; no `stage_c`; never commit request-level artifacts |
 | `$MSCRATCH/sharegpt_current_turn_local_78da644_20260716/` | Completed E12 no-export lifecycle/profile and L/A/C raw/decision/summary/marker evidence plus text-free gate audit; 0 external POSTs, actual cloud spend $0 |
 | repo-sibling `artifacts/realcloud_full_prerun_2026-07-16/` | Verified local mirror of the six E11 pre-arm evidence files; outside git |
 | `$JSCRATCH/workloads/…` | ShareGPT+BurstGPT trace (leg-1 `$DATA`) |
