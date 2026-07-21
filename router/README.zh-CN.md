@@ -14,7 +14,7 @@
 | `run.py` | **唯一入口**:外部 FIFO + work-conserving dispatcher + KV 读数器 + CLI |
 | `common.py` | 共享库:`one_request`/`load_trace`/`SCENARIOS`(逐行取自 `vllm/run.py` @ `dff1a81`)、`Endpoint`、`Policy`、`NullCloud`、计费、`summarize` |
 | `nimbus.py` | Nimbus v3 baseline + 正交的 KV-gap / 预测 TTFT 触发器与 victim-selector 消融 |
-| `test_run.py` / `test_common.py` / `test_nimbus.py` | 75 个单元测试,无需网络/aiohttp/GPU |
+| `test_run.py` / `test_common.py` / `test_nimbus.py` | 105 个单元测试,无需网络/aiohttp/GPU |
 
 ## 架构
 
@@ -108,8 +108,10 @@ nimbus 的 kick 检查在 dispatch **之前**跑,`--policy nimbus` 下引擎饱�
 
 ## Nimbus v3 policy(`--policy nimbus --kv-capacity-tokens N`)
 
-队列级甩负载,每次到达/完成时在本地 dispatch **之前**裁决。权威设计见
-[`docs/notion_algorithm_design_v3.zh-CN.md`](../docs/notion_algorithm_design_v3.zh-CN.md)。
+队列级甩负载,每次到达/完成时在本地 dispatch **之前**裁决。历史 shipped baseline 见
+[`docs/notion_algorithm_design_v3.zh-CN.md`](../docs/notion_algorithm_design_v3.zh-CN.md)；
+当前算法与证据入口见
+[`docs/nimbus_algorithm_and_results_2026-07.zh-CN.md`](../docs/nimbus_algorithm_and_results_2026-07.zh-CN.md)。
 在线规则为:
 
 ```
@@ -133,8 +135,9 @@ release_target = G + 0.05 × K_headroom
 生成 token 数跟踪进度,不再把 MTP content chunk 当作单个 token。
 
 本 policy 明确是 **KV-bound**。compute/slot-bound 过载需要另一套触发信号,不会
-被静默当成 KV 压力。v3 在线不运行背包 solver;精确 cover-form DP 计划作为离线
-评估参考,当前尚未实现。
+被静默当成 KV 压力。v3 在线不运行背包 solver；实现按 `cost/displacement` 做启发式
+排序并覆盖 footprint target，不是标准 minimum-cost-cover density 算法。精确
+cover-form DP 计划作为离线评估参考，当前尚未实现。
 
 ## 实验性预测 TTFT 触发器
 
@@ -170,10 +173,12 @@ anchor 存在 Nimbus trigger 或 decision log。
 **当前证据边界（2026-07-15）。** 在已完成的预注册 11,605-request dense-32B
 no-cache full cell 中，`ttft_pred + cost_cachedisp_old` 与 `ttft_pred +
 cost_disp_current` 留在本地的请求均为 0 违约；old V2 位于冻结的路由等价带内，
-且成本低 4.98%。`ttft_pred + newest` 留下 39 个违约，这些违约都发生在
-client-visible load 超出 profile 支持域时；`kv_gap + cost_disp_current` 则留下 5,249 个违约。
+且成本低 4.98%。`ttft_pred + newest` 留下 39 个违约；它们的 planned commitment
+都超过最大 profile cell，与离开 calibration coverage 一致（runtime 尚无显式
+support-envelope classifier）。`kv_gap + cost_disp_current` 则留下 5,249 个违约。
 因此 `ttft_pred` 仍属实验性，还需要显式 support-envelope/resource fallback；
-`kv_gap` 保留为代码默认是为了兼容，并不代表它已被证明能保证 TTFT 安全。
+`kv_gap` 保留为 `--policy nimbus` 下的 trigger 默认是为了兼容，并不代表它已被证明能
+保证 TTFT 安全。
 详见 [`../docs/v3_experiments_2026-07.md`](../docs/v3_experiments_2026-07.md)
 第 5g 节。
 

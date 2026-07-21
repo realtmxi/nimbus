@@ -2,13 +2,16 @@
 
 # Nimbus 算法设计（v3，KV 受限）
 
+> **历史规格。** 当前 trigger/selector 算法与已完成的 E12 结果请先读
+> [`nimbus_algorithm_and_results_2026-07.zh-CN.md`](nimbus_algorithm_and_results_2026-07.zh-CN.md)。
+
 > **状态（2026-07-15）：这是已发布 baseline，不是推荐的 TTFT 设计。**
 > 仓库默认仍是本文描述的 `kv_gap`，但已完成的 11,605-request dense-32B
 > no-cache full cell 已否定它在该负载上足以保证 TTFT 安全：留下本地的 5,545 个
 > 请求中有 5,249 个超过 5 秒。换成正交的 `ttft_pred` 触发器后，exact old-V2
 > 与 current-displacement 排序都做到本地 0 违约；old V2 的路由数等价且成本
 > 更低。冻结的 selector-independent safety gate 仍然失败，因为 naive
-> `newest` 在 profile 支持域外留下了 39 个违约。所以下一步应做 support-aware
+> `newest` 在 commitment 超过最大 profile cell 时留下了 39 个违约。所以下一步应做 support-aware
 > TTFT predictor，而不是退回 KV-only 触发。仓库默认暂不改变；这条
 > no-cache/oracle-decode/NullCloud 实验也不能验证 cached-token 项、在线 decode
 > 估计或真实云 SLO。详见
@@ -142,9 +145,9 @@ B 外发贵 4×，但对缓存时间的伤害大 10×——踢它更划算。**�
 
 按此顺序踢，直到盖住释放目标（本场景 29,014 tokens）。被踢请求去云 API，我们付它们的 cost。
 
-（启用 MTP/batch 耦合时：每踢一个会缩小运行中的 batch，从而改变每个人的每 token 时间与 residence——因此每踢一次后重新估计并重排。静态近似下，一轮排序即可。）
+（未来 MTP/batch-aware 设计应随 batch 变化重估有效 TPOT，并可能在每次踢出后重排；当前实现没有该模式，只使用一个静态标定 TPOT 和一次排序。）
 
-**在线 vs 离线，精确表述：** 在线算法是覆盖形式的**密度贪心**（「释放 ≥ release_target tokens，优先买回最多 cache·time」）——在线不跑背包求解器。静态覆盖问题（「以最小总成本释放 ≥ G tokens」）有精确 DP 解；该 DP **计划作为离线评估 oracle**，但当前仓库尚未实现。
+**在线 vs 离线，精确表述：** 当前实现按 `cost / displacement` 做**启发式 victim ordering**，直到累计释放的 `footprint` 覆盖 target。它不是标准的 minimum-cost-cover density greedy（后者应按 `cost / footprint`），因此没有对应最优性保证。精确静态 cover-form DP 只计划作为离线评估 oracle，当前仓库尚未实现。
 
 ---
 
@@ -161,7 +164,7 @@ B 外发贵 4×，但对缓存时间的伤害大 10×——踢它更划算。**�
 ## 第 5 部分 — 两个诚实脚注（给论文；不改变算法）
 
 1. 输出长度在线未知。量 ①③④ 都依赖对它的估计。实验必须包含「oracle 长度 vs 估计长度」对比。
-2. 被踢请求也可能违约延迟 SLO（测得的云端 TTFT：我们通道上中位数 ≈ 10 s——云不是快速逃生舱）。总账必须也计入它们的违约，不只是本地侧。
+2. 被踢请求也可能违约延迟 SLO。历史队友 current-turn 数据在另一条通道上曾测得云 TTFT 中位数 ≈10 s；这不是后来固定 DeepInfra 的 E12 结果。总账必须同时计入两侧违约，不能只看本地。
 
 ---
 

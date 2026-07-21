@@ -1,5 +1,10 @@
 # Nimbus v3 — experiment record & handoff (July 2026)
 
+**Start here for the current algorithm and result interpretation:**
+[`nimbus_algorithm_and_results_2026-07.zh-CN.md`](nimbus_algorithm_and_results_2026-07.zh-CN.md).
+This long document remains the frozen experiment contract, audit trail, and
+artifact handoff; it is not the shortest explanation of the current design.
+
 Self-contained status document: what was built, what was measured, what broke our
 assumptions, and the exact queue of next experiments. Written so a person or agent
 (e.g. Codex) can continue without access to prior conversations. Historical
@@ -40,9 +45,11 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
    were also decided row-by-row, often leaving the selector one candidate. The
    recorded latencies are real for those payloads, but claims that displacement
    caused the win are not identified.
-4. The independent gauge finding remains valid: hybrid Qwen3.6-35B-A3B exposes
-   a per-sequence state pool (~41 concurrent), while dense Qwen3-32B exposes
-   token KV. That explains why a KV-gauge trigger is architecture-dependent; it
+4. The independent gauge finding remains valid at the mechanism level: the
+   hybrid Qwen3.6-35B-A3B gauge was dominated by per-sequence state (phase max
+   running observed near 41), while dense Qwen3-32B was consistent with token
+   KV. The retained phase maxima do not establish an exact coefficient or hard
+   concurrency ceiling. The result still shows why a KV-gauge trigger is architecture-dependent; it
    is evidence against treating KV as a universal overload trigger and says
    nothing against the original v2 weight as a victim-ordering signal.
 5. The July-15 repeatability campaign completed **6 blocks / 24 arms** on one
@@ -249,10 +256,11 @@ python -m router.run --data $DATA --scenario extreme_burst_1200 --policy nimbus 
 **Audit that led to Section 4** (reproduce: `tools/analyze_eb1200.py <jsonl>`;
 raw results: `$MSCRATCH/router_v3/v3_nimbus_eb1200.jsonl`):
 
-- Kicks spread uniformly t = 13 s … 1,198 s (of 1,199 s), 20–55% of arrivals per
-  10 s bucket — steady-state shedding, not burst response.
+- Kicks spread across t = 13 s … 1,198 s (of 1,199 s), with 8.16–55.45% of
+  arrivals kicked among the 109 ten-second buckets that contained a kick —
+  sustained shedding, not a one-time burst response.
 - At kick moments: inflight p50 43 (max 55); **KV commitment upper bound p50 =
-  20,841 tokens, max = 45,840 — never above 21% of the 216,512-token capacity.**
+  20,841 tokens, max = 45,840 — at most 21.17% of the 216,512-token capacity.**
   Token-KV pressure did not exist at any kick.
 - Scheduler metadata *appeared* selective: kicked prompt p50 = 644 vs kept p50
   = 28 (footprint p50 920 vs 289). The July-14 payload audit showed these were
@@ -263,18 +271,20 @@ raw results: `$MSCRATCH/router_v3/v3_nimbus_eb1200.jsonl`):
 
 ---
 
-## 4. Core finding: on hybrid-GDN models the "KV usage" gauge is a concurrency meter
+## 4. Core finding: hybrid-GDN "KV usage" was dominated by per-sequence state
 
 Live probe on a fresh identical server (`tools/kv_gauge_probe.py`), fixed token
-volume, varying concurrency:
+volume, varying concurrency. Only phase-level max usage and max running survive;
+the original 0.5 s samples were not retained, so the two maxima below are not
+proven to be simultaneous:
 
-| Load | In-flight tokens (% of 216,512) | `kv_cache_usage_perc` |
+| Load | Nominal attempted tokens (% of 216,512, if all concurrent) | phase max `kv_cache_usage_perc` |
 |---|---|---|
 | idle | 0 | 0.00% |
 | 8 concurrent small reqs | 0.8% | **19.12%** |
-| 32 concurrent small reqs | 3.2% | **76.48%** (linear, ≈2.4%/seq) |
-| 64 attempted | 6.4% | **97.99%, engine ran only ≤41 concurrently** |
-| 2 × 8k-token prompts | 7.9% | 3.40% |
+| 32 concurrent small reqs | 3.2% | **76.48%** |
+| 64 attempted | 6.4% | **97.99%; phase max running observed ≈41** |
+| 2 × 8k-token prompts | 7.9% | 3.40% (phase max running separately observed as 1) |
 | after each phase, idle | 0 | 0.00% |
 
 Corroborating server-log lines (same launch): `num_gpu_blocks_override=512`;
@@ -284,31 +294,33 @@ request: 3.07x` (a pure full-attention model would show 216,512/262,144 = 0.83×
 is NOT the explanation).
 
 **Interpretation.** Qwen3.6-35B-A3B is hybrid GDN(linear-attention)+full-attention.
-The GDN layers hold a fixed-size recurrent state **per sequence**, allocated from
-a 512-block pool; each running sequence costs ≈2.4% of the pool regardless of
-length, so the pool — and the gauge — saturates at ~41–42 concurrent sequences.
-Per-token attention KV contributes comparatively little (~1% per 8k tokens;
-2-point estimate, proper fit is queue item 1).
+Together with the server log, the phase maxima strongly support that the gauge
+is dominated by fixed-size recurrent state **per sequence**, not ordinary
+per-token attention KV. The retained evidence is not sufficient to claim an
+exact 2.4%/sequence coefficient, a hard 41-sequence ceiling, or a fitted
+per-8k-token contribution; those require a rerun that preserves the time series.
 
 **Consequences.**
 
-1. *Leg-1 mechanism*: `KVMonitor` converted the slot-meter into fake "headroom
+1. *Leg-1 mechanism*: `KVMonitor` converted the state-dominated gauge into fake "headroom
    tokens" `(1−u)×216512`, which collapsed to ~30k once ~35 sequences ran. The
-   gap therefore fired exactly at the engine's true saturation knee, and v3
-   operated as an adaptive concurrency governor + big-request filter. Right
-   trigger point, wrong units: on a slot-bound engine, kicking one 900-token
+   observed behavior is consistent with firing near a state-slot saturation
+   region, so v3 operated like an adaptive concurrency governor + big-request
+   filter. The retained time series is insufficient to identify an exact knee.
+   On a slot-bound engine, kicking one 900-token
    request frees the same one slot as kicking a 50-token request, while the
    token-denominated `release_target` believes it freed 18× more. A different
    workload shape (many small requests) could make the cover computation
-   systematically over/under-shed. The win is real; the safety margin is luck.
-2. *For the team*: `max_num_seqs=128` is not achievable on this model — true
-   ceiling ≈41. Every saturation result on it (including "compute-bound"
-   interpretations of extreme_burst) is state-slot-bound and should be re-read
-   accordingly.
-3. *For the paper*: engine "KV usage" semantics are architecture-dependent
-   (tokens vs. per-sequence state). Routers that assume token units are wrong on
-   hybrid models — none of the related work handles this. This is a
-   contribution, not just a bug.
+   systematically over/under-shed. The win is real; its safety margin was not
+   established by the retained gauge evidence.
+2. *For the team*: `max_num_seqs=128` did not imply 128 observed concurrent
+   sequences in this deployment; the probe observed a phase maximum near 41.
+   Saturation results should therefore be re-read as potentially state-slot
+   bound, without promoting 41 to an architecture-wide hard limit.
+3. *For the paper*: engine "KV usage" semantics appear architecture-dependent
+   (tokens vs. per-sequence state). Routers should not assume token units on a
+   hybrid model without a probe. Whether this is a novel paper contribution
+   requires a separate literature review.
 
 ---
 
@@ -362,11 +374,12 @@ self-consistent, unlike the hybrid's 3.07×). Note: GPU0 wedged again
 ordinal by UUID via torch at startup, and an NVML `sitecustomize` shim
 (`$MSCRATCH/nvml_shim/`) lets vLLM import past the dead NVML handle.
 
-**Gauge probe on dense (perfect inversion of the hybrid)**: usage == token
-fraction (8-way small → 1.50%, 32-way → 5.95%, 64-way → 11.89% with all 64
-running; 2×8k prompts → 8.14% ≈ one resident 8k prompt's share). The gauge is
-an honest token meter here; no per-sequence slot ceiling (all 64 ran vs the
-hybrid's hard 41).
+**Gauge probe on dense:** phase max usage was consistent with token-dominated
+occupancy (8-way small → 1.50%, 32-way → 5.95%, 64-way → 11.89% with all 64
+running; 2×8k phase max → 8.14%). Unlike the hybrid phase, all 64 ran. Because
+the original 0.5 s samples were not retained, these independent maxima support
+the high-level semantic contrast but not an exact token fit or a precise
+cross-model concurrency ceiling.
 
 **Cell results (current-harness semantics: `max_tokens` = trace value)**:
 
@@ -397,15 +410,16 @@ into free KV"
 stabilizes the queue at exactly free-KV depth (~35k tokens ≈ 59 requests ≈ 6 s
 of wait at this service rate) and stops shedding, while the actual binding
 resource (compute slots) needs a near-empty queue to meet a 5 s TTFT SLO.
-Honest units, wrong resource → systematic under-shed. Cost note: at matched
+Token-consistent gauge behavior, wrong binding resource → systematic under-shed. Cost note: at matched
 fraction v3's victims cost more per head than random's ($2.70 vs $1.82) —
 displacement ordering deliberately exports the biggest requests.
 
 **Historical July-13 proposal (superseded as the active path by Section 5b).**
-The two campaigns compose into one principle. Hybrid 35B: the gauge
-accidentally measured the binding resource (GDN state slots) → trigger landed
-on the true knee → 0.32 s / 0%. Dense 32B: the gauge honestly measures tokens,
-but slots bind → trigger lands on the wrong bar → 6.4 s / 64%. **v3.1 must set
+The two campaigns compose into one principle. Hybrid 35B: the state-dominated
+gauge made the trigger behave like a concurrency governor near the observed
+saturation region → 0.32 s / 0%. Dense 32B: the gauge behavior was consistent
+with token-dominated occupancy, but slots bind → trigger lands on the wrong bar
+→ 6.4 s / 64%. **v3.1 must set
 the admission bar on the binding resource at the operating point** — per-
 resource headroom meters (KV tokens, sequence slots, compute/batch slots) with
 gap taken on the tightest one. The cost/displacement layer is still a hypothesis

@@ -1,33 +1,38 @@
 # Nimbus: Cache-Displacement-Aware Outsourcing for Hybrid LLM Inference
 
-Nimbus is a hybrid LLM inference system that combines local GPU deployment with
-serverless cloud APIs. When burst traffic exceeds local capacity, Nimbus
-intelligently selects which requests to outsource to cloud APIs based on their
-**cache displacement** — the product of KV memory footprint and residence time
-— rather than compute cost (FLOPs).
+Nimbus is a hybrid LLM inference research system that combines local GPU
+deployment with cloud APIs. Its current design separates **when/how much** to
+outsource (a predicted-TTFT trigger) from **which requests** to outsource (a
+cost-aware resource-residence selector).
 
-**Key result**: At 15% outsource fraction, Nimbus achieves **11.7x lower TTFT
-p50** than FLOP-based outsourcing on the ShareGPT+BurstGPT trace
-(Qwen2.5-7B on RTX PRO 6000 Blackwell).
+**Historical motivation result:** at a fixed 15% outsource fraction, the early
+cache-displacement prototype achieved 11.7x lower TTFT p50 than FLOP-based
+outsourcing on one ShareGPT+BurstGPT / Qwen2.5-7B setup. This is not the current
+audited headline or evidence for the shipped trigger.
 
-The current online implementation is `router/`, following
+Start with the self-contained current algorithm and evidence summary:
+[`docs/nimbus_algorithm_and_results_2026-07.zh-CN.md`](docs/nimbus_algorithm_and_results_2026-07.zh-CN.md)
+(Chinese).
+The executable experiment harness is `router/`; the historical shipped-v3 KV
+baseline is preserved in
 [`docs/notion_algorithm_design_v3.md`](docs/notion_algorithm_design_v3.md).
 The top-level `nimbus/` package is the legacy FLOP/online-knapsack prototype;
 it is retained only for historical analysis and is not imported by the router.
 
-**Algorithm status (2026-07-15):** the shipped/default Nimbus combination
+**Algorithm status (2026-07-21):** after selecting `--policy nimbus`, the
+default trigger/selector combination
 remains `kv_gap + cost_disp_current`, but the completed dense-32B no-cache full
 cell falsified it as a sufficient TTFT-safety trigger on that workload (94.7%
 of retained-local requests violated 5 s). The experimental direction is
-`ttft_pred` for when/how much to shed, with a resource-sensitive selector for
-whom. Exact old-V2 `cost_cachedisp_old` and current `cost_disp_current` each had
-zero local violations; old V2 was route-equivalent and cheaper. The frozen
-all-selector safety gate nevertheless failed because naive `newest` left 39
-local violations outside the calibration support envelope. Therefore old V2
-survives as an ordering signal, TTFT predictor hardening is next, and no
-default has been changed. See
-[`docs/v3_experiments_2026-07.md`](docs/v3_experiments_2026-07.md), Sections
-5b–5g, for the evidence and remaining gates.
+`ttft_pred + cost_cachedisp_old`: old V2 survives as an ordering signal, not as
+a token-second capacity. In the completed real-cloud A→C pair, old/current
+selectors had 11/3 overall 5 s violations and zero retained-local violations;
+the comparison remains unresolved because it is one fixed order and the
+difference is below the preregistered 1 pp threshold. Support-envelope fallback
+and an online decode estimator are still missing, so no default has changed.
+See the current summary above or
+[`docs/v3_experiments_2026-07.md`](docs/v3_experiments_2026-07.md) for the
+frozen evidence trail.
 中文时间线、每次实验目的和结果总账见
 [`docs/nimbus_experiment_ledger_2026-07.zh-CN.md`](docs/nimbus_experiment_ledger_2026-07.zh-CN.md)。
 
@@ -65,7 +70,8 @@ scripts/analysis/                Offline/historical analysis (no GPU required)
   plot_cachedisp_knee.py         Knee sweep plot
 
 docs/
-  notion_algorithm_design_v3.md Current online algorithm specification
+  nimbus_algorithm_and_results_2026-07.zh-CN.md Current algorithm/evidence entry point
+  notion_algorithm_design_v3.md Historical shipped-v3 KV specification
   nimbus_v2_pitch.md             Paper pitch (Cache Displacement story)
   tcpo_oracle_design.md          Trace-Clairvoyant Pressure Oracle design
   exp_knapsack_vs_sorting_design.md
@@ -74,10 +80,12 @@ scripts/download_data.sh         Fetch trace data from gpu1
 data/                            Local trace files (gitignored)
 ```
 
-## Outsourcing Strategies (Baselines + Ours)
+## Historical fixed-fraction experiment strategies
 
 `experiments/run_offload_strategies.py` implements 11 strategies behind a unified
-`OffloadStrategy` interface, organized in three tiers:
+`OffloadStrategy` interface, organized in three tiers. These belong to the
+legacy fixed-fraction experiment path and are **not** the current `router/`
+trigger/selector policy.
 
 ### Intuitive baselines (oblivious / extremes)
 
@@ -104,7 +112,7 @@ data/                            Local trace files (gitignored)
 | SizeOutsourceShortStrategy | `size_short` | Outsource smallest-prefill requests (worst case) |
 | FlopBasedStrategy | `flop_based` | Weight = `prefill_flops + 0.6 * decode_flops` (Nimbus v0) |
 
-### Ours
+### Historical CacheDisp prototype
 
 | Strategy | CLI name | Description |
 |----------|----------|-------------|

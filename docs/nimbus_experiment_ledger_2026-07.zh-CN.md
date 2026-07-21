@@ -1,5 +1,9 @@
 # Nimbus 实验总账（2026 年 7 月）
 
+**第一次了解当前算法，请先读短版真相页：**
+[`nimbus_algorithm_and_results_2026-07.zh-CN.md`](nimbus_algorithm_and_results_2026-07.zh-CN.md)。
+本文件继续作为 E0–E12 的中文时间线、证据等级和原始数据索引。
+
 这份文档是中文导航账本，解决三个问题：
 
 1. 我们每次实验到底想回答什么；
@@ -107,12 +111,12 @@ TTFT 违约为 11/3，retained-local 均为 0；retry 花费 `$0.04693796`，连
 
 | ID | 日期 | 实验目的 | 一句话结果 | 证据等级 |
 |---|---|---|---|---|
-| E0 | 7 月上旬 | 验证 router harness 本身没有引入偏差 | open-loop parity 1.003，queue neutrality 110 vs 111 ms | VALIDATED |
+| E0 | 7 月上旬 | 验证 router harness 本身没有引入偏差 | historical parity summary 1.003，queue neutrality 110 vs 111 ms | FRAMEWORK VALIDATED / PARITY RAW MISSING |
 | E1 | 7 月 12 日前 | 同比例外发时，“踢谁”是否重要 | pre-v3 明显优于 random，但触发器严重欠踢 | EXPLORATORY |
 | E2 | 7 月 12 日 | 在长 prompt rednote slice 上测试 KV v3 | 本地 TTFT 改善；悲观 combined 与 all-local 基本打平 | EXPLORATORY |
 | E3 | 7 月 12–13 日 | 在 hybrid 35B hardest cell 上验证 v3 | 0 本地违约，但随后发现 gauge 不是 token-KV meter | MECHANISM ONLY |
-| E4 | 7 月 13 日 | 探明 gauge 在 hybrid/dense 模型上的真实语义 | hybrid gauge≈sequence state；dense gauge≈token KV | VALIDATED |
-| E5 | 7 月 13 日 | 在 dense 32B 上给 KV 触发器一次公平机会 | gauge 单位正确，但 KV 非绑定资源，仍系统性欠踢 | SUPERSEDED / MECHANISM ONLY |
+| E4 | 7 月 13 日 | 探明 gauge 在 hybrid/dense 模型上的真实语义 | hybrid gauge 受 sequence state 主导；dense 更接近 token KV | MECHANISM VALIDATED / PRECISE FIT PENDING |
+| E5 | 7 月 13 日 | 在 dense 32B 上给 KV 触发器一次公平机会 | gauge 与 token-dominated occupancy 一致，但 KV 非绑定资源，仍系统性欠踢 | SUPERSEDED / MECHANISM ONLY |
 | E6 | 7 月 14 日 | 修复 payload、同刻到达、profile 与审计合同 | 得到 token-aligned trace 和 shared-prefill TTFT predictor | VALIDATED |
 | E7 | 7 月 14 日 | 在相同 TTFT stop rule 下初筛 selector | old V2 257 routes，current 266，newest 326 | EXPLORATORY |
 | E8 | 7 月 15 日 | 检查 selector 结果能否跨顺序/重复稳定 | old V2 6/6 胜 newest；与 current 路由数等价但更便宜 | VALIDATED |
@@ -141,7 +145,9 @@ TTFT 违约为 11/3，retained-local 均为 0；retry 花费 `$0.04693796`，连
 
 **结论**
 
-后续实验可以把差异归因到 workload/policy/server 条件，而不是框架基础偏差。
+除 parity raw 已缺失、只能保留为 historical summary anchor 外，其余 framework
+anchors 与当前离线测试支持后续把差异归因到 workload/policy/server 条件，而不是
+已知的框架基础偏差。
 
 **证据**
 
@@ -275,14 +281,17 @@ Nimbus 是 `(8+45)/80 = 66.3%`，all-local 是 `67.5%`，几乎打平。
 
 **Hybrid Qwen3.6-35B-A3B**
 
-| 负载 | 理论 in-flight token 占比 | gauge |
+| 负载 | nominal attempted token 占比（假设全并发） | phase max gauge |
 |---|---:|---:|
 | 8 路小请求 | 0.8% | 19.12% |
 | 32 路小请求 | 3.2% | 76.48% |
-| 尝试 64 路 | 6.4% | 97.99%，实际约 41 路上限 |
-| 2×8k prompt | 7.9% | 3.40% |
+| 尝试 64 路 | 6.4% | phase max 97.99%，另观察到 max running 约 41 |
+| 2×8k prompt | 7.9% | 3.40%（另观察到 phase max running=1） |
 
 它主要像“每个 sequence 固定占一份 GDN state”的并发表，而不是 token-KV 表。
+注意：抢救下来的 stdout 只保留每个 phase 独立的 max usage 与 max running，原始
+0.5 秒样本已丢，两项峰值不一定在同一时刻；因此这里不再把 41 写成精确硬上限，
+也不从这份证据拟合精确的每-sequence 系数。
 
 **Dense Qwen3-32B**
 
@@ -292,7 +301,7 @@ Nimbus 是 `(8+45)/80 = 66.3%`，all-local 是 `67.5%`，几乎打平。
 | 32 路 | 5.95% |
 | 64 路 | 11.89%，64 路全部运行 |
 
-它才近似诚实的 token-KV meter。
+它的 phase 行为更接近 token-dominated occupancy；留存证据仍不足以做精确 token fit。
 
 **结论**
 
@@ -303,17 +312,17 @@ deployment-specific probe 后才能进入模型：
 - hybrid GDN：可能主要代表 per-sequence state；
 - 其他部署：需要重新标定。
 
-**证据等级：VALIDATED。**
+**证据等级：高层机制 VALIDATED；精确系数/上限待重跑。**
 
 **复现工具**：`tools/kv_gauge_probe.py`。
 
 ---
 
-### E5 — Dense 32B：Gauge 单位终于正确，为何 KV trigger 仍失败？
+### E5 — Dense 32B：Gauge 更接近 token occupancy，为何 KV trigger 仍失败？
 
 **目的**
 
-执行历史 Option B：换纯 full-attention dense 模型，让 gauge 确实表示 token KV，
+执行历史 Option B：换纯 full-attention dense 模型，让 gauge 行为更接近 token KV，
 再检查 KV v3。
 
 **先确认中等 cell 是否有压力**
@@ -331,7 +340,8 @@ deployment-specific probe 后才能进入模型：
 
 **关键机制**
 
-Gauge 单位这次是对的，但引擎全程 sequence/compute-bound：
+Dense gauge 的 phase 行为这次与 token-dominated occupancy 一致，但引擎全程
+sequence/compute-bound：
 
 - `peak_inflight=128` 钉死；
 - token KV 最高约 69%，从未成为绑定资源。
@@ -527,7 +537,9 @@ failure”；exit code 2 才表示证据损坏。
 - 32/39 的本地 service TTFT 自身就超过 5 秒；其余 7 个是 queue+service 相加
   超线；
 - 39/39 都发生在 client-visible active requests 为 126–128 时；
-- planned `prompt + requested decode` commitment 全部超过 profile 的支持上界；
+- planned `prompt + requested decode` commitment 全部超过最大 profiled cell
+  98,304，也超过 declared capacity proxy 112,656；runtime 当时没有事前定义的
+  support-envelope classifier；
 - B 本地请求 TPOT p50 是标定值的 1.259×，违约请求为 1.371×；
 - 同期 engine-reported cache gauge 为 98.1–100%，但其语义依赖部署，只能作为
   相关上下文，不能直接叫“token-KV 满了”。
@@ -548,7 +560,7 @@ failure”；exit code 2 才表示证据损坏。
 - 被否定：`kv_gap` 足以保证 TTFT 安全；
 - 被保留：TTFT violation 作为触发目标；
 - 被保留：旧 V2 token-seconds 作为 victim ordering 信号；
-- 新问题：predictor 离开 calibration support envelope 时需要保守 fallback。
+- 新问题：状态超出 calibration coverage 时需要显式 envelope 判定和保守 fallback。
 
 **证据等级：VALIDATED。** 总 gate 的“失败”本身就是有效结论。
 
@@ -1192,7 +1204,8 @@ Shipped v3: kv_gap trigger + current displacement selector
 
 实验 TTFT 版: ttft_pred trigger + 可替换 selector
     进展：A/C 在完整 cell 上 0 本地违约
-    问题：B 使 predictor 离开支持域，selector-independent safety gate 失败
+    问题：B 在 commitment 超过 calibration coverage 时仍有违约，
+          selector-independent safety gate 失败
 
 下一版目标: support-aware ttft_pred + old V2 selector
     support 内：按 TTFT 预测做最短 prefix spill
@@ -1302,11 +1315,12 @@ python3 -m unittest \
 python3 -m unittest discover -s tools -p 'test_*.py'
 ```
 
-- **原 GPU 数据状态**：parity `1.003`、queue neutrality `110 vs 111 ms`、
-  pressure pacing `756/756` 的原始 JSONL/summary 路径没有进入当前 artifact
-  inventory；当时用于 parity 的同-schema runner 后来已删除。
-- **因此能主张**：框架设计和离线证据测试当前可验证；历史 GPU 数字目前是
-  summary-only anchor，正式投稿前应重跑并按 E6 之后的 marker 合约归档。
+- **原 GPU 数据状态**：queue neutrality、pressure pacing、random 与 nimbus-neutrality
+  的 raw/summary 已在 `router_step2/`、`router_final/`、`router_nimbus/` 中定位并进入
+  §6.13 的 repo 外哈希镜像；只有 parity `1.003` 那一次的 raw 未保存，当时使用的
+  same-schema runner 后来已删除。
+- **因此能主张**：除 parity 外的 framework anchors 可从镜像复算；parity 仍只是
+  historical summary anchor，正式投稿前应重跑并按 E6 之后的 marker 合约归档。
 
 ### 6.4 E1 数据索引 — Pre-v3 selection signal
 

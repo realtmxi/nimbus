@@ -14,7 +14,7 @@ policy, recording latency, cost, and the split. Single entry point:
 | `run.py` | **The entry point**: external FIFO + work-conserving dispatcher + KV monitor + CLI |
 | `common.py` | Shared library: `one_request` / `load_trace` / `SCENARIOS` (line-for-line from `vllm/run.py` @ `dff1a81`), `Endpoint`, `Policy`, `NullCloud`, billing, `summarize` |
 | `nimbus.py` | Nimbus v3 baseline plus orthogonal KV-gap / predicted-TTFT triggers and victim-selector ablations |
-| `test_run.py` / `test_common.py` / `test_nimbus.py` | 75 unit tests; no network / aiohttp / GPU needed |
+| `test_run.py` / `test_common.py` / `test_nimbus.py` | 105 unit tests; no network / aiohttp / GPU needed |
 
 ## Architecture
 
@@ -124,8 +124,10 @@ implemented: the nimbus kick check runs BEFORE dispatch, so under
 ## The Nimbus v3 policy (`--policy nimbus --kv-capacity-tokens N`)
 
 Queue-level shedding, adjudicated BEFORE local dispatch on every
-arrival/completion. The authoritative design is
-[`docs/notion_algorithm_design_v3.md`](../docs/notion_algorithm_design_v3.md).
+arrival/completion. This historical shipped baseline is specified in
+[`docs/notion_algorithm_design_v3.md`](../docs/notion_algorithm_design_v3.md);
+the current algorithm/evidence entry point is
+[`docs/nimbus_algorithm_and_results_2026-07.zh-CN.md`](../docs/nimbus_algorithm_and_results_2026-07.zh-CN.md).
 The online rule is:
 
 ```
@@ -152,8 +154,10 @@ as individual tokens.
 
 This policy is deliberately **KV-bound**. Compute/slot-bound overload requires a
 separate trigger and is not silently treated as KV pressure. No online
-knapsack solver runs in v3; an exact cover-form DP is planned as an offline
-evaluation reference and is not yet implemented.
+knapsack solver runs in v3. The implementation uses heuristic
+`cost/displacement` ordering to cover a footprint target; it is not a standard
+minimum-cost-cover density algorithm. An exact cover-form DP is planned as an
+offline evaluation reference and is not yet implemented.
 
 ## Experimental predicted-TTFT trigger
 
@@ -195,11 +199,14 @@ pretending the anchor has a Nimbus trigger or decision log.
 11,605-request dense-32B no-cache cell, `ttft_pred + cost_cachedisp_old` and
 `ttft_pred + cost_disp_current` each retained zero local violations; old V2 was
 within the frozen route-equivalence band and cost 4.98% less. `ttft_pred +
-newest` left 39 violations; all occurred with client-visible load beyond the
-profile support envelope, while `kv_gap + cost_disp_current` left 5,249.
+newest` left 39 violations; all had planned commitment above the maximum
+profiled cell, consistent with leaving calibration coverage (no runtime
+support-envelope classifier exists yet), while `kv_gap + cost_disp_current`
+left 5,249.
 Consequently `ttft_pred` is still experimental and needs an explicit
-support-envelope/resource fallback; `kv_gap` remains the code default for
-compatibility, not a demonstrated TTFT-safety guarantee. See Section 5g of
+support-envelope/resource fallback; `kv_gap` remains the trigger default under
+`--policy nimbus` for compatibility, not a demonstrated TTFT-safety guarantee.
+See Section 5g of
 [`../docs/v3_experiments_2026-07.md`](../docs/v3_experiments_2026-07.md).
 
 ### Token-aligned no-cache experiment prerequisite

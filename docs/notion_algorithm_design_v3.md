@@ -2,6 +2,10 @@
 
 # Nimbus Algorithm Design (v3, KV-bound)
 
+> **Historical specification.** For the current trigger/selector algorithm and
+> the completed E12 results, start with
+> [`nimbus_algorithm_and_results_2026-07.zh-CN.md`](nimbus_algorithm_and_results_2026-07.zh-CN.md).
+
 > **Status (2026-07-15): shipped baseline, not the recommended TTFT design.**
 > The repository still defaults to the `kv_gap` algorithm described here, but
 > the completed 11,605-request dense-32B no-cache cell falsified it as a
@@ -9,8 +13,8 @@
 > requests violated 5 s. Under the orthogonal `ttft_pred` trigger, exact old-V2
 > and current-displacement ordering each had zero local violations; old V2 was
 > route-equivalent and cheaper. The frozen selector-independent safety gate
-> still failed because naive `newest` had 39 violations outside the profile
-> support envelope. The next design step is therefore a support-aware TTFT
+> still failed because naive `newest` had 39 violations at commitments beyond
+> the largest profiled cell. The next design step is therefore a support-aware TTFT
 > predictor, not a return to KV-only triggering. No default is changed; the
 > no-cache/oracle-decode/NullCloud cell also does not validate the cached term,
 > an online decode estimator, or real-cloud SLO. See
@@ -201,17 +205,16 @@ only place it acts** — it decides the order, never the fit.
 Kick in this order until the release target (29,014 tokens in the scenario) is covered. Kicked
 requests go to the cloud API and we pay their cost.
 
-(When the MTP/batch coupling is enabled: each kick shrinks the running batch,
-which changes everyone's per-token time and hence residence — so re-estimate
-and re-rank after each kick. Under a static approximation, one ranking pass
-suffices.)
+(Future MTP/batch-aware design should re-estimate effective TPOT as the batch
+changes and may re-rank after each kick. The current implementation does not do
+this; it uses one static calibrated TPOT and one ranking pass.)
 
-**Online vs offline, stated precisely:** online, the algorithm is a **density
-greedy over the cover form** ("release ≥ release_target tokens, cheapest
-cache·time first") — no knapsack solver runs online. The static cover problem
-("release ≥ G tokens at minimum total cost") has an exact DP solution. That DP
-is **planned as an offline evaluation oracle**, but is not implemented in the
-current repository.
+**Online vs offline, stated precisely:** online, the implementation uses a
+`cost / displacement` **heuristic victim ordering** until the released
+`footprint` covers the target. It is not the standard minimum-cost-cover density
+greedy (`cost / footprint`) and has no corresponding optimality guarantee. An
+exact static cover-form DP is planned only as an offline evaluation oracle and
+is not implemented in the current repository.
 
 ---
 
@@ -230,10 +233,10 @@ current repository.
 1. Output length is unknown online. Quantities ①③④ all depend on an estimate
    of it. Experiments must include an "oracle length vs estimated length"
    comparison.
-2. Kicked requests can violate the latency SLO too (measured cloud
-   time-to-first-token: median ≈ 10 s on our channel — the cloud is not a
-   fast escape hatch). Total accounting must count their violations as well,
-   not just the local side's.
+2. Kicked requests can violate the latency SLO too. A historical teammate
+   current-turn dataset on a different channel had cloud TTFT median ≈10 s;
+   this is not the later fixed-DeepInfra E12 result. Total accounting must
+   count both sides, not just local.
 
 ---
 
