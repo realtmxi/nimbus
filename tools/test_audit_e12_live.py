@@ -973,6 +973,24 @@ class LiveFixture(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, rendered)
 
+    def test_final_audit_accepts_old_accounting_baseline(self) -> None:
+        self.usage_final_previous = self.make_usage(
+            "final_old_previous", "2026-07-18T07:00:00Z",
+            Decimal("0.31"), Decimal("1.21"),
+        )
+        self.usage_final_current = self.make_usage(
+            "final_old_current", "2026-07-18T07:01:00Z",
+            Decimal("0.31"), Decimal("1.21"),
+        )
+        self.final_gate = self.make_gate(
+            "final_old", self.usage_final_previous,
+            self.usage_final_current,
+            future_bound=Decimal("0.95401528"),
+            now="2026-07-18T07:01:00Z",
+            final=True,
+        )
+        self.assertEqual(self.run_audit()["verdict"], "pass")
+
     def test_launch_time_precision_accepts_same_second_only(self) -> None:
         authorized = utc("2026-07-20T09:04:33Z")
         live = utc("2026-07-20T09:04:33.500000Z")

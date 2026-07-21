@@ -57,6 +57,7 @@ def _stage_call(function: Any, *args: Any, **kwargs: Any) -> Any:
 def _validate_times(
     *, global_at: datetime, retry_at: datetime,
     settlement_previous_at: datetime, current_at: datetime, now: datetime,
+    enforce_retry_baseline_freshness: bool,
 ) -> Decimal:
     if not global_at <= retry_at < settlement_previous_at < current_at:
         raise RetryBudgetError(
@@ -64,7 +65,10 @@ def _validate_times(
         )
     if current_at > now:
         raise RetryBudgetError("current snapshot timestamp is in the future")
-    if now - retry_at > SNAPSHOT_MAX_AGE:
+    if (
+        enforce_retry_baseline_freshness
+        and now - retry_at > SNAPSHOT_MAX_AGE
+    ):
         raise RetryBudgetError("retry-baseline snapshot is stale")
     if now - current_at > CURRENT_SNAPSHOT_MAX_AGE:
         raise RetryBudgetError("current snapshot is stale")
@@ -159,6 +163,11 @@ def build_retry_budget_attestation(
         settlement_previous_at=settlement_previous_at,
         current_at=current_at,
         now=current_time,
+        # Starting another paid stage requires a fresh retry baseline.  A
+        # final attestation is retrospective and remains anchored to that
+        # original baseline even when a provider settlement or operator pause
+        # takes longer than six hours; its final pair must still be fresh.
+        enforce_retry_baseline_freshness=not final,
     )
 
     global_key = _stage_call(
@@ -267,8 +276,12 @@ def build_retry_budget_attestation(
         },
         "freshness": {
             "global_baseline_max_age_enforced": False,
-            "retry_baseline_max_age_s": _decimal_text(
-                Decimal(str(SNAPSHOT_MAX_AGE.total_seconds()))
+            "retry_baseline_max_age_s": (
+                None
+                if final
+                else _decimal_text(
+                    Decimal(str(SNAPSHOT_MAX_AGE.total_seconds()))
+                )
             ),
             "current_max_age_s": _decimal_text(
                 Decimal(str(CURRENT_SNAPSHOT_MAX_AGE.total_seconds()))

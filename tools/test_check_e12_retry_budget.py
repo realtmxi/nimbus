@@ -275,6 +275,7 @@ class TestE12RetryBudget(unittest.TestCase):
             self.assertEqual(result["budget"]["global_usage_delta_usd"], "3")
             self.assertEqual(result["budget"]["projected_global_spend_usd"], "3")
             self.assertEqual(result["budget"]["projected_headroom_usd"], "0")
+            self.assertIsNone(result["freshness"]["retry_baseline_max_age_s"])
 
             over = Decimal("4.90000001")
             with self.assertRaisesRegex(RetryBudgetError, "authorized budget"):
@@ -297,6 +298,50 @@ class TestE12RetryBudget(unittest.TestCase):
                     final=True,
                     next_stage_full_upper_bound_usd="0.95401528",
                     key_contract_mode=E12_MARKETPLACE_KEY_CONTRACT,
+                )
+
+    def test_only_final_accepts_a_stale_retry_accounting_baseline(self):
+        stale_retry_at = "2026-07-20T05:59:59Z"
+        snapshots = (
+            snapshot(at=GLOBAL_AT, usage=Decimal("0.1")),
+            snapshot(at=stale_retry_at, usage=Decimal("0.2")),
+            snapshot(at=SETTLEMENT_AT, usage=Decimal("0.3")),
+            snapshot(at=CURRENT_AT, usage=Decimal("0.3")),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = guard(root, *copy.deepcopy(snapshots), final=True)
+            self.assertEqual(result["mode"], "retry_final")
+            self.assertIsNone(result["freshness"]["retry_baseline_max_age_s"])
+            with self.assertRaisesRegex(
+                RetryBudgetError, "retry-baseline snapshot is stale"
+            ):
+                guard(root, *copy.deepcopy(snapshots))
+            with self.assertRaisesRegex(
+                RetryBudgetError, "current snapshot is stale"
+            ):
+                guard(
+                    root,
+                    copy.deepcopy(snapshots[0]),
+                    copy.deepcopy(snapshots[1]),
+                    snapshot(
+                        at="2026-07-20T11:48:00Z",
+                        usage=Decimal("0.3"),
+                    ),
+                    snapshot(
+                        at="2026-07-20T11:49:59Z",
+                        usage=Decimal("0.3"),
+                    ),
+                    final=True,
+                )
+            with self.assertRaisesRegex(RetryBudgetError, "not settled"):
+                guard(
+                    root,
+                    copy.deepcopy(snapshots[0]),
+                    copy.deepcopy(snapshots[1]),
+                    snapshot(at=SETTLEMENT_AT, usage=Decimal("0.2")),
+                    snapshot(at=CURRENT_AT, usage=Decimal("0.3")),
+                    final=True,
                 )
 
     def test_account_capacity_is_required_when_available_but_403_is_safe(self):

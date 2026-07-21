@@ -280,6 +280,52 @@ class TestOpenRouterStageBudget(unittest.TestCase):
             self.assertTrue(result["settlement"]["verified"])
             self.assertEqual(result["settlement"]["observed_interval_s"], "60")
 
+    def test_only_final_accepts_an_old_accounting_baseline(self):
+        old_baseline = snapshot(
+            usage=0,
+            limit_remaining=3,
+            captured_at_utc="2026-07-17T12:00:00Z",
+        )
+        settled = snapshot(
+            usage=0.2,
+            limit_remaining=2.8,
+            captured_at_utc=SETTLEMENT_AT,
+        )
+        current = snapshot(
+            usage=0.2,
+            limit_remaining=2.8,
+            captured_at_utc=CURRENT_AT,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = gate(
+                root,
+                old_baseline,
+                current,
+                settlement_previous=settled,
+                preserve_timestamps=True,
+                final=True,
+            )
+            self.assertEqual(result["mode"], "final")
+            with self.assertRaisesRegex(StageGateError, "baseline snapshot is stale"):
+                gate(
+                    root,
+                    old_baseline,
+                    current,
+                    settlement_previous=settled,
+                    preserve_timestamps=True,
+                )
+            with self.assertRaisesRegex(StageGateError, "current snapshot is stale"):
+                gate(
+                    root,
+                    old_baseline,
+                    current,
+                    settlement_previous=settled,
+                    preserve_timestamps=True,
+                    final=True,
+                    now=datetime(2026, 7, 18, 0, 20, tzinfo=timezone.utc),
+                )
+
     def test_rejects_invalid_key_limits_usage_and_snapshot_identity(self):
         mutations = [
             (snapshot(usage=0, limit=None), snapshot(usage=0)),
@@ -435,6 +481,17 @@ class TestOpenRouterStageBudget(unittest.TestCase):
                         usage=0.1,
                         limit_remaining=2.9,
                     ),
+                )
+            with self.assertRaisesRegex(StageGateError, "did not remain equal"):
+                gate(
+                    root,
+                    snapshot(usage=0, limit_remaining=3),
+                    snapshot(usage=0.2, limit_remaining=2.8),
+                    settlement_previous=snapshot(
+                        usage=0.1,
+                        limit_remaining=2.9,
+                    ),
+                    final=True,
                 )
 
             short_previous = snapshot(

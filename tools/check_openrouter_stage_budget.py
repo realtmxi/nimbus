@@ -159,12 +159,13 @@ def _validate_snapshot_times(
     current: datetime,
     now: datetime,
     settlement_previous: datetime | None,
+    enforce_baseline_freshness: bool,
 ) -> None:
     if not baseline < current:
         raise StageGateError("snapshot timestamps must be strictly increasing")
     if current > now or baseline > now:
         raise StageGateError("snapshot timestamp is in the future")
-    if now - baseline > SNAPSHOT_MAX_AGE:
+    if enforce_baseline_freshness and now - baseline > SNAPSHOT_MAX_AGE:
         raise StageGateError("baseline snapshot is stale")
     if now - current > CURRENT_SNAPSHOT_MAX_AGE:
         raise StageGateError("current snapshot is stale")
@@ -370,6 +371,10 @@ def build_stage_gate_attestation(
         current=current_at,
         now=current_time,
         settlement_previous=settlement_previous_at,
+        # A final gate is retrospective: the original experiment baseline is
+        # the accounting anchor and may legitimately be older than the
+        # operational launch window.  The settled final pair must stay fresh.
+        enforce_baseline_freshness=not final,
     )
 
     baseline_key = _key_values(
