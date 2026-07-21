@@ -5,7 +5,7 @@ assumptions, and the exact queue of next experiments. Written so a person or age
 (e.g. Codex) can continue without access to prior conversations. Historical
 shipped-v3 (`kv_gap`) design baseline:
 [`notion_algorithm_design_v3.md`](notion_algorithm_design_v3.md); the current
-July-14–20 TTFT experiment contract and results are authoritative in Sections
+July-14–21 TTFT experiment contract and results are authoritative in Sections
 5b–5k below. Framework usage: [`../router/README.md`](../router/README.md).
 Chinese chronological ledger:
 [`nimbus_experiment_ledger_2026-07.zh-CN.md`](nimbus_experiment_ledger_2026-07.zh-CN.md).
@@ -22,9 +22,10 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
 1. The `router/` framework (external FIFO + work-conserving dispatcher + policies)
    remains validated against the trusted open-loop harness (parity 1.003; queue
    neutrality 110 vs 111 ms). The E12 live execution tree was frozen at
-   `98cab54`; the later validator-only timestamp repairs are `15979bb` and
-   `132e012`. The current offline test totals are recorded with the commands in
-   Section 2.
+   `98cab54`; validator-only timestamp repairs are `15979bb` and `132e012`, and
+   the cumulative-retry/final-audit guards are `ee1a7f6` and `f3583a3`. At the
+   latter checkpoint the clean tree passes **287/287** offline tests; commands
+   are in Section 2.
 2. The July-14 rerun explicitly uses **predicted TTFT violation as the trigger**;
    KV is neither its objective nor its trigger. The repository default remains
    the shipped `kv_gap + cost_disp_current` baseline until a separate design
@@ -90,16 +91,20 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
    with NullCloud, it validates retained-local safety, not a selector winner or
    observed hybrid/cloud TTFT. External requests and actual cloud spend were
    both zero; original ShareGPT text did not leave the team host.
-9. The registered real OpenRouter/DeepInfra pair is **partially executed**
-   (Section 5k). The user authorized the original 11,604 ShareGPT current-turn
-   texts and timing on July 18 and reconfirmed C after the validator repair on
-   July 20. The synthetic canary and A ran: A completed 11,604/11,604 requests,
-   routed 5,063, and observed 4/11,604 overall 5 s TTFT violations; canary+A
-   marketplace spend settled at **$0.02670220**. C sent **zero** requests and
-   incurred **$0** new spend because the execution environment's external-data
-   policy rejected the final process launch. Therefore there is no paired A/C
-   verdict; A cannot establish that old-v2 ordering beats current displacement.
-   The server and children were terminated and GPU2 was returned to idle.
+9. The registered real OpenRouter/DeepInfra experiment now has **two distinct
+   lifecycles** (Section 5k). The first is permanently **TERMINAL PARTIAL**: its
+   canary+A completed, C never launched, and its settled **$0.02670220** remains
+   part of the global `$3` spend. A fresh retry then completed the ordered A→C
+   pair and passed the final text-free audit. A routed 5,097 and had 11/11,604
+   overall 5 s violations; C routed 4,057 and had 3/11,604. Both retained-local
+   sets had zero violations. C used 1,040 fewer cloud routes but had worse
+   overall TTFT p50/p95/p99 by 180.46/139.06/44.62 ms. Retry spend including
+   canary was **$0.04693796**; cumulative spend including the terminal partial
+   lifecycle was **$0.07364016**, leaving **$2.92635984** under the authorized
+   cap. Because this is one A→C pair and the violation-rate difference is only
+   0.06894 percentage points, the preregistered `<1 pp` rule declares the
+   selector comparison **unresolved**; reverse-order/repeated lifecycles are
+   required before naming a winner.
 
 ---
 
@@ -124,21 +129,19 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
 | `tools/check_e12_live_budget.py` | E12 trace/manifest/price validator and exact full-decode two-arm static budget attestation |
 | `tools/openrouter_usage_snapshot.py` | Whitelisted non-secret OpenRouter key limit/usage snapshot; never persists the key or provider error body |
 | `tools/check_openrouter_stage_budget.py` | Offline `$3` canary/A/C staged-budget gate over usage snapshots |
+| `tools/check_e12_retry_budget.py` | Cumulative retry guard: carries prior spend into launch/final accounting while requiring a fresh settled pair |
 | `tools/run_openrouter_ttft_canary.py` | One fixed public synthetic first-token-cancel request; never reads the restricted trace |
 | `tools/check_e12_stage_launch.py` | Reproducible A/C launch authorization plus last-moment live-usage verification receipt; binds completed A before C |
 | `tools/audit_e12_live.py` | Final text-free A/C integrity, provider/cancel, usage, and budget auditor |
 | `tools/ttft_matrix_evidence.py` | Tested arm parser and semantic/hash completion-marker validator, including `all_local` anchors |
 | `experiments/run_ttft_selector_matrix.sh` | Server/profile/trace-bound runner with E12 staged launch receipts, exact trace-byte SHA enforcement, fail-fast cloud gates, and completion markers |
 
-At validator checkpoint `132e012`, the clean tracked tree passes **273/273**
-offline tests: 105 router tests plus 168 tools/evidence tests. The two focused
-E12 suites contribute 12 stage-launch and 26 final-auditor tests (already
-included in the 168):
+At final-audit tooling checkpoint `f3583a3`, the clean tracked tree passes
+**287/287** offline tests: 105 router tests plus 182 tools/evidence tests:
 
 ```bash
 python3 -m unittest discover -s router -p 'test_*.py'
 python3 -m unittest discover -s tools -p 'test_*.py'
-python3 -m unittest tools.test_check_e12_stage_launch tools.test_audit_e12_live
 ```
 
 Validation ladder (all on the GPU box, Qwen3.6-35B-A3B + MTP(5), details in
@@ -334,7 +337,7 @@ still owed before a paper claim.
 
 ## 5a. ADDENDUM 2026-07-13 — dense-model campaign (Option B executed) and the binding-resource principle
 
-Murphy's decision: validate on a pure full-attention model (Qwen3-32B dense)
+Team decision: validate on a pure full-attention model (Qwen3-32B dense)
 using the SAME team workload (ShareGPT + BurstGPT timestamps); the rednote
 slice is dropped from the near-term plan. Executed same day; all results under
 `$MSCRATCH/router_v32b/`, scripts `v32b_accept.sh` / `v32b_eb.sh` /
@@ -404,7 +407,7 @@ gap taken on the tightest one. The cost/displacement layer is still a hypothesis
 to re-test on aligned payloads; the old ×25 comparison is not proof.
 Option A above is subsumed: resource-generic units are necessary but not
 sufficient — resource *identification* is the missing half. Design note for
-Murphy's sign-off before implementing.
+the project owner's sign-off before implementing.
 
 ### 5b. ADDENDUM 2026-07-14 — TTFT-trigger rerun and audit contract
 
@@ -989,7 +992,7 @@ behavior still requires a full-drain sensitivity leg.
 
 ### 5i. PRE-REGISTERED 2026-07-16 — direct full real-cloud A/C
 
-**Decision and deviation from the queue.** Murphy chose to skip both the
+**Decision and deviation from the queue.** The project owner chose to skip both the
 512-request frozen-route shadow and the 512-request live pilot and proceed
 directly to the complete 11,605-request live-hybrid A/C pair. This increases
 spend and makes a bad configuration more expensive, but it does not change the
@@ -1364,11 +1367,14 @@ the tree passed 83 router plus 64 tools tests (**147/147**), including 11/11
 focused analyzer tests, plus `py_compile` and `git diff --check`; the current
 E12-live total and commands are recorded in Section 2.
 
-### 5k. PARTIAL EXECUTION 2026-07-20 — E12 live current-turn A/C first-token-cancel pair
+### 5k. E12 live current-turn A/C first-token-cancel — old lifecycle TERMINAL PARTIAL; fresh retry COMPLETE
 
-**Status (updated 2026-07-20): A COMPLETE / C NOT EXPORTED / PAIR
-INCOMPLETE.** The user supplied the following informed authorization on
-2026-07-18:
+**Status (updated 2026-07-21): lifecycle 1 is TERMINAL PARTIAL; lifecycle 2
+completed A→C and its final audit passed.** These are independent lifecycles
+with independent profiles and run fingerprints. They share the frozen trace,
+deployment, provider, selector, and `$3` authorization contract below, but an
+arm from one lifecycle must never be paired with an arm from the other. The user
+supplied the following informed authorization on 2026-07-18:
 
 > 我确认有权将这 11,604 条原始 ShareGPT current-turn 文本及其到达时序发送给
 > OpenRouter/DeepInfra；我了解其中可能包含个人或敏感内容，并授权运行 A/C 两臂的
@@ -1378,11 +1384,10 @@ This authorization covered the two registered live trace arms below and was
 reconfirmed specifically for C on 2026-07-20 after the validator repair. It
 does not erase the sensitivity of the source data: the trace and request-level
 artifacts remain restricted, are never committed, and must not be copied to a
-general-purpose mirror. The one-request synthetic canary and stage A were sent
-to the fixed OpenRouter/DeepInfra marketplace route. Stage C was not sent: the
-execution environment's external-data policy rejected the final C process
-launch even after the explicit confirmation. Read-only public endpoint/price
-metadata checks are not inference requests.
+general-purpose mirror. In lifecycle 1 the one-request synthetic canary and A
+were sent, while C was blocked before any POST. In lifecycle 2 a new canary and
+both A and C were sent to the fixed OpenRouter/DeepInfra marketplace route.
+Read-only public endpoint/price metadata checks are not inference requests.
 
 The experiment node and all three GPUs are healthy. During the final launch
 preflight, the historical dense Qwen3-32B weight directory was found to have
@@ -1437,12 +1442,14 @@ semantics, so the original manifest correctly failed the exact dependency
 check. The trace was therefore re-materialized into a new sibling path from
 the same restricted source, tokenizer, and arguments. Its bytes were identical
 to the old trace (`cmp` pass; the same `e838016a…cb410` SHA), while the new
-manifest honestly binds the current dependency SHA. The live A manifest and
-budget identities are:
+manifest honestly binds the current dependency SHA. The active manifest is
+common to both execution lifecycles. Their separate budget-attestation
+identities are:
 
 ```text
 manifest  dc0430c11faca9077f75f88cea8ab66ed5e2424351057819fb27d20dc3db9b9a
-budget    c3631bd4073e87a8945e5bee91a782e1ab423405b117e7634419ddf961856310
+lifecycle 1 budget  c3631bd4073e87a8945e5bee91a782e1ab423405b117e7634419ddf961856310
+lifecycle 2 budget  21812bb145deb29e692d0e178ce8bd65d5890954a5a7d49279bf1a2ae6ea5ac9
 ```
 
 The old trace/manifest were preserved rather than overwritten. The active
@@ -1623,7 +1630,7 @@ cancel does not measure completed-response E2E, TPOT, answer quality,
 mid-stream reliability, or full-response cost, and the authorized assumption
 that cancellation does not change upstream cloud load remains an assumption.
 
-#### Executed arm A and blocked arm C
+#### Lifecycle 1 — TERMINAL PARTIAL: A complete, C never launched
 
 The bound Qwen3-32B lifecycle used execution commit `98cab54`, PID `112997`,
 FlashAttention v2, BF16, prefix caching disabled, `max_model_len=40960`,
@@ -1673,16 +1680,123 @@ but the local execution policy then rejected the external process before SSH
 or any trace POST, even after the user explicitly reconfirmed authorization.
 Consequently `stage_c` and `authorize_c_v3` do not exist; `authorize_c` and the
 empty `authorize_c_v2` are retained as failed-preflight evidence. **There is no
-paired A/C result and no final E12 verdict.** A is a valid descriptive arm, but
-it must not be used to claim that old-v2 beats current displacement.
+paired A/C result and no final E12 verdict from this lifecycle.** A is a valid
+descriptive arm, but it must not be used to claim that old-v2 beats current
+displacement.
 
 After the external-policy rejection, recorded server PID `112997` and children
 `113279/113280` were terminated, port 8010 was verified closed, and GPU2 memory
-fell from about 94.8 GiB to 125 MiB. Continuing the original-text C arm now
-requires an execution environment whose data-export policy permits it; the
-safer in-scope alternatives are a token-length-matched synthetic cloud C or a
-no-export NullCloud C, neither of which is an exact replacement for the
-registered real-text pair.
+fell from about 94.8 GiB to 125 MiB. The bound server and profile were destroyed,
+so this lifecycle is permanently **TERMINAL PARTIAL**: it cannot be resumed, and
+its A must never be paired with a C from a later lifecycle. Its settled canary+A
+spend of **$0.02670220** remains charged against the global `$3` authorization.
+
+#### Lifecycle 2 — fresh retry A→C: COMPLETE / FINAL AUDIT PASS
+
+The retry used the same frozen execution commit
+`98cab54a29e3b8ff066e474d26ddbdbf0394b2b8`, trace, manifest, deployment, and
+arm order, but started a new server/profile lifecycle. Retry-budget tooling was
+frozen at `ee1a7f648aed8bb19eba52fa223944a0b647ccae`; the final delayed-settlement
+audit used `f3583a329fbbd2099a24b3ef9425ee6cdf8979cc`. The contract ID is
+`e12-live-current-turn-retry-pair-20260720-marketplace-8512bc423b3d095b1c426c345d9095d2a75188634e1eb2d93cd6b4f59d2bab40`.
+
+The new lifecycle ran under PID `137586`, with 112,032 KV tokens and a valid
+15-cell profile (SHA256
+`b5e29af776ecf82edf94ef3aa9388ee00c20a70546d416dac199b0bc1a134d47`).
+All 2,105 profile samples succeeded; the held-out set had 421 samples and zero
+false negatives. Its calibrated parameters were prefill throughput
+`3247.990163` tokens/s, TPOT `151.213123 ms`, fixed first-token overhead
+`372.804523 ms`, and TTFT guard `1712 ms`. The fixed DeepInfra canary passed at
+`319.492 ms`, requested stream cancellation, did not complete the response, and
+reported marketplace rather than BYOK billing; its evidence SHA256 is
+`70bbb70bbbd551b2bffdc6f3aee57c462817a24750c6c4a75f7633c42d50aa10`.
+
+Both registered arms then completed at `time_scale=1.0`:
+
+| Metric | A — `cost_cachedisp_old` | C — `cost_disp_current` |
+|---|---:|---:|
+| Total / successful | 11,604 / 11,601 | 11,604 / 11,604 |
+| Local / cloud | 6,507 / 5,097 | 7,547 / 4,057 |
+| Routed fraction | 43.9245% | 34.9621% |
+| Overall TTFT p50 / p95 / p99 | 1,126.482 / 1,983.963 / 2,451.606 ms | 1,306.939 / 2,123.023 / 2,496.230 ms |
+| Local TTFT p50 / p95 / p99 | 1,377.188 / 2,007.805 / 2,204.826 ms | 1,470.152 / 2,147.514 / 2,372.112 ms |
+| Cloud TTFT p50 / p95 / p99 | 474.991 / 1,830.916 / 2,941.866 ms | 567.699 / 1,938.093 / 2,972.899 ms |
+| Overall 5 s violations | 11 / 11,604 = **0.0947949%** | 3 / 11,604 = **0.0258532%** |
+| Retained-local violations | **0 / 6,507** | **0 / 7,547** |
+| Cloud timeout / HTTP 429 | 3 / 0 | 0 / 0 |
+| Settled marketplace spend | **$0.02720312** | **$0.01973248** |
+
+The TTFT quantiles use successful rows with a finite observed TTFT, so A's
+three timeout rows are absent from its quantiles. They are nevertheless
+retained as failures and violations in the fixed 11,604-request SLO
+denominator. The spend values come from settled key/account usage deltas, not
+the per-run summary fields: first-token cancellation left cloud costs pending
+there, with `known_cost_usd=0`.
+
+All successful retained-local rows were prompt/decode-token exact; applied
+victims exactly matched cloud request IDs. The complete text-free evidence
+identities are:
+
+| Evidence | A SHA256 | C SHA256 |
+|---|---|---|
+| raw | `2bc944209cbfbe26e8a8916b7922d0766e8b13156ff513291ba576be6ba54877` | `19cfa07772809c8872ac0e4a345d62a74c82f05508e268315bc314f9eb942d65` |
+| summary | `c2455fec91d833c753562975fddb8437097d520f58806fbfbe8e718b7d9fbd49` | `de028203af6244a606db797b49dd7ee8af8ef8b459be6537be29ed8fc0db6d95` |
+| decisions | `652cb27643360c3abbd33d152c63c66b935b54fd0547abc85e744904aa0bde63` | `a5fa2810b4ac46cae9efa7c96951ef093ea07f846389612ef37a270e45707a4f` |
+| completion marker | `8b9429d49c54f8431e9bbe28c6fd5cbdff161a4aa16bd6b08e30deb7d860625e` | `fd34d7a0ed9dca89886ef6ce09a8295f4f21de4ff11365dcf744455596ee48e5` |
+| events | `e7d64c4011b8f0696a28b4994e83482bf81a52a9e1f7e5ec2d2171c53d9aaf48` | `a3d0353615dab460487c2d76bd0ca63de9ebbc0379ff925d4b99e8dc60ac4bd4` |
+| run fingerprint | `967b3ac418bc55b8db9049bfd4353882ea4e7902c047b465b16acbceb747dba6` | `3c4d23ebcb98aa8bc70d03b66e820ff020bc53885738d888de29c39628c5c10d` |
+
+The retry canary cost `$0.00000236`; A+C cost `$0.04693560`, so retry spend was
+**$0.04693796**. Including lifecycle 1's terminal partial spend, the global
+experiment total was **$0.07364016** and headroom was **$2.92635984**; BYOK
+usage remained `$0`. The public price snapshot, retry budget attestation,
+pre-A/pre-C/final cumulative guards, final stage gate, and final audit have
+SHA256 values respectively:
+
+```text
+price              690cb986740769b711a67d3d1cb848aace618c54263a273aca94f6a89f158a02
+budget             21812bb145deb29e692d0e178ce8bd65d5890954a5a7d49279bf1a2ae6ea5ac9
+pre-A cumulative   8512bc423b3d095b1c426c345d9095d2a75188634e1eb2d93cd6b4f59d2bab40
+pre-C cumulative   c741b6091a789263ec04183d1a21a84f78df7f4a9db2efefbf23fc612cd33751
+final cumulative   105e211721ad8e1074dcac6b1551e361d5fca5a2d33b615bca3be7e85c458e25
+final stage gate   ae409ab1e3c060c8cfd7d3c7b8a70e286df2ede60f2418727b69fca91b255b19
+final audit        ed669378d416c220e5afe87d03744b1e62105fc6a9efa0b5ab7b69e36cdaeaf4
+```
+
+The final audit verdict is **PASS**. At final-gate creation, both snapshots in
+the final settlement pair had to be no more than 10 minutes old, exactly equal,
+and at least 60 seconds apart. A later offline audit replays that freshness
+check against the recorded final-current timestamp; it does not compare old,
+immutable evidence with the later audit wall clock. Final mode may retain an
+old global/retry accounting baseline after delayed provider settlement. This
+relaxation is final-audit-only: every paid launch uses `final=False`, still
+requires a fresh retry baseline and fresh settled pair, and cannot reuse the
+retrospective exception. This preserves the global anchor and therefore never
+drops lifecycle 1's spend from accounting.
+
+For schema compatibility, `final_budget_gate.json` retains the frozen
+`next_stage_full_upper_bound_usd=$0.95401528` field. Because its mode is
+`final`, `required_from_baseline_usd` is only the observed retry delta
+`$0.04693796`; it does not authorize or reserve another stage. The cumulative
+final guard is authoritative for global accounting: its future bound is `$0`,
+its global spend is `$0.07364016`, and its headroom is `$2.92635984`.
+
+C used 1,040 fewer cloud routes than A (**-8.9624 percentage points**) and had
+8 fewer violations (**-0.06894 percentage points**), but its overall TTFT
+p50/p95/p99 were worse by 180.46/139.06/44.62 ms. This is only one ordered A→C
+pair. Because the absolute violation-rate difference is below the preregistered
+1-point threshold, the result is explicitly **unresolved**, not a selector win;
+a fresh reverse-order run and repeated/balanced blocks are required.
+
+Finally, PID `137586` and all children were terminated, port 8010 was closed,
+and GPU2 returned to 122 MiB. The cleanup check passed. The final auditor binds
+the pre-run server-log prefix SHA256
+`12c996bd9ad380e6218a1130d9c8dad5d3242a910f60785fa31ceea0f770e219`;
+after shutdown messages had flushed, the complete `server.log` SHA256 was
+rechecked as
+`9d667b22d50a558de46687bdb6053c2405c821742758bf4d628328d990823c41`.
+The restricted request-level artifacts remain
+under `$MSCRATCH/e12_retry_pair_20260720/live_run/` and must not enter git.
 
 ---
 
@@ -1731,7 +1845,7 @@ whole-run diagnostics even after observed cloud TTFT becomes the headline.
 
 ---
 
-## 7. Experiment queue (REVISED 2026-07-20 after partial E12 live execution)
+## 7. Experiment queue (REVISED 2026-07-21 after completed E12 retry)
 
 1. **COMPLETED — audit contract.** Atomic token-aligned materializer,
    complete-cohort/stale-arrival protection, local usage telemetry, no-cache
@@ -1769,7 +1883,7 @@ whole-run diagnostics even after observed cloud TTFT becomes the headline.
    0/16 above 5 s; see Section 5h for the strict claim boundary.
 9. **SKIPPED BY DECISION — 512 frozen-route cloud shadow (A then C,
    separately).** The planned stitch/provider check remains a valid cheaper
-   diagnostic, but Murphy chose on July 16 to proceed directly to the full live
+   diagnostic, but the project owner chose on July 16 to proceed directly to the full live
    pair. The skipped design would replay the existing A and C routed IDs at
    their recorded kick times, not at original
    trace arrival. For each cloud request compute `pre-route wait + cloud-gate
@@ -1780,7 +1894,7 @@ whole-run diagnostics even after observed cloud TTFT becomes the headline.
    rows, no `routed_only`, every success has TTFT, error/429 rate no greater than
    1%, and an explicit observed-combined/local/cloud report. This is a cheap
    provider/stitch check, not the final hybrid result.
-10. **SKIPPED BY DECISION — 512 live hybrid A/C TTFT-cancel pilot.** Murphy
+10. **SKIPPED BY DECISION — 512 live hybrid A/C TTFT-cancel pilot.** The project owner
     accepted the extra spend/risk and selected the direct full run. Its two
     required code prerequisites—split local/cloud `ignore_eos` and split
     pre-route/cloud-gate waits—are incorporated into the full-cell contract.
@@ -1808,26 +1922,21 @@ whole-run diagnostics even after observed cloud TTFT becomes the headline.
     exposed a selected-route-count (and therefore potential live exposure)
     versus modeled-dollar tradeoff. Section 5j records the audited result and
     its NullCloud claim boundary.
-13. **NEXT, NO EXPORT — pre-register a fresh-lifecycle reverse-order/block
-    replication.** Repeat the current-turn A/C comparison with order reversed
-    or balanced across blocks; include `newest` or waiting-random only if the
-    preregistered question needs a naive comparator. Acceptance must estimate
-    paired route/cost/local-TTFT stability and preserve the 0-local-violation
-    gate. Do not use the single A→C pair to select a winner.
-14. **PARTIAL COMPLETE / C BLOCKED BY EXECUTION POLICY — E12 live current-turn
-    A/C.** Section 5k freezes the 11,604-row A→usage-settle/gate→C contract.
-    Under execution commit `98cab54`, the canary and A completed successfully:
-    A routed 5,063/11,604, had 4/11,604 overall 5 s violations and zero retained-
-    local violations, and canary+A settled at `$0.02670220`. The timestamp
-    precision defect found by the first C preflight was repaired and tested in
-    validator-only commits `15979bb` and `132e012`, without changing A's frozen
-    execution tree. After the user reconfirmed C authorization, the local
-    execution environment rejected the external-data process before SSH or any
-    C trace POST. C therefore has zero requests and zero new spend. Do not claim
-    an A/C selector result. The original-text C can continue only in an
-    environment whose export policy permits it; otherwise use the explicitly
-    non-equivalent synthetic-cloud or NullCloud alternative. The server is down,
-    port 8010 is closed, and GPU2 is idle.
+13. **NEXT — pre-register reverse-order/repeated fresh lifecycles.** Repeat the
+    live current-turn comparison as C→A and preferably balanced blocks; a new
+    export authorization, same-day price snapshot, and independent cumulative
+    budget gate are required before any additional POST. Include `newest` or
+    waiting-random only if the preregistered question needs a naive comparator.
+    Acceptance must estimate order/route/cost/overall-TTFT stability and retain
+    the zero-local-violation gate. The single A→C pair cannot select a winner.
+14. **COMPLETE RETRY / OLD LIFECYCLE TERMINAL PARTIAL — E12 live current-turn
+    A/C.** Lifecycle 1 ended after canary+A and charged `$0.02670220`; its C never
+    launched and its server/profile were destroyed. Lifecycle 2 freshly profiled
+    the same execution tree, completed A→C, and passed the final audit. A/C routed
+    5,097/4,057 and had 11/3 overall violations, with zero retained-local
+    violations in both arms. Retry spend was `$0.04693796`; cumulative spend was
+    `$0.07364016`. The `<1 pp` preregistration rule makes the comparison
+    unresolved. Section 5k records the complete identities and cleanup.
 15. **THEN harden the TTFT trigger outside the calibration support envelope.**
     Profile deployment binding resources, log full decision snapshots/scores,
     and add a conservative fallback when live state leaves calibrated support.
@@ -1885,7 +1994,8 @@ whole-run diagnostics even after observed cloud TTFT becomes the headline.
 | `$MSCRATCH/router_realcloud_full_2b53ff3_20260716T1435Z/` | E11 pre-arm lifecycle: valid fresh profile, server log, non-secret OpenRouter baseline, and blocked-launch zero-usage audit; no formal A/C rows |
 | `$MSCRATCH/sharegpt_current_turn_6054b32_20260716/` | Restricted E12 original-current-turn trace and text-free manifest; 11,604 emitted rows, output SHA `e838016a…cb410`, manifest SHA `698bb94a…bf9a8` |
 | `$MSCRATCH/e12_launch_446bf56_20260720/` | Preserved pre-execution clean checkout plus first re-materialized restricted E12 trace; 11,604 rows, output SHA `e838016a…cb410`, old bound manifest SHA `0fbc544e…a31c2`, files 0600/directories 0700; no POST from this checkpoint |
-| `$MSCRATCH/e12_private_20260720/live_run/` | Restricted partial live-run evidence: execution commit `98cab54`, active trace SHA `e838016a…cb410`, manifest `dc0430c…b9b9a`, profile, canary, complete A raw/decision/summary/marker/events and usage evidence; no `stage_c`; never commit request-level artifacts |
+| `$MSCRATCH/e12_private_20260720/live_run/` | Restricted lifecycle-1 evidence, permanently **TERMINAL PARTIAL**: execution commit `98cab54`, active trace SHA `e838016a…cb410`, manifest `dc0430c…b9b9a`, profile, canary, complete A evidence, no `stage_c`; never pair this A with another lifecycle |
+| `$MSCRATCH/e12_retry_pair_20260720/live_run/` | Restricted lifecycle-2 evidence: fresh profile, canary, complete A/C raw/decision/summary/marker/events, usage/cumulative guards, and final audit `ed669378…daeaf4` (**PASS**); never commit request-level artifacts |
 | `$MSCRATCH/sharegpt_current_turn_local_78da644_20260716/` | Completed E12 no-export lifecycle/profile and L/A/C raw/decision/summary/marker evidence plus text-free gate audit; 0 external POSTs, actual cloud spend $0 |
 | repo-sibling `artifacts/realcloud_full_prerun_2026-07-16/` | Verified local mirror of the six E11 pre-arm evidence files; outside git |
 | `$JSCRATCH/workloads/…` | ShareGPT+BurstGPT trace (leg-1 `$DATA`) |

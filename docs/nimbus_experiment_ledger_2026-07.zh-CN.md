@@ -8,10 +8,11 @@
 
 完整英文实验细节、命令和产物路径仍以
 [`v3_experiments_2026-07.md`](v3_experiments_2026-07.md) 为准；本账本负责把
-时间线和因果关系讲清楚。当前 real-cloud 执行实现对应 `4c18ae6`，E11
-预注册/checkpoint 对应其后的文档提交；E12 current-turn 物化实现对应
-`6054b32`，local-gate 预注册对应 `78da644`，权威事后证据分析器对应 `cdf7f16`；
-E12-live fail-closed 执行、预算与最终审计实现对应 `446bf56`。
+时间线和因果关系讲清楚。E12 current-turn 物化实现对应 `6054b32`，local-gate
+预注册对应 `78da644`，权威事后证据分析器对应 `cdf7f16`；E12-live 的冻结执行树为
+`98cab54`，时间戳 validator 修复为 `15979bb`/`132e012`，旧 lifecycle 封存记录为
+`4d9bd31`，累计 retry budget guard 与延迟结算 final-audit 修复分别为
+`ee1a7f6`/`f3583a3`。
 
 **数据保存边界：**repo 里提交的是实现、分析器、审计逻辑和文档，GPU 实验产生的
 大体积 JSONL/日志仍保存在 `$MSCRATCH`，不在 git 中。第 6 节逐项登记 E0–E12 的
@@ -73,14 +74,14 @@ E12 又补了一层外部有效性证据：把原始 ShareGPT current-turn 文�
 是 NullCloud，所以只能说“本地保留安全 gate 通过”，不能说 old-v2 已普遍胜出，也
 不能说 11,604 条请求的真实端到端 TTFT 已通过。
 
-2026-07-18，用户已经单独、明确授权把这 11,604 条原始 current-turn 文本及其到达
-时序发送给 OpenRouter/DeepInfra，运行 A/C 两臂首-token-cancel，费用硬上限为 `$3`。
-E12 live 合同已在本账本预注册；但**授权不等于已经执行**。截至 2026-07-20，GPU 故障
-已经解除，`446bf56` 的私有 clean checkout 已逐字节复现冻结 trace，新 manifest SHA 为
-`0fbc544e…a31c2`。但 trace 原文仍未发送，任何 inference POST（包括 synthetic canary）
-都尚未发生，费用仍为 `$0`。当前唯一 POST 前 blocker 是一个“有余额、专用、服务端
-limit 不超过 `$3`”且通过 no-reset、BYOK、key 类型、expiry 与 settled-usage 门的
-OpenRouter inference key。因此现在仍没有 E12 live outcome。
+2026-07-18，用户单独、明确授权把这 11,604 条原始 current-turn 文本及其到达时序
+发送给 OpenRouter/DeepInfra，运行 A/C 两臂首-token-cancel，费用硬上限为 `$3`。
+现在必须区分两个 lifecycle：第一个只完成 canary+A，C 从未启动，已永久标记
+**TERMINAL PARTIAL**，其 `$0.02670220` 仍计入总预算；第二个 fresh retry 完整跑完
+A→C 并通过 text-free final audit。Retry 中 A/C 分别路由 5,097/4,057 条，overall 5 秒
+TTFT 违约为 11/3，retained-local 均为 0；retry 花费 `$0.04693796`，连同旧 partial
+累计 `$0.07364016`，剩余 `$2.92635984`。但只有一次 A→C，且违约率绝对差仅
+0.06894 个百分点，按预注册 `<1 pp` 规则仍是 **unresolved**，不能宣布 selector winner。
 
 ---
 
@@ -116,7 +117,7 @@ OpenRouter inference key。因此现在仍没有 E12 live outcome。
 | E10 | 7 月 16 日 | 验证固定 OpenRouter provider 的首 token cancel/TTFT 路径 | DeepInfra burst 16/16 客户端断流；TTFT p50/p95/p99=467/929/1,167 ms，0/16 超 5s | MECHANISM ONLY / EXPLORATORY |
 | E11 | 7 月 16 日 | 完整 11,605 请求真实云 live-hybrid A/C | fresh profile 已通过；正式 arm 在外发安全门前停止，0 请求/0 费用 | PROFILE VALIDATED / ARMS NOT RUN |
 | E12 | 7 月 16 日 UTC / 北京时间 7 月 17 日完成 | 用原始 ShareGPT current-turn 文本做 token/payload 对齐的外部有效性实验 | 11,604/11,604 成功；L 有 11,400 个本地违约，A/C retained-local 均 0，分别路由 5,109/4,099；0 出网 | VALIDATED — LOCAL-ONLY GATE / CLOUD NOT MEASURED |
-| E12-live | 7 月 18 日预注册；7 月 20 日绑定 manifest | 在真实 OpenRouter/DeepInfra 上测 E12 A/C observed TTFT | 已取得原文外发与 `$3` 授权；GPU 已恢复；clean-checkout manifest=`0fbc544e…a31c2`；0 trace POST / `$0`；仅等合规限额 key | AUTHORIZED / PRE-REGISTERED / MANIFEST BOUND / WAITING FOR KEY |
+| E12-live | 7 月 18 日预注册；7 月 20–21 日执行/结算 | 在真实 OpenRouter/DeepInfra 上测 E12 A/C observed TTFT | 旧 lifecycle **TERMINAL PARTIAL**；fresh retry A→C 完成并 final audit PASS：A/C 路由 5,097/4,057，overall 违约 11/3，本地均 0；累计花费 `$0.07364016`；selector 仍 unresolved | VALIDATED PAIR / EXPLORATORY ORDERED COMPARISON |
 
 ---
 
@@ -133,7 +134,7 @@ OpenRouter inference key。因此现在仍没有 E12 live outcome。
 - 与可信 open-loop harness 的 TTFT p50 比值：`1.003`；
 - queue neutrality：p50 `110 ms vs 111 ms`；
 - 无压力时 Nimbus 0 kick，延迟与 all-local 一致；
-- 当前离线测试：router 105 项 + tools/evidence 151 项 = **256/256**。
+- 当前离线测试：router 105 项 + tools/evidence 182 项 = **287/287**（`f3583a3`）。
 
 **结论**
 
@@ -644,7 +645,7 @@ sensitivity leg。
 
 **下一步顺序（后被 E11 决策覆盖）**
 
-原计划依次跑 512 frozen-route shadow、512 live pilot、完整 11,605 A/C。Murphy
+原计划依次跑 512 frozen-route shadow、512 live pilot、完整 11,605 A/C。项目负责人
 在 2026-07-16 明确选择跳过两个 512 步骤，直接进入完整 live-hybrid A/C；跳过的
 便宜检查并没有被证明“没必要”，只是接受更高费用和配置出错风险来换取直接证据。
 
@@ -924,7 +925,7 @@ profile、stage PID 已退出，8010 空闲，GPU 内存已释放。该 local-ga
 通过 router 83 + tools 64 = **147/147**，其中 analyzer focused tests 11/11，另有
 `py_compile` 与 `git diff --check`；当前 E12-live 总数见第 3 节 E0。
 
-#### E12 live A/C 事前合同（2026-07-18 预注册；2026-07-20 manifest 已绑定、仅等 key）
+#### E12 live A/C：冻结合同、TERMINAL PARTIAL 旧 lifecycle 与完成的 fresh retry
 
 **授权边界。** 用户于 2026-07-18 给出以下明确知情授权：
 
@@ -934,15 +935,10 @@ profile、stage PID 已退出，8010 空闲，GPU 内存已释放。该 local-ga
 
 该授权覆盖下面冻结的两条 live trace arm。原文仍是受限数据：trace、request-level
 结果不得进 git，也不得复制到通用镜像；repo 只保存不含原文的合同、工具和聚合审计。
-截至 2026-07-20，**11,604 条 trace 原文及到达时序仍未发给 provider，且没有发生任何
-inference POST，连 synthetic canary 也没有跑；实际费用仍是 `$0`**。读取公开 endpoint/
-价格 metadata 的 GET 不属于 inference。
-
-此前 GPU 的 driver-level NVML/CUDA blocker 已解除；source trace 与 Qwen3-32B tokenizer
-snapshot 已重新核对。为了不空占共享 GPU，key 未就绪前没有启动 server。当前唯一 POST
-前 blocker 是一个有余额的专用 OpenRouter inference key：服务端 limit 必须 `>0`、
-`≤$3`，并满足下面冻结的 no-reset、BYOK、key 类型、expiry 与 usage 条件。不得用旧
-profile、共享/无限额 key、无余额账户、其他 provider 或未预注册 deployment 绕过。
+下面直到“执行结果”小节都是 **2026-07-18 的冻结事前合同**；其中的未来时态保留为
+历史约束，不代表当前仍在等 key。最终执行采用了合同允许的固定
+OpenRouter/DeepInfra marketplace route。两个 lifecycle 和实际费用在后文独立登记；
+公开 endpoint/价格 metadata GET 不属于 inference。
 
 **冻结 trace 身份。** Live 使用 E12 的原始 current-turn、no-cache trace：
 
@@ -967,6 +963,12 @@ trace/manifest 权限为 `0600`，受限目录为 `0700`；严格 manifest schem
 对齐及相同 output SHA。trace SHA、行数、token sum、payload/cache mode 或 overflow
 policy 任一不符都使本预注册失效，不能静默改合同。Section 5j 的旧 manifest 继续证明
 已完成的 local gate，但不能代替本次 launch manifest。
+
+正式执行树后来冻结在
+`98cab54a29e3b8ff066e474d26ddbdbf0394b2b8`。在相同受限 source、tokenizer 和参数下
+重新物化得到逐字节相同的 trace SHA；active manifest 更新并冻结为
+`dc0430c11faca9077f75f88cea8ab66ed5e2424351057819fb27d20dc3db9b9a`。旧
+`0fbc544e…a31c2` 只是 pre-execution checkout 证据，不能代替 active launch manifest。
 
 **冻结 local deployment/profile。** 合规 key 就绪后，启动一个 fresh no-prefix-cache
 Qwen3-32B lifecycle：bfloat16、`max_model_len=40960`、`max_num_seqs=128`。Profile 必须
@@ -1012,12 +1014,14 @@ text price 一律 fail closed。不符就停止并重新预注册，不能看见
 ```
 
 它故意不依赖 cancel 是否省钱，只是 spend guard，不是 TTFT 口径。用户授权的实验总费用
-上限 `$3` 还包括 synthetic canary。必须用一个专用且有余额的 inference key，服务端
-limit `>0` 且 `≤$3`；reset 必须为 null，BYOK 必须计入 limit，不能是 management、
-provisioning 或 free-tier key；expiry 必须为 null 或在每次 launch verify 后至少还有 6
-小时。只落盘白名单中的非敏感 limit/usage/expiry，以及只用于跨 artifact 等值校验的 key
-SHA256 fingerprint。共享 key、无/超额/可 reset limit、remaining 不足、账户无余额、key
-类型不符、usage 反向跳变或无法对账，一律不启动。
+上限 `$3` 还包括 synthetic canary。默认 strict 合同要求 server limit `>0` 且 `≤$3`、
+no-reset 且 BYOK 计入 limit。本次另冻结了窄化的
+`e12_marketplace_deepinfra_no_byok_v1` 例外：只对固定 OpenRouter marketplace /
+DeepInfra / no-fallback route 接受精确 `$5` server limit 和
+`include_byok_in_limit=false`，但每个累计 gate 及 final audit 仍以用户的 `$3` 为硬上限，
+并强制 BYOK usage 始终不变且 canary `is_byok=false`。两种模式都拒绝 management、
+provisioning、free-tier、resettable、余额不足或无法对账的 key；文档不记录任何 key
+身份值。
 
 第一次 trace POST 前的顺序固定为：采集 baseline key usage；用同一 model/provider/
 no-fallback/首-token-cancel 路径发一个固定公开 synthetic prompt，`max_tokens=1`；等待
@@ -1072,8 +1076,66 @@ fraction、wait、HTTP/error class、provider/model、cancel coverage 和 known/
 百分点时明确记作 unresolved，并做反序重复后才能谈 winner；即使差更大，一次顺序结果
 也只是 preliminary。首-token-cancel 不测 completed-response E2E、TPOT、答案质量、
 mid-stream reliability 或完整 response cost；“cancel 不改变上游 cloud load”仍是用户
-授权采用的实验假设，不是结论。两臂和最终 text-free audit 没完成前不能报告 live
-outcome；本 checkpoint 没有 outcome。
+授权采用的实验假设，不是结论。以上是冻结的事前 claim boundary；实际 outcome 如下。
+
+**执行结果。** 两次执行必须按 lifecycle 分开读：
+
+**Lifecycle 1 — TERMINAL PARTIAL。** 冻结执行 commit 为
+`98cab54a29e3b8ff066e474d26ddbdbf0394b2b8`。Canary+A 完成：A 路由
+5,063/11,604，overall 违约 4/11,604，retained-local 违约 0，canary+A settled spend
+为 `$0.02670220`。C 在任何请求 POST 前被执行环境拦截，0 请求、0 新费用；随后 PID、
+children 和 port 都已清理，GPU2 回到约 125 MiB。该 server/profile 已销毁，所以旧 A
+不能和任何新 C 配对，lifecycle 不能恢复，状态永久为 **TERMINAL PARTIAL**。这笔费用
+仍计入全局 `$3`。
+
+**Lifecycle 2 — fresh retry COMPLETE / final audit PASS。** Retry 仍使用同一个
+`98cab54…b2b8` execution tree，但新启 server/profile。Profile SHA256 为
+`b5e29af776ecf82edf94ef3aa9388ee00c20a70546d416dac199b0bc1a134d47`：15 cells、
+2,105/2,105 samples、held-out 421、FN=0，KV=112,032，prefill throughput
+`3247.990163 tokens/s`、TPOT `151.213123 ms`、overhead `372.804523 ms`、guard
+`1712 ms`。Canary TTFT `319.492 ms`，cancel=true、completed=false、非 BYOK。
+
+| 指标 | A `cost_cachedisp_old` | C `cost_disp_current` |
+|---|---:|---:|
+| total / success | 11,604 / 11,601 | 11,604 / 11,604 |
+| local / cloud | 6,507 / 5,097 | 7,547 / 4,057 |
+| overall TTFT p50/p95/p99 | 1,126.482 / 1,983.963 / 2,451.606 ms | 1,306.939 / 2,123.023 / 2,496.230 ms |
+| local TTFT p50/p95/p99 | 1,377.188 / 2,007.805 / 2,204.826 ms | 1,470.152 / 2,147.514 / 2,372.112 ms |
+| cloud TTFT p50/p95/p99 | 474.991 / 1,830.916 / 2,941.866 ms | 567.699 / 1,938.093 / 2,972.899 ms |
+| overall 5s violation | 11 = **0.0947949%** | 3 = **0.0258532%** |
+| retained-local violation | **0 / 6,507** | **0 / 7,547** |
+| timeout / HTTP 429 | 3 / 0 | 0 / 0 |
+| settled spend | `$0.02720312` | `$0.01973248` |
+
+TTFT 分位数只使用成功且有有限实测 TTFT 的 rows，所以 A 的 3 条 timeout 不进入
+分位数；但它们仍按失败和违约计入固定的 11,604 条 SLO 分母。表中的 spend
+来自 settled key/account usage 增量，不来自 run summary：首-token-cancel 使 summary 中的
+云费用仍是 pending，`known_cost_usd=0`。
+
+C 比 A 少路由 1,040 条（-8.9624 个百分点），少 8 个违约（-0.06894 个百分点），
+但 overall TTFT p50/p95/p99 反而慢 180.46/139.06/44.62 ms。因为只有一次 A→C，且
+违约率差小于预注册 1 个百分点，结论明确是 **unresolved**；必须 fresh lifecycle
+反序和重复，不能把 C 或 A 写成 winner。
+
+Retry canary/A/C 分别为 `$0.00000236`、`$0.02720312`、`$0.01973248`，合计
+`$0.04693796`；加旧 partial 后累计 `$0.07364016`，剩余 `$2.92635984`，BYOK `$0`。
+Final audit SHA256 为
+`ed669378d416c220e5afe87d03744b1e62105fc6a9efa0b5ab7b69e36cdaeaf4`，verdict
+为 **PASS**。最终结算允许 retrospective baseline 超过六小时，但只在 `final=True`
+生效；final gate 创建时，settled pair 必须完全相等、间隔至少 60 秒，且两份都不能
+超过 10 分钟。后续离线 auditor 用证据中记录的 final-current 时间重放 freshness，
+不会拿不可变的旧证据与审计当下的墙钟比较。所有付费 launch 都是 `final=False`，
+不能复用该放宽，并继续把旧 partial 费用计入全局基线。
+
+`final_budget_gate.json` 为保持冻结 schema，仍保留
+`next_stage_full_upper_bound_usd=$0.95401528` 字段；但在 `mode=final` 时，
+`required_from_baseline_usd` 只等于已发生的 retry 增量 `$0.04693796`，不会授权或预留
+下一阶段。全局账以 cumulative final guard 为准：future bound `$0`、累计
+`$0.07364016`、headroom `$2.92635984`。
+
+实现对应 `ee1a7f648aed8bb19eba52fa223944a0b647ccae` 与
+`f3583a329fbbd2099a24b3ef9425ee6cdf8979cc`。最终 PID/children 已退出，port 关闭，
+GPU2 回到 122 MiB。
 
 ---
 
@@ -1117,27 +1179,21 @@ Shipped v3: kv_gap trigger + current displacement selector
    workload mix 等标定 predictor；超出支持域时保守 fallback。
 2. **完整 decision replay schema**：保存 snapshot IDs、waiting age、每请求
    prediction、selector score/order、in-flight release state。
-3. **反序/平衡 block 重复**：E12 已完成第二个独立 workload/lifecycle，但本轮仍只有
-   一次固定 A→C；要比较 old-v2/current，必须在 fresh lifecycle 反序或平衡重复。
+3. **反序/平衡 block 重复**：E12 live 已完成一组有效 A→C，但 `<1 pp` gate 明确判为
+   unresolved；要比较 old-v2/current，必须在 fresh lifecycle 做 C→A 或平衡重复。
 4. **在线 decode estimate**：当前实验使用 trace/oracle decode 长度。
 5. **Cache-aware trace**：当前 no-cache 实验不能验证 `U=P−cached_tokens` 项。
-6. **真实 cloud latency**：E10 已验证固定 DeepInfra 的首-token transport/TTFT
-   路径；E11 已预注册直接完整 11,605 A/C，两个 512 pilot 由用户明确跳过而非完成。
-   E12 原始 current-turn 的 local-only gate 已通过；其 11,604-row live A/C 已于
-   2026-07-18 获得单独授权并预注册；GPU 已恢复，clean-checkout manifest 已绑定为
-   `0fbc544e…a31c2`，但仍缺有余额、server-side limit≤`$3` 且通过完整 key 合同的专用
-   key，所以仍无 cloud TTFT。Cancel 模式也不能替代 E2E/TPOT/mid-stream 的
-   full-drain sensitivity。
+6. **真实 cloud latency 的复现与 full-drain 边界**：E12 live A→C 已测到固定
+   DeepInfra 的真实 first-token TTFT，并通过 final audit；但单次顺序不能证明 selector，
+   cancel 模式也不能替代 E2E/TPOT/mid-stream/答案质量的 full-drain sensitivity。
 7. **负载/guard sweep 与 offline oracle**：确定性能前沿，并与历史 0/1 DP 或
    clairvoyant oracle 比较。
 
-当前执行顺序（E12 local gate 完成后）：授权、设计合同、fail-closed 实现、GPU health、
-clean-checkout 重物化与 manifest binding 均已完成。拿到合规限额 key 后，才启动 fresh
-server/profile，并按 baseline→canary→A→usage gate→C 执行；key 未就绪时不要空占共享 GPU。
-阻塞期间可继续做不出网的 fresh-lifecycle 反序/平衡 block 重复和 support-envelope
-hardening，但不能把它们冒充 live outcome。E11 synthetic live 仍等待它自己的 export
-consent；本次只针对 11,604 条 E12 原文。任何默认切换仍必须等 support-envelope
-hardening 完成。
+当前执行顺序：先冻结现有 A→C 为 exploratory ordered pair；再单独预注册 fresh
+C→A/平衡重复（新增原文外发必须重新确认授权与累计预算），同时推进不出网的
+support-envelope hardening；最后才讨论 selector/default。E11 synthetic live 仍需它自己
+的 export consent，不能借用 E12 授权。任何默认切换仍必须等 support-envelope hardening
+和顺序鲁棒性证据完成。
 
 ---
 
@@ -1186,7 +1242,7 @@ hardening 完成。
 | E9 | 五 arms、两份 audit、trace/profile/server 全绑定，**已镜像** | **是** | 同样缺完整 selector replay state |
 | E10 | 代码在 `e0b6686`；burst16 raw/summary/billing audit 已登记并做 repo 外本地镜像 | **部分（TTFT 可复算）** | 15/16 generation metadata 未找到，完整费用 pending；只是单-provider probe |
 | E11 | fresh profile/server/pre-run/zero-usage audit 已登记并镜像；正式 arm 未启动 | **profile 可复算，无 outcome** | 等 synthetic bulk export consent；下次必须新 lifecycle/profile |
-| E12 | 受限原文 trace、fresh profile、L/A/C raw/decision/summary/marker 与 text-free audit 均登记；live A/C 已授权、预注册，`446bf56` 已加固，manifest=`0fbc544e…a31c2` | **local gate 可独立复算；live 无 outcome** | live 仍是 0 POST / `$0`，GPU 已恢复，仅等合规限额 key；单次 A→C；no-cache；oracle/capped decode；未做通用镜像 |
+| E12 | local-only L/A/C 完整；live 旧 lifecycle **TERMINAL PARTIAL**；fresh retry A/C raw/decision/summary/marker/events、usage guards 与 final audit 均登记，active manifest=`dc0430c…b9b9a` | **local gate 与 fresh live pair 均可独立复算** | live 仍只有单次 A→C，selector unresolved；no-cache；oracle/capped decode；受限 request-level 产物未做通用镜像 |
 
 **E0–E9 于 2026-07-15 在 GPU 箱上逐文件核验存在性与 SHA256，并完成双站点镜像**（全量
 清单与镜像位置见 §6.13）。上表"已镜像" = 文件同时存在于 `$MSCRATCH` 与本地
@@ -1523,13 +1579,16 @@ NullCloud rows 完全一致，marker/fingerprint 通过。第三方 POST=0、实
 所有 PID、port 8010 和 GPU 占用已清理。原文 trace 与大体积 outcome 仍只在受限 scratch，
 没有复制进 repo 或通用镜像。
 
-E12 live 的 2026-07-18 checkpoint 冻结了用户授权、trace SHA
+E12 live 冻结 trace SHA
 `e838016a8e55660c565dadb1ad019770f6b88f878d8ca29f165c30887d2cb410`、11,604 行、
-prompt/decode-cap sums `1,289,405/3,038,796` 和两臂静态费用上界 `$1.90803056`。
-2026-07-20，`446bf56` 的私有 clean detached checkout 重物化逐项复现这些值，新 launch
-manifest SHA 为 `0fbc544e2e9e37befe1a7e9a3bbaf54fa26eaed52d11d4d00e718924592a31c2`；
-GPU 也已恢复。当前仍明确不存在 canary/A/C raw、summary、marker 或 usage outcome：0
-inference POST、费用 `$0`，只等合规限额 key。
+prompt/decode-cap sums `1,289,405/3,038,796` 和两臂静态费用上界 `$1.90803056`；正式
+execution manifest 为
+`dc0430c11faca9077f75f88cea8ab66ed5e2424351057819fb27d20dc3db9b9a`。旧 lifecycle
+只含 canary+A，已封存为 **TERMINAL PARTIAL**，目录为
+`$MSCRATCH/e12_private_20260720/live_run/`。Fresh retry 的完整证据在
+`$MSCRATCH/e12_retry_pair_20260720/live_run/`：A/C 各 11,604 行、完整 marker/events、
+usage/cumulative guards 与 final audit；audit SHA
+`ed669378d416c220e5afe87d03744b1e62105fc6a9efa0b5ab7b69e36cdaeaf4`，verdict PASS。
 
 ---
 
@@ -1552,6 +1611,7 @@ inference POST、费用 `$0`，只等合规限额 key。
 | `tools/check_e12_live_budget.py` | 校验 E12 trace/manifest/价格，并计算两臂完整 capped-decode 静态费用上界 |
 | `tools/openrouter_usage_snapshot.py` | 读取专用 key 的非敏感 limit/usage metadata；不落盘 secret 或错误正文 |
 | `tools/check_openrouter_stage_budget.py` | 离线执行 canary/A/C 之间的 `$3` staged budget gate |
+| `tools/check_e12_retry_budget.py` | 把旧 lifecycle spend 纳入 retry 的累计 launch/final gate；只在 retrospective final 放宽旧 baseline |
 | `tools/run_openrouter_ttft_canary.py` | 用固定公开 synthetic prompt 验证同 provider 的首-token-cancel 路径，不读取 trace |
 | `tools/check_e12_stage_launch.py` | 生成/复算 A/C launch authorization 与最后一刻 live-usage receipt；C 前强绑定完整 A |
 | `tools/audit_e12_live.py` | 对 A/C marker、请求行、provider、cancel、usage/budget 做最终 text-free 审计 |
@@ -1573,6 +1633,10 @@ inference POST、费用 `$0`，只等合规限额 key。
 - `$MSCRATCH/e12_launch_446bf56_20260720/`：私有 clean detached checkout 与重物化 E12
   trace；output SHA `e838016a…cb410`、manifest `0fbc544e…a31c2`、文件 `0600`/目录
   `0700`；没有 server、没有 POST。
+- `$MSCRATCH/e12_private_20260720/live_run/`：旧 live lifecycle，**TERMINAL
+  PARTIAL**；canary+A 完整、C 不存在，不得与任何新 lifecycle 配对。
+- `$MSCRATCH/e12_retry_pair_20260720/live_run/`：fresh retry 完整 A/C、profile、canary、
+  price/budget、usage/cumulative guards 与 final audit；request-level 文件保持受限。
 - `$MSCRATCH/sharegpt_current_turn_local_78da644_20260716/`：E12 完整 no-export
   profile、L/A/C raw/decision/summary/marker 与 text-free gate audit；0 external POST。
 
