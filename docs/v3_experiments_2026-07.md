@@ -23,9 +23,9 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
    remains validated against the trusted open-loop harness (parity 1.003; queue
    neutrality 110 vs 111 ms). The E12 live execution tree was frozen at
    `98cab54`; validator-only timestamp repairs are `15979bb` and `132e012`, and
-   the cumulative-retry/final-audit guards are `ee1a7f6` and `f3583a3`. At the
-   latter checkpoint the clean tree passes **287/287** offline tests; commands
-   are in Section 2.
+   the cumulative-retry/final-audit guards are `ee1a7f6` and `f3583a3`. With the
+   July-21 selected-cohort cost analyzer, the clean tree passes **296/296**
+   offline tests; commands are in Section 2.
 2. The July-14 rerun explicitly uses **predicted TTFT violation as the trigger**;
    KV is neither its objective nor its trigger. The repository default remains
    the shipped `kv_gap + cost_disp_current` baseline until a separate design
@@ -101,10 +101,14 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
    overall TTFT p50/p95/p99 by 180.46/139.06/44.62 ms. Retry spend including
    canary was **$0.04693796**; cumulative spend including the terminal partial
    lifecycle was **$0.07364016**, leaving **$2.92635984** under the authorized
-   cap. Because this is one A→C pair and the violation-rate difference is only
-   0.06894 percentage points, the preregistered `<1 pp` rule declares the
-   selector comparison **unresolved**; reverse-order/repeated lifecycles are
-   required before naming a winner.
+   cap. A zero-export reprice of the exact routed cohorts then found modeled
+   full-response capped-decode costs of **$0.49967044 for A** and
+   **$0.51352936 for C**: C routed fewer requests, but its selected cohort had
+   130,213 more capped decode tokens. This is a trace-oracle counterfactual,
+   not a full-drain bill. Because this is one A→C pair and the violation-rate
+   difference is only 0.06894 percentage points, the preregistered `<1 pp` rule
+   declares the selector comparison **unresolved**; reverse-order/repeated
+   lifecycles are required before naming a winner.
 
 ---
 
@@ -130,14 +134,15 @@ owns the workloads/serving setup. Actual values are configured out-of-band.
 | `tools/openrouter_usage_snapshot.py` | Whitelisted non-secret OpenRouter key limit/usage snapshot; never persists the key or provider error body |
 | `tools/check_openrouter_stage_budget.py` | Offline `$3` canary/A/C staged-budget gate over usage snapshots |
 | `tools/check_e12_retry_budget.py` | Cumulative retry guard: carries prior spend into launch/final accounting while requiring a fresh settled pair |
+| `tools/analyze_e12_full_response_cost.py` | Text-free, audit-bound reprice of actual E12 routed cohorts under the frozen full-response capped-decode model |
 | `tools/run_openrouter_ttft_canary.py` | One fixed public synthetic first-token-cancel request; never reads the restricted trace |
 | `tools/check_e12_stage_launch.py` | Reproducible A/C launch authorization plus last-moment live-usage verification receipt; binds completed A before C |
 | `tools/audit_e12_live.py` | Final text-free A/C integrity, provider/cancel, usage, and budget auditor |
 | `tools/ttft_matrix_evidence.py` | Tested arm parser and semantic/hash completion-marker validator, including `all_local` anchors |
 | `experiments/run_ttft_selector_matrix.sh` | Server/profile/trace-bound runner with E12 staged launch receipts, exact trace-byte SHA enforcement, fail-fast cloud gates, and completion markers |
 
-At final-audit tooling checkpoint `f3583a3`, the clean tracked tree passes
-**287/287** offline tests: 105 router tests plus 182 tools/evidence tests:
+With the July-21 selected-cohort analyzer, the clean tracked tree passes
+**296/296** offline tests: 105 router tests plus 191 tools/evidence tests:
 
 ```bash
 python3 -m unittest discover -s router -p 'test_*.py'
@@ -1733,6 +1738,64 @@ denominator. The spend values come from settled key/account usage deltas, not
 the per-run summary fields: first-token cancellation left cloud costs pending
 there, with `known_cost_usd=0`.
 
+##### Zero-export selected-cohort full-response reprice (2026-07-21)
+
+No request was sent and no new provider charge was incurred. The parameterized
+`tools/analyze_e12_full_response_cost.py` joined each audited cloud row back to
+the restricted token-aligned trace, verified exact scheduler `P/U/D` for all
+11,604 IDs, and applied the frozen price snapshot:
+
+```text
+modeled_full_cap_cost
+  = uncached_prompt_tokens × $0.08 / 1M
+  + capped_trace_decode_tokens × $0.28 / 1M
+  + routed_requests × $0
+```
+
+| Arm | Routed | Prompt tokens | Capped decode tokens | Input cost | Output cost | Modeled full-cap cost |
+|---|---:|---:|---:|---:|---:|---:|
+| A `cost_cachedisp_old` | 5,097 | 1,013,293 | 1,495,025 | $0.08106344 | $0.41860700 | **$0.49967044** |
+| C `cost_disp_current` | 4,057 | 730,784 | 1,625,238 | $0.05846272 | $0.45506664 | **$0.51352936** |
+
+C used 1,040 fewer routes and 282,509 fewer prompt tokens, but selected 130,213
+more capped decode tokens. Its modeled full-cap cost was therefore
+`$0.01385892` higher than A, a 2.773612% premium relative to A; equivalently A
+was 2.698759% cheaper relative to C. The primary total includes A's three
+failed cloud routes because they were selected by the policy. Excluding those
+three rows as a sensitivity gives A `$0.49942960`, so the ordering is unchanged.
+The cohort intersection/A-only/C-only counts were 2,550/2,547/1,507.
+
+This answers the selector's own frozen cost model, not actual production
+billing. Decode length is the ShareGPT trace oracle capped at 1,024; a real
+full response may stop at EOS, and provider-side prompt tokenization may differ
+from the local aligned count. Consequently it must not be mixed with the
+settled first-token-cancel spend (`$0.02720312` / `$0.01973248`) or described as
+a measured full-drain bill. The result strengthens the A-side cost signal on
+this one ordered pair, but does not override the preregistered unresolved
+selector verdict.
+
+The derived text-free artifact is
+`$MSCRATCH/e12_retry_pair_20260720/live_run/full_response_cost_counterfactual.json`
+(mode `0600`, SHA256
+`de3f9780a78fca9f4b0a726d41eb6b001d6f52cccd2fc0673754c2be81413da6`).
+It binds analyzer SHA256
+`d3bbcbc9c4c4bfab21f4f4b44b125e11296f7123a0af18c8949af72a1209a926`
+and canonical final-audit SHA256
+`ed669378d416c220e5afe87d03744b1e62105fc6a9efa0b5ab7b69e36cdaeaf4`.
+To rerun, set `$E12_TRACE`, `$E12_TRACE_MANIFEST`, and `$E12_RUN` to the
+restricted inputs and execute:
+
+```bash
+python3 tools/analyze_e12_full_response_cost.py \
+  --trace "$E12_TRACE" \
+  --trace-manifest "$E12_TRACE_MANIFEST" \
+  --price-snapshot "$E12_RUN/price_snapshot.json" \
+  --final-audit "$E12_RUN/final_audit.json" \
+  --expected-final-audit-sha256 ed669378d416c220e5afe87d03744b1e62105fc6a9efa0b5ab7b69e36cdaeaf4 \
+  --a-raw "$E12_RUN/stage_a/extreme_burst_1200_ttft_pred_cost_cachedisp_old_seed0.jsonl" \
+  --c-raw "$E12_RUN/stage_c/extreme_burst_1200_ttft_pred_cost_disp_current_seed0.jsonl"
+```
+
 All successful retained-local rows were prompt/decode-token exact; applied
 victims exactly matched cloud request IDs. The complete text-free evidence
 identities are:
@@ -1928,15 +1991,20 @@ whole-run diagnostics even after observed cloud TTFT becomes the headline.
     budget gate are required before any additional POST. Include `newest` or
     waiting-random only if the preregistered question needs a naive comparator.
     Acceptance must estimate order/route/cost/overall-TTFT stability and retain
-    the zero-local-violation gate. The single A→C pair cannot select a winner.
+    the zero-local-violation gate. Compare both settled first-token spend and the
+    audit-bound full-cap model; the completed zero-export reprice found A/C
+    `$0.49967044/$0.51352936`. The single A→C pair cannot select a winner.
 14. **COMPLETE RETRY / OLD LIFECYCLE TERMINAL PARTIAL — E12 live current-turn
     A/C.** Lifecycle 1 ended after canary+A and charged `$0.02670220`; its C never
     launched and its server/profile were destroyed. Lifecycle 2 freshly profiled
     the same execution tree, completed A→C, and passed the final audit. A/C routed
     5,097/4,057 and had 11/3 overall violations, with zero retained-local
     violations in both arms. Retry spend was `$0.04693796`; cumulative spend was
-    `$0.07364016`. The `<1 pp` preregistration rule makes the comparison
-    unresolved. Section 5k records the complete identities and cleanup.
+    `$0.07364016`. Its post-run zero-export selected-cohort reprice also
+    completed: A was 2.698759% cheaper than C under the capped-decode model,
+    despite more routes. The `<1 pp` preregistration rule still makes the
+    selector comparison unresolved. Section 5k records the identities and
+    cleanup.
 15. **THEN harden the TTFT trigger outside the calibration support envelope.**
     Profile deployment binding resources, log full decision snapshots/scores,
     and add a conservative fallback when live state leaves calibrated support.
@@ -1995,7 +2063,7 @@ whole-run diagnostics even after observed cloud TTFT becomes the headline.
 | `$MSCRATCH/sharegpt_current_turn_6054b32_20260716/` | Restricted E12 original-current-turn trace and text-free manifest; 11,604 emitted rows, output SHA `e838016a…cb410`, manifest SHA `698bb94a…bf9a8` |
 | `$MSCRATCH/e12_launch_446bf56_20260720/` | Preserved pre-execution clean checkout plus first re-materialized restricted E12 trace; 11,604 rows, output SHA `e838016a…cb410`, old bound manifest SHA `0fbc544e…a31c2`, files 0600/directories 0700; no POST from this checkpoint |
 | `$MSCRATCH/e12_private_20260720/live_run/` | Restricted lifecycle-1 evidence, permanently **TERMINAL PARTIAL**: execution commit `98cab54`, active trace SHA `e838016a…cb410`, manifest `dc0430c…b9b9a`, profile, canary, complete A evidence, no `stage_c`; never pair this A with another lifecycle |
-| `$MSCRATCH/e12_retry_pair_20260720/live_run/` | Restricted lifecycle-2 evidence: fresh profile, canary, complete A/C raw/decision/summary/marker/events, usage/cumulative guards, and final audit `ed669378…daeaf4` (**PASS**); never commit request-level artifacts |
+| `$MSCRATCH/e12_retry_pair_20260720/live_run/` | Restricted lifecycle-2 evidence: fresh profile, canary, complete A/C raw/decision/summary/marker/events, usage/cumulative guards, final audit `ed669378…daeaf4` (**PASS**), and text-free full-cap reprice `de3f9780…1413da6`; never commit request-level artifacts |
 | `$MSCRATCH/sharegpt_current_turn_local_78da644_20260716/` | Completed E12 no-export lifecycle/profile and L/A/C raw/decision/summary/marker evidence plus text-free gate audit; 0 external POSTs, actual cloud spend $0 |
 | repo-sibling `artifacts/realcloud_full_prerun_2026-07-16/` | Verified local mirror of the six E11 pre-arm evidence files; outside git |
 | `$JSCRATCH/workloads/…` | ShareGPT+BurstGPT trace (leg-1 `$DATA`) |

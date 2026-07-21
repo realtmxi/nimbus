@@ -80,8 +80,11 @@ E12 又补了一层外部有效性证据：把原始 ShareGPT current-turn 文�
 **TERMINAL PARTIAL**，其 `$0.02670220` 仍计入总预算；第二个 fresh retry 完整跑完
 A→C 并通过 text-free final audit。Retry 中 A/C 分别路由 5,097/4,057 条，overall 5 秒
 TTFT 违约为 11/3，retained-local 均为 0；retry 花费 `$0.04693796`，连同旧 partial
-累计 `$0.07364016`，剩余 `$2.92635984`。但只有一次 A→C，且违约率绝对差仅
-0.06894 个百分点，按预注册 `<1 pp` 规则仍是 **unresolved**，不能宣布 selector winner。
+累计 `$0.07364016`，剩余 `$2.92635984`。随后完成的零出网复算按实际 routed cohort
+得到 full-response capped-decode 建模成本：A `$0.49967044`、C `$0.51352936`；C 虽少
+路由 1,040 条，却选中了更多 capped decode tokens。该数是 trace-oracle 反事实上界，
+不是 full-drain 实账。因为仍只有一次 A→C，且违约率绝对差仅 0.06894 个百分点，按
+预注册 `<1 pp` 规则仍是 **unresolved**，不能宣布 selector winner。
 
 ---
 
@@ -134,7 +137,7 @@ TTFT 违约为 11/3，retained-local 均为 0；retry 花费 `$0.04693796`，连
 - 与可信 open-loop harness 的 TTFT p50 比值：`1.003`；
 - queue neutrality：p50 `110 ms vs 111 ms`；
 - 无压力时 Nimbus 0 kick，延迟与 all-local 一致；
-- 当前离线测试：router 105 项 + tools/evidence 182 项 = **287/287**（`f3583a3`）。
+- 当前离线测试：router 105 项 + tools/evidence 191 项 = **296/296**。
 
 **结论**
 
@@ -1112,6 +1115,40 @@ TTFT 分位数只使用成功且有有限实测 TTFT 的 rows，所以 A 的 3 �
 来自 settled key/account usage 增量，不来自 run summary：首-token-cancel 使 summary 中的
 云费用仍是 pending，`known_cost_usd=0`。
 
+**2026-07-21 零出网 full-response capped-decode 复算。** 新的
+`tools/analyze_e12_full_response_cost.py` 没有发起任何 provider 请求；它把已审计
+cloud rows 按 ID join 回受限 token-aligned trace，逐行验证 scheduler `P/U/D`，然后用
+冻结价格计算：
+
+```text
+modeled_full_cap_cost
+  = U × $0.08 / 1M + D_cap × $0.28 / 1M + route_n × $0
+```
+
+| Arm | routed | prompt tokens | capped decode tokens | input cost | output cost | modeled full-cap cost |
+|---|---:|---:|---:|---:|---:|---:|
+| A old-v2 | 5,097 | 1,013,293 | 1,495,025 | `$0.08106344` | `$0.41860700` | **`$0.49967044`** |
+| C current | 4,057 | 730,784 | 1,625,238 | `$0.05846272` | `$0.45506664` | **`$0.51352936`** |
+
+C 少路由 1,040 条、少 282,509 个 prompt tokens，但其被选 cohort 多 130,213 个
+capped decode tokens，因此建模总价比 A 高 `$0.01385892`（相对 A +2.773612%；
+A 相对 C 低 2.698759%）。主口径包含 A 的 3 条 failed cloud routes；排除它们的
+sensitivity 是 A `$0.49942960`，排序不变。A/C cohort 的交集、A-only、C-only 分别为
+2,550/2,547/1,507。
+
+这是 selector 自身使用的 **trace-oracle、decode cap=1,024 反事实上界**，不是实测
+full-drain 账单：cloud 可能提前 EOS，provider tokenizer 也可能与本地 token 数不同。它不能与
+首-token-cancel 的 settled spend `$0.02720312/$0.01973248` 混为一个指标。该结果支持
+“如果目标是满 D 的建模 API 成本，本次 A 更低”，但不改变单次 A→C 仍
+**unresolved** 的结论。
+
+派生 text-free 产物为
+`$MSCRATCH/e12_retry_pair_20260720/live_run/full_response_cost_counterfactual.json`，
+mode `0600`，SHA256
+`de3f9780a78fca9f4b0a726d41eb6b001d6f52cccd2fc0673754c2be81413da6`；它绑定脚本
+SHA256 `d3bbcbc9c4c4bfab21f4f4b44b125e11296f7123a0af18c8949af72a1209a926`
+和 canonical final audit `ed669378…daeaf4`。完整复算命令见英文 handoff 第 5k 节。
+
 C 比 A 少路由 1,040 条（-8.9624 个百分点），少 8 个违约（-0.06894 个百分点），
 但 overall TTFT p50/p95/p99 反而慢 180.46/139.06/44.62 ms。因为只有一次 A→C，且
 违约率差小于预注册 1 个百分点，结论明确是 **unresolved**；必须 fresh lifecycle
@@ -1180,7 +1217,8 @@ Shipped v3: kv_gap trigger + current displacement selector
 2. **完整 decision replay schema**：保存 snapshot IDs、waiting age、每请求
    prediction、selector score/order、in-flight release state。
 3. **反序/平衡 block 重复**：E12 live 已完成一组有效 A→C，但 `<1 pp` gate 明确判为
-   unresolved；要比较 old-v2/current，必须在 fresh lifecycle 做 C→A 或平衡重复。
+   unresolved；零出网 full-cap 复算显示 A 比 C 低 2.70%，但仍必须在 fresh lifecycle
+   做 C→A 或平衡重复，检查该成本排序与 TTFT 差异是否抗顺序。
 4. **在线 decode estimate**：当前实验使用 trace/oracle decode 长度。
 5. **Cache-aware trace**：当前 no-cache 实验不能验证 `U=P−cached_tokens` 项。
 6. **真实 cloud latency 的复现与 full-drain 边界**：E12 live A→C 已测到固定
@@ -1189,8 +1227,8 @@ Shipped v3: kv_gap trigger + current displacement selector
 7. **负载/guard sweep 与 offline oracle**：确定性能前沿，并与历史 0/1 DP 或
    clairvoyant oracle 比较。
 
-当前执行顺序：先冻结现有 A→C 为 exploratory ordered pair；再单独预注册 fresh
-C→A/平衡重复（新增原文外发必须重新确认授权与累计预算），同时推进不出网的
+当前执行顺序：现有 A→C 及其零出网 selected-cohort full-cap 复算已经冻结；下一步
+单独预注册 fresh C→A/平衡重复（新增原文外发必须重新确认授权与累计预算），同时推进不出网的
 support-envelope hardening；最后才讨论 selector/default。E11 synthetic live 仍需它自己
 的 export consent，不能借用 E12 授权。任何默认切换仍必须等 support-envelope hardening
 和顺序鲁棒性证据完成。
@@ -1612,6 +1650,7 @@ usage/cumulative guards 与 final audit；audit SHA
 | `tools/openrouter_usage_snapshot.py` | 读取专用 key 的非敏感 limit/usage metadata；不落盘 secret 或错误正文 |
 | `tools/check_openrouter_stage_budget.py` | 离线执行 canary/A/C 之间的 `$3` staged budget gate |
 | `tools/check_e12_retry_budget.py` | 把旧 lifecycle spend 纳入 retry 的累计 launch/final gate；只在 retrospective final 放宽旧 baseline |
+| `tools/analyze_e12_full_response_cost.py` | 将已审计 live routed cohort join 回受限 trace，按冻结 capped-decode 模型输出 text-free 完整回复成本反事实 |
 | `tools/run_openrouter_ttft_canary.py` | 用固定公开 synthetic prompt 验证同 provider 的首-token-cancel 路径，不读取 trace |
 | `tools/check_e12_stage_launch.py` | 生成/复算 A/C launch authorization 与最后一刻 live-usage receipt；C 前强绑定完整 A |
 | `tools/audit_e12_live.py` | 对 A/C marker、请求行、provider、cancel、usage/budget 做最终 text-free 审计 |
@@ -1636,7 +1675,9 @@ usage/cumulative guards 与 final audit；audit SHA
 - `$MSCRATCH/e12_private_20260720/live_run/`：旧 live lifecycle，**TERMINAL
   PARTIAL**；canary+A 完整、C 不存在，不得与任何新 lifecycle 配对。
 - `$MSCRATCH/e12_retry_pair_20260720/live_run/`：fresh retry 完整 A/C、profile、canary、
-  price/budget、usage/cumulative guards 与 final audit；request-level 文件保持受限。
+  price/budget、usage/cumulative guards、final audit 与 full-cap 派生证据
+  `full_response_cost_counterfactual.json`（SHA `de3f9780…1413da6`）；request-level
+  文件保持受限。
 - `$MSCRATCH/sharegpt_current_turn_local_78da644_20260716/`：E12 完整 no-export
   profile、L/A/C raw/decision/summary/marker 与 text-free gate audit；0 external POST。
 
