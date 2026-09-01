@@ -27,3 +27,10 @@ Thumbs.db
 
 # Generated figures (kept curated copies in results/images/)
 *.tmp.png
+
+# Secrets (API keys live here, never commit)
+.env
+.env.*
+
+# Per-run outputs from router/ experiments
+results/
