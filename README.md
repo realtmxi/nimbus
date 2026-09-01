@@ -135,14 +135,3 @@ schema and dataset details.
 
 - ShareGPT+BurstGPT: 200K requests with `block_hash_ids` for prefix overlap
 - RouteWise traces: long-context rednote agent + production freeinference logs
-
-## Citation
-
-```
-@inproceedings{nimbus2026,
-  title  = {Nimbus: Cache-Displacement-Aware Outsourcing for Hybrid LLM Inference},
-  author = {Murphy and Yiyan Zhai and Yiyu Liu and Juncheng Yang},
-  booktitle = {EuroSys},
-  year = {2026}
-}
-```
